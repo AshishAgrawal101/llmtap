@@ -255,8 +255,10 @@ class Store:
                 expr = _GROUP_EXPR[group_by]
             elif group_by.startswith("tag:") and len(group_by) > 4:
                 name = group_by[4:]
-                expr = "(CASE WHEN json_valid(tags) THEN json_extract(tags, ?) END)"
-                gargs = ['$."' + name.replace("\\", "\\\\").replace('"', '\\"') + '"'] + gargs
+                # json_each + a bound key avoids building a JSON path, whose quoting/escaping rules
+                # differ across SQLite versions (backslash escapes only work on 3.45+).
+                expr = "(CASE WHEN json_valid(tags) THEN (SELECT value FROM json_each(tags) WHERE key = ?) END)"
+                gargs = [name] + gargs
             else:
                 raise ValueError(f"unsupported group_by: {group_by!r}")
             order = "key ASC" if group_by in ("day", "hour") else "cost_usd DESC, requests DESC, key ASC"
