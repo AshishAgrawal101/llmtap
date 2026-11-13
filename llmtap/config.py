@@ -22,6 +22,7 @@ DEFAULT_UPSTREAMS: dict[str, dict[str, str]] = {
     "mistral": {"base": "https://api.mistral.ai", "style": "openai"},
     "deepseek": {"base": "https://api.deepseek.com", "style": "openai"},
     "ollama": {"base": "http://localhost:11434", "style": "openai"},
+    "gemini": {"base":"https://generativelanguage.googleapis.com","style":"gemini"}
 }
 
 
