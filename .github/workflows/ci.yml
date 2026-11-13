@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: py${{ matrix.python-version }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Verify zero runtime dependencies
+        run: |
+          python - <<'PY'
+          import importlib.metadata as m
+          reqs = [r for r in (m.requires("llmtap") or []) if "extra ==" not in r]
+          assert not reqs, f"llmtap must have zero runtime dependencies, found: {reqs}"
+          print("zero runtime dependencies")
+          PY
+
+      - name: Test
+        run: pytest -q
+
+      - name: CLI smoke test
+        run: |
+          llmtap version
+          llmtap prices claude
+          echo "nothing to see here" | llmtap scan -

@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llmtap"
+version = "0.1.0"
+description = "The flight recorder & firewall for LLM apps. See, cache, replay, budget and secure every LLM call — zero code changes, zero dependencies."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+keywords = ["llm", "openai", "anthropic", "claude", "proxy", "observability", "cache", "testing", "vcr", "agents", "cost"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Topic :: Software Development :: Testing",
+  "Topic :: Software Development :: Debuggers",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://github.com/AshishAgrawal101/llmtap"
+Issues = "https://github.com/AshishAgrawal101/llmtap/issues"
+
+[project.scripts]
+llmtap = "llmtap.cli:main"
+
+[tool.setuptools]
+packages = ["llmtap"]
+
+[tool.setuptools.package-data]
+llmtap = ["ui/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

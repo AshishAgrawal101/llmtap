@@ -1,0 +1,87 @@
+name: "llmtap replay"
+description: "Run your LLM tests against a recorded llmtap cassette: offline, deterministic, no API keys, $0."
+author: "llmtap contributors"
+branding:
+  icon: "play-circle"
+  color: "purple"
+
+inputs:
+  command:
+    description: "Command to run under llmtap (e.g. `pytest -q`, `npm test`). Executed with bash."
+    required: true
+  cassette:
+    description: "Path to the .jsonl cassette, relative to working-directory."
+    required: false
+    default: "tests/cassettes/llm.jsonl"
+  mode:
+    description: "Cassette mode: replay (default, misses fail with HTTP 409), auto or record."
+    required: false
+    default: "replay"
+  allow-miss:
+    description: "In replay mode, forward unrecorded requests upstream instead of failing (needs real keys)."
+    required: false
+    default: "false"
+  guard:
+    description: "Secret guard mode: off, warn, redact or block."
+    required: false
+    default: "warn"
+  args:
+    description: "Extra flags passed to `llmtap wrap` (e.g. `--quiet --budget-session 1`)."
+    required: false
+    default: ""
+  working-directory:
+    description: "Directory to run the command in."
+    required: false
+    default: "."
+  fake-keys:
+    description: "Set placeholder ANTHROPIC_API_KEY / OPENAI_API_KEY when they are not already set, so SDKs initialise during replay."
+    required: false
+    default: "true"
+  python:
+    description: "Python interpreter used to install and run llmtap (3.11+)."
+    required: false
+    default: "python3"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install llmtap
+      shell: bash
+      env:
+        LLMTAP_SRC: ${{ github.action_path }}
+        PY: ${{ inputs.python }}
+      run: |
+        "$PY" -m pip install --disable-pip-version-check --quiet "$LLMTAP_SRC"
+        "$PY" -m llmtap version
+
+    - name: Run command under llmtap (${{ inputs.mode }})
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        LLMTAP_CMD: ${{ inputs.command }}
+        LLMTAP_ACTION_CASSETTE: ${{ inputs.cassette }}
+        LLMTAP_ACTION_MODE: ${{ inputs.mode }}
+        LLMTAP_ACTION_ALLOW_MISS: ${{ inputs.allow-miss }}
+        LLMTAP_ACTION_GUARD: ${{ inputs.guard }}
+        LLMTAP_ACTION_ARGS: ${{ inputs.args }}
+        LLMTAP_ACTION_FAKE_KEYS: ${{ inputs.fake-keys }}
+        PY: ${{ inputs.python }}
+      run: |
+        set -euo pipefail
+        if [ "$LLMTAP_ACTION_MODE" = "replay" ] && [ ! -f "$LLMTAP_ACTION_CASSETTE" ]; then
+          echo "::error::llmtap cassette not found: $LLMTAP_ACTION_CASSETTE (record it locally with --mode record and commit it)"
+          exit 1
+        fi
+        if [ "$LLMTAP_ACTION_FAKE_KEYS" = "true" ]; then
+          export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-llmtap-replay-fake-key}"
+          export OPENAI_API_KEY="${OPENAI_API_KEY:-llmtap-replay-fake-key}"
+        fi
+        flags=(--cassette "$LLMTAP_ACTION_CASSETTE" --mode "$LLMTAP_ACTION_MODE" --guard "$LLMTAP_ACTION_GUARD")
+        if [ "$LLMTAP_ACTION_ALLOW_MISS" = "true" ]; then
+          flags+=(--allow-miss)
+        fi
+        # Intentional word-splitting of user-supplied extra flags.
+        # shellcheck disable=SC2206
+        extra=($LLMTAP_ACTION_ARGS)
+        export LLMTAP_DB_PATH="${LLMTAP_DB_PATH:-$RUNNER_TEMP/llmtap.db}"
+        "$PY" -m llmtap wrap "${flags[@]}" ${extra[@]+"${extra[@]}"} -- bash -c "$LLMTAP_CMD"

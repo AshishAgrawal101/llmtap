@@ -1,0 +1,61 @@
+# llmtap configuration example.
+# Copy to ./llmtap.toml (per project) or ~/.config/llmtap/config.toml (global), or pass --config <path>.
+# Precedence: defaults <- this file <- LLMTAP_<FIELD> env vars <- CLI flags.
+# Every key is optional. Settings may also be nested under an [llmtap] table.
+
+# --- server -------------------------------------------------------------------------------------
+host = "127.0.0.1"            # keep on loopback: the dashboard has no authentication
+port = 4141                   # `llmtap serve` port (`llmtap wrap` picks a free one)
+# db_path = "~/.llmtap/llmtap.db"   # default; ":memory:" keeps nothing on disk
+quiet = false                 # true = no per-request terminal line
+upstream_timeout_s = 600.0
+
+# --- dev response cache -------------------------------------------------------------------------
+cache = false                 # serve identical requests from the local cache
+cache_ttl_s = 0               # seconds; 0 = never expire
+
+# --- cassettes (record / replay) ----------------------------------------------------------------
+# cassette = "tests/cassettes/llm.jsonl"
+mode = "auto"                 # "record" | "replay" | "auto"
+allow_miss = false            # replay mode: forward unrecorded requests instead of returning 409
+
+# --- secret guard -------------------------------------------------------------------------------
+guard = "warn"                # "off" | "warn" | "redact" | "block"
+guard_pii = false             # also detect emails, phone numbers, credit cards
+
+# --- budgets & loop breaker ---------------------------------------------------------------------
+budget_daily_usd = 0.0        # 0 = unlimited; counts upstream spend since local midnight
+budget_session_usd = 0.0      # 0 = unlimited; per proxy process
+loop_threshold = 0            # 0 = off; e.g. 5 = refuse an identical request seen 5 times...
+loop_window_s = 60            # ...within this many seconds
+
+# --- upstreams ----------------------------------------------------------------------------------
+# Built in: anthropic, openai, openrouter, groq, together, mistral, deepseek, ollama.
+# Each one is reachable at http://127.0.0.1:4141/<name>/... ; add or override below.
+
+# [upstreams.vllm]
+# base = "http://gpu-box:8000"
+# style = "openai"            # "openai" (any OpenAI-compatible server) or "anthropic"
+
+# [upstreams.lmstudio]
+# base = "http://localhost:1234"
+# style = "openai"
+
+# Route all un-prefixed OpenAI traffic through a corporate gateway:
+# [upstreams.openai]
+# base = "https://llm-gateway.internal.example.com/openai"
+# style = "openai"
+
+# --- pricing overrides (USD per 1M tokens) ------------------------------------------------------
+# Add models llmtap doesn't know, or override built-in prices (e.g. negotiated rates).
+# Missing cache_read defaults to 10% (anthropic) / 50% (openai) of input; cache_write to 125%.
+
+# [pricing_overrides."my-finetuned-model"]
+# input = 0.50
+# output = 1.50
+
+# [pricing_overrides."claude-sonnet-4-5"]
+# input = 2.70
+# output = 13.50
+# cache_read = 0.27
+# cache_write = 3.375

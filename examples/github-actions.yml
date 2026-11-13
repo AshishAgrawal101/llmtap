@@ -1,0 +1,62 @@
+# Example workflow: run LLM tests in CI by replaying a committed llmtap cassette.
+# No API keys, no network calls to the provider, no cost, identical results on every run.
+#
+# Copy to .github/workflows/llm-tests.yml and adjust paths.
+# Record the cassette locally first:
+#   llmtap wrap --cassette tests/cassettes/llm.jsonl --mode record -- pytest -q
+name: LLM tests (replay)
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # Option A: the CLI directly.
+  replay-cli:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install git+https://github.com/AshishAgrawal101/llmtap -r requirements.txt pytest
+      - name: Run tests against the cassette
+        env:
+          # SDKs require a key to be set; replayed requests never reach the provider.
+          ANTHROPIC_API_KEY: fake-key
+          OPENAI_API_KEY: fake-key
+        run: |
+          llmtap wrap --cassette tests/cassettes/llm.jsonl --mode replay --quiet -- pytest -q
+
+  # Option B: the composite action shipped in the llmtap repo.
+  replay-action:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt pytest
+      - uses: AshishAgrawal101/llmtap@main
+        with:
+          cassette: tests/cassettes/llm.jsonl
+          command: pytest -q
+          guard: block          # fail the build if a test prompt ever contains a secret
+
+  # Optional: scheduled job that re-records against the real API and opens a PR if outputs drifted.
+  # Uses a real key from secrets; keep it off pull_request triggers so forks can't spend your money.
+  # re-record:
+  #   if: github.event_name == 'schedule'
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: actions/setup-python@v5
+  #       with: { python-version: "3.12" }
+  #     - run: pip install git+https://github.com/AshishAgrawal101/llmtap -r requirements.txt pytest
+  #     - run: llmtap wrap --cassette tests/cassettes/llm.jsonl --mode record --budget-session 2 -- pytest -q
+  #       env:
+  #         ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
