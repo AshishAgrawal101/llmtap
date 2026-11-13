@@ -104,6 +104,15 @@ def resolve_route(path: str, headers: Mapping[str, str], cfg: Config) -> Route:
         base, style = _upstream(cfg, "anthropic")
         return Route(provider="anthropic", upstream_base=base, upstream_path=path, style=style)
 
+    #Check if path is a Gemini ednpoit or Google API key header is present
+    if(
+        ":generateContent" in pure
+        or ":streamGenerateContent" in pure
+        or "x-goog-api-key" in hdrs
+    ):
+        base, style = _upstream(cfg,"gemini")
+        return Route(provider="gemini", upstream_base=base, upstream_path=path,style=style)
+
     # 4. openai
     base, style = _upstream(cfg, "openai")
     up_path = _normalize_openai_path(path, base) if style == "openai" else path
@@ -189,6 +198,14 @@ def extract_usage(style: str, resp: dict) -> Usage:
     """Token usage from a non-streaming response JSON. Missing fields -> 0."""
     if not isinstance(resp, dict):
         return Usage()
+    if "usageMetadata" in resp or style=="gemini": 
+        meta = resp.get("usageMetadata")
+        if isinstance(meta,dict):
+            return Usage(
+            input_tokens=_int(meta.get("promptTokenCount")),
+            output_tokens=_int(meta.get("candidatesTokenCount")),
+            cache_read_tokens=_int(meta.get("cachedContentTokenCount")),
+            )
     usage = resp.get("usage")
     if usage is None and isinstance(resp.get("response"), dict):  # wrapped responses-API object
         usage = resp["response"].get("usage")
@@ -205,7 +222,6 @@ def _anthropic_text(content: Any) -> str:
         if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str):
             out.append(block["text"])
     return "".join(out)
-
 
 def _openai_message_content(content: Any) -> str:
     if isinstance(content, str):
@@ -235,6 +251,17 @@ def _openai_chat_text(resp: dict) -> str:
         return first["text"]
     return ""
 
+def _gemini_text(resp:dict)-> str:
+    candidates = resp.get("candidates")
+    if not isinstance(candidates,list) or not candidates:
+        return""
+
+    first = candidates[0]
+    if not isinstance(first, dict):
+        return ""
+    content = first.get("content") or {}
+    parts = content.get("parts") or []
+    return "".join(p.get("text", "") for p in parts if isinstance(p, dict) and isinstance(p.get("text"), str))
 
 def _responses_text(resp: dict) -> str:
     top = resp.get("output_text")
@@ -267,6 +294,8 @@ def extract_text(style: str, resp: dict) -> str:
             return _responses_text(resp)
         if "content" in resp:
             return _anthropic_text(resp.get("content"))
+        if style == "gemini" or "candidates" in resp:
+            return _gemini_text(resp)
         if isinstance(resp.get("response"), dict):
             return _responses_text(resp["response"])
     except Exception:
@@ -390,7 +419,28 @@ def parse_sse(style: str, raw: str) -> tuple[Usage, str, str | None]:
                 continue
             if isinstance(etype, str) and etype.startswith("response."):
                 continue
-
+            
+            #Google Gemini API Responses
+            if style == "gemini" or "candidates" in obj or "usageMetadata" in obj:
+                # 1. Extract text delta from candidate parts
+                for cand in obj.get("candidates") or []:
+                    for part in (cand.get("content") or {}).get("parts") or []:
+                        if isinstance(part, dict) and isinstance(part.get("text"), str):
+                            text_parts.append(part["text"])
+                    
+                
+                # 2. Extract usage if present in this chunk
+                if isinstance(obj.get("usageMetadata"), dict):
+                    meta = obj["usageMetadata"]
+                    if meta.get("promptTokenCount"):
+                        usage.input_tokens = _int(meta.get("promptTokenCount"))
+                    if meta.get("candidatesTokenCount"):
+                        usage.output_tokens = _int(meta.get("candidatesTokenCount"))
+                    if meta.get("cachedContentTokenCount"):
+                        usage.cache_read_tokens = _int(meta.get("cachedContentTokenCount"))
+                if not model and isinstance(obj.get("modelVersion"), str):
+                    model = obj["modelVersion"]
+                continue
             # ---- openai chat / legacy completions chunks ----
             if not model and isinstance(obj.get("model"), str) and obj["model"]:
                 model = obj["model"]
@@ -463,6 +513,8 @@ def error_body(style: str, status: int, message: str, err_type: str = "llmtap_er
     """Provider-shaped JSON error body so SDKs surface llmtap errors nicely."""
     if style == "anthropic":
         obj: dict[str, Any] = {"type": "error", "error": {"type": err_type, "message": message}}
+    elif style == "gemini":
+        obj = {"error": {"code": status, "message": message, "status": err_type.upper()}}
     else:
         obj = {"error": {"message": message, "type": err_type, "code": err_type}}
     return json.dumps(obj).encode("utf-8")
