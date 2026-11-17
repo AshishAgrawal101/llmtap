@@ -66,9 +66,12 @@ def parse_since(s: str | None, now: float | None = None) -> float | None:
         return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday - 1, 0, 0, 0, 0, 0, -1))
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}([t ]\d{2}:\d{2}(:\d{2})?)?", t):
         from datetime import datetime
+        dt = datetime.fromisoformat(t.upper().replace(" ", "T"))  # ValueError = not a real date
         try:
-            cutoff = datetime.fromisoformat(t.upper().replace(" ", "T")).timestamp()
-        except (OverflowError, OSError):  # outside the platform's time range
+            cutoff = dt.timestamp()
+        # outside the platform's time range: OverflowError/OSError on Windows, ValueError ("year 0 is
+        # out of range") on Linux/macOS for dates near year 1
+        except (OverflowError, OSError, ValueError):
             if int(t[:4]) <= 1970:
                 return None
             raise ValueError(f"date out of range: {s!r}") from None

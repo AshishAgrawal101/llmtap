@@ -173,6 +173,12 @@ def test_extreme_since_is_clamped(tmp_path: Path, since: str, capsys: pytest.Cap
     capsys.readouterr()
 
 
+@pytest.mark.parametrize("since", ["2026-13-45", "2026-02-30"])
+def test_impossible_since_date_rejected(since: str) -> None:
+    with pytest.raises(ValueError):
+        cli.parse_since(since)
+
+
 def test_nan_since_rejected(capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(ValueError):
         cli.parse_since("nan")
