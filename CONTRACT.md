@@ -24,8 +24,10 @@ Routing rules (first match wins):
    upstream_base=cfg.upstreams[name]["base"], upstream_path="/rest" (keep query string), style=that upstream's style).
    e.g. `/openrouter/v1/chat/completions` → base `https://openrouter.ai/api`, path `/v1/chat/completions`.
 2. Path starts with `/v1/messages` or `/v1/complete` → anthropic.
-3. Headers contain `anthropic-version` or `x-api-key` (case-insensitive) → anthropic.
-4. Otherwise → openai.
+3. Headers contain `x-api-key` or any `anthropic-*` header (case-insensitive) → anthropic.
+4. Google Generative Language shapes (`:generateContent` / `:streamGenerateContent` / `models/<m>:<method>` paths,
+   `/v1beta/…` or `/v1alpha/…` paths, an `x-goog-api-key` header or a `?key=` query parameter) → gemini.
+5. Otherwise → openai.
 Paths without `/v1` prefix (e.g. `/chat/completions`, when user sets OPENAI_BASE_URL without /v1) get `/v1` prepended for openai style.
 
 ```python
@@ -60,7 +62,8 @@ openai responses/embeddings `input_tokens`/`output_tokens` or `prompt_tokens`. M
 PRICES: dict[str, dict[str, float]]    # model-prefix -> {"input","output","cache_read","cache_write"} USD per 1M tokens
 def price_for(model: str | None, overrides: dict | None = None) -> dict[str, float] | None
     # exact match, then longest prefix match (strip provider prefixes like "anthropic/" or "openai/"), overrides win. None if unknown.
-def cost_usd(model: str | None, usage: Usage, overrides: dict | None = None) -> float   # 0.0 if unknown model
+def cost_usd(model: str | None, usage: Usage, overrides: dict | None = None, style: str | None = None) -> float
+    # 0.0 if unknown model; `style` = wire format the usage came from (decides how cached tokens are counted)
 def format_usd(x: float) -> str        # "$0.0042", "$1.23", "$0.00" (4 decimals under $1 if nonzero, else 2)
 ```
 Cover Claude (opus/sonnet/haiku 3.x, 4.x, 4.5, 5 families), GPT-4o/4o-mini/4.1/4.1-mini/nano, o1/o3/o4-mini, gpt-5/5-mini/5-nano,
@@ -116,8 +119,8 @@ class Cassette:
     def __len__(self) -> int
 ```
 Line format: `{"key":..., "request": <parsed json or str>, "response": {"status","headers","body","streamed","cost_usd"}, "recorded_at": iso8601}`.
-Proxy semantics: replay mode + miss → `CassetteMiss` handled by proxy as HTTP 599-ish? No: return **HTTP 409** with provider error
-"llmtap cassette miss (replay mode): no recording for this request. Re-record with --mode record" unless cfg.allow_miss.
+Proxy semantics: replay mode + miss → **HTTP 409** with provider error "llmtap cassette miss (replay mode): no recording for
+this request. Re-record with --mode record" (source="error") unless cfg.allow_miss.
 
 ## llmtap/guard.py — secret/PII firewall for prompts
 ```python
@@ -144,15 +147,18 @@ PII (only if pii=True): email, phone (intl/US), credit_card (Luhn-validated). Ke
 class Verdict: allowed: bool; reason: str = ""; kind: str = ""    # kind: "budget" | "loop" | ""
 class Budget:
     def __init__(self, cfg: Config, spent_since: Callable[[float], float])   # spent_since = store.spent_since
-    def check(self, key: str) -> Verdict
-        # 1) daily: spent_since(local midnight) >= cfg.budget_daily_usd > 0 → deny "daily budget $X reached ($Y spent)"
-        # 2) session: in-process spent >= cfg.budget_session_usd > 0 → deny
-        # 3) loop: if cfg.loop_threshold > 0 and this key was seen >= loop_threshold times in last loop_window_s → deny
-        #    "loop detected: identical request sent N times in Ws". (Records the attempt timestamp every call.)
+    def check_loop(self, key: str) -> Verdict
+        # records the attempt; deny when cfg.loop_threshold > 0 and this key was already sent loop_threshold times
+        # in the last loop_window_s ("llmtap: runaway loop detected — this exact request was sent N times in Ws…")
+    def check_spend(self, estimate_usd: float = 0.0) -> Verdict
+        # daily: spent_since(local midnight) >= cfg.budget_daily_usd > 0 → deny; session: in-process spent >=
+        # cfg.budget_session_usd > 0 → deny. An allowed call reserves `estimate_usd` until release(verdict.reservation).
+    def check(self, key: str, estimate_usd: float = 0.0) -> Verdict   # check_spend, then the loop check
+    def release(self, reservation: int | None) -> None
     def add_spend(self, usd: float) -> None   # session accumulator (call after each upstream response)
     def session_spent(self) -> float
 ```
-Proxy returns HTTP 429 with provider-shaped error, source="budget" or "loop".
+Proxy returns HTTP 429 with provider-shaped error, source="budget" or "loop". Cache/cassette hits skip check_spend.
 
 ## llmtap/proxy.py — the core server
 ```python
@@ -170,12 +176,13 @@ class EventBus:   # pub/sub for the live dashboard
     def unsubscribe(self, q) -> None
 ```
 Pipeline per request (non-`/_llmtap` paths): resolve_route → parse JSON → tags → apply_guard (block → 400 provider error,
-source="blocked") → cache_key → budget.check (deny → 429) → cassette.lookup / cache.get (serve stored body verbatim; streamed bodies
-are re-sent as `text/event-stream` chunked; source="cassette"/"cache"; saved_usd = stored cost) → forward upstream with
+source="blocked") → cache_key → budget.check_loop (deny → 429, source="loop") → cassette.lookup / cache.get (serve stored body
+verbatim; streamed bodies are re-sent as `text/event-stream` chunked; source="cassette"/"cache"; saved_usd = stored cost; replay-mode
+miss → 409, source="error") → budget.check_spend (deny → 429, source="budget") → forward upstream with
 http.client (HTTPS via ssl.create_default_context(); honor timeout) → for `text/event-stream` responses, relay each chunk to the client
 immediately (chunked transfer-encoding, flush) while accumulating; record ttft_ms → compute usage (parse_sse / extract_usage, fall back to
 estimate_usage) → cost → budget.add_spend → cache.put/cassette.record for 2xx → store.record → bus.publish({"type":"exchange","exchange": summary dict})
-→ term.log_exchange(ex) unless cfg.quiet. Upstream connection errors → 502 provider-shaped error, source="error".
+→ term.log_exchange(ex) unless cfg.quiet. Upstream connection errors → 502 (timeouts → 504) provider-shaped error, source="error".
 Response headers to client: pass upstream headers except hop-by-hop; add `x-llmtap-id: <exchange id>` and `x-llmtap-source`.
 Paths under `/_llmtap/` are delegated to `dashboard.handle_internal(tap, method, path, headers, body, respond) -> bool`.
 `GET /` with no route → redirect 302 to `/_llmtap/`.

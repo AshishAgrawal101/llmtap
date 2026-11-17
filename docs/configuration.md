@@ -55,10 +55,10 @@ A fully commented example is in [`llmtap.example.toml`](../llmtap.example.toml).
 | Field | Default | Env var | CLI flag | Description |
 |---|---|---|---|---|
 | `host` | `"127.0.0.1"` | `LLMTAP_HOST` | `--host` | Interface to bind. The dashboard has no auth, so keep it on loopback unless you trust the network. |
-| `port` | `4141` | `LLMTAP_PORT` | `--port` | Port for `serve`. `wrap` always picks a free port. `0` = any free port. |
+| `port` | `4141` | `LLMTAP_PORT` | `--port` | Port for `serve`. `wrap` picks a free port unless you pass `--port`. `0` = any free port. |
 | `db_path` | `""` → `~/.llmtap/llmtap.db` | `LLMTAP_DB_PATH` | `--db` | SQLite history file. `":memory:"` keeps nothing on disk. |
 | `quiet` | `false` | `LLMTAP_QUIET` | `--quiet` | Don't print a line per request. |
-| `cache` | `false` | `LLMTAP_CACHE` | `--cache` | Serve identical requests from the local response cache. |
+| `cache` | `false` | `LLMTAP_CACHE` | `--cache` / `--no-cache` | Serve identical requests from the local response cache. |
 | `cache_ttl_s` | `0` | `LLMTAP_CACHE_TTL_S` | `--cache-ttl` | Cache entry lifetime in seconds. `0` = forever. |
 | `cassette` | `""` | `LLMTAP_CASSETTE` | `--cassette` | Path to a `.jsonl` cassette. Empty = disabled. See [cassettes.md](cassettes.md). |
 | `mode` | `"auto"` | `LLMTAP_MODE` | `--mode` | Cassette mode: `record`, `replay` or `auto`. |
@@ -69,18 +69,20 @@ A fully commented example is in [`llmtap.example.toml`](../llmtap.example.toml).
 | `budget_session_usd` | `0.0` | `LLMTAP_BUDGET_SESSION_USD` | `--budget-session` | Same, for spend through this proxy process. `0` = unlimited. |
 | `loop_threshold` | `0` | `LLMTAP_LOOP_THRESHOLD` | `--loop-threshold` | Refuse (429) an identical request once seen this many times within the window. `0` = off. |
 | `loop_window_s` | `60` | `LLMTAP_LOOP_WINDOW_S` | `--loop-window` | Loop-detection window in seconds. |
-| `upstreams` | see below | – | – | Named upstreams (`base`, `style`). File only. |
+| `upstreams` | see below | – | `--upstream NAME=URL[,STYLE]` (repeatable) | Named upstreams (`base`, `style`). |
 | `pricing_overrides` | `{}` | – | – | Per-model prices in USD per 1M tokens (`input`, `output`, `cache_read`, `cache_write`). File only, as `[pricing_overrides."<model>"]` tables. |
-| `upstream_timeout_s` | `600.0` | `LLMTAP_UPSTREAM_TIMEOUT_S` | – | Timeout for upstream requests, in seconds. |
+| `upstream_timeout_s` | `600.0` | `LLMTAP_UPSTREAM_TIMEOUT_S` | `--timeout` | Timeout for upstream requests, in seconds. |
 
 Other environment variables:
 
 | Variable | Meaning |
 |---|---|
 | `LLMTAP_HOME` | Data directory (default `~/.llmtap`). The default database lives here. |
-| `NO_COLOR` | Disable ANSI colours in terminal output. Colours are also off when stderr isn't a TTY. |
+| `NO_COLOR` | Disable ANSI colours in terminal output. Colours are also off when the output stream isn't a TTY. |
+| `FORCE_COLOR` | Force ANSI colours on, even when the output isn't a TTY (`0`, `false`, `no`, `off` don't count). |
 
-Boolean env vars are true for `1`, `true`, `yes` or `on` (case-insensitive) and false for anything else.
+Boolean env vars are true for `1`, `true`, `yes` or `on` and false for `0`, `false`, `no`, `off` or an empty value
+(case-insensitive). Anything else is an error that names the variable, as is a non-numeric value for a numeric setting.
 
 ```bash
 LLMTAP_CACHE=1 LLMTAP_GUARD=redact llmtap wrap -- python app.py
@@ -101,9 +103,10 @@ Built in. Any of these can be overridden in the config file, and new ones added:
 | `mistral` | `https://api.mistral.ai` | `openai` |
 | `deepseek` | `https://api.deepseek.com` | `openai` |
 | `ollama` | `http://localhost:11434` | `openai` |
+| `gemini` | `https://generativelanguage.googleapis.com` | `gemini` |
 
-`style` tells llmtap which wire format to expect, for usage parsing and for the shape of its own error responses. Use
-`openai` for any OpenAI-compatible server (vLLM, LM Studio, llama.cpp server, TGI, LiteLLM proxy…).
+`style` (`openai`, `anthropic` or `gemini`) tells llmtap which wire format to expect, for usage parsing and for the shape
+of its own error responses. Use `openai` for any OpenAI-compatible server (vLLM, LM Studio, llama.cpp server, TGI, LiteLLM proxy…).
 
 ### Routing rules
 
@@ -112,8 +115,11 @@ For each request, the first matching rule wins:
 1. **Explicit prefix.** `/<name>/rest` where `<name>` is a configured upstream → `<base>/rest` (query string kept).
    `/openrouter/v1/chat/completions` → `https://openrouter.ai/api/v1/chat/completions`.
 2. Path starts with `/v1/messages` or `/v1/complete` → `anthropic`.
-3. Request has an `anthropic-version` or `x-api-key` header → `anthropic`.
-4. Everything else → `openai`.
+3. Request has an `x-api-key` header or any `anthropic-*` header (`anthropic-version`, `anthropic-beta`, …) → `anthropic`.
+4. Google Generative Language requests → `gemini`: a `:generateContent` / `:streamGenerateContent` (or other
+   `models/<model>:<method>`) path, a `/v1beta/…` or `/v1alpha/…` path, an `x-goog-api-key` header, or a `?key=` query
+   parameter.
+5. Everything else → `openai`.
 
 For OpenAI-style routes, a path without a `/v1` prefix (e.g. `/chat/completions`, from a client configured with a base URL
 missing `/v1`) gets `/v1` prepended.

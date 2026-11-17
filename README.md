@@ -36,7 +36,7 @@ every cent.
 ## ⚡ 30-second start
 
 ```bash
-pipx install llmtap-proxy     # stdlib only, nothing else gets installed; the command is `llmtap`
+pip install llmtap-proxy      # stdlib only, nothing else gets installed; the command is `llmtap` (pipx works too)
 llmtap demo                    # fake LLM traffic + the live dashboard in your browser. No API key needed.
 llmtap wrap -- python app.py   # now do it for real with your own app
 ```
@@ -253,7 +253,8 @@ style = "openai"          # or "anthropic"
 ```
 
 …then use `http://127.0.0.1:4141/vllm/v1`. Without a prefix, requests are routed by shape: `/v1/messages` or an
-`anthropic-version` / `x-api-key` header goes to Anthropic, everything else to OpenAI.
+`x-api-key` / `anthropic-*` header goes to Anthropic, Gemini-style requests (`:generateContent`, `x-goog-api-key`,
+`?key=`) go to Gemini, and everything else goes to OpenAI.
 
 ### Tagging requests
 
@@ -388,7 +389,8 @@ llmtap wrap --loop-threshold 5 --loop-window 60 -- python agent.py
 - **`--loop-threshold N --loop-window W`**: once the *identical* request has been sent N times within W seconds, further copies are refused with HTTP **429**. This is the classic stuck-agent pattern, and it gets stopped in seconds instead of at 3am.
 
 Refusals are returned as provider-shaped error JSON, so your SDK raises its normal error type with a clear message
-(e.g. `daily budget $5.00 reached ($5.02 spent)` or `loop detected: identical request sent 5 times in 60s`).
+(e.g. `llmtap: daily budget of $5.00 reached ($5.02 spent today)` or
+`llmtap: runaway loop detected — this exact request was sent 5 times in 60s`).
 Cache and cassette hits cost nothing and don't count toward budgets.
 
 ## ⚙️ Configuration
@@ -426,7 +428,7 @@ Every field, env var and flag: **[docs/configuration.md](docs/configuration.md)*
 | `llmtap demo` | Fake upstream + generated traffic + dashboard. Zero keys, zero cost. |
 | `llmtap wrap [flags] -- <cmd…>` | Run a command through a fresh proxy; print a cost summary at the end |
 | `llmtap serve [flags]` | Run the proxy + dashboard on `127.0.0.1:4141` |
-| `llmtap env [--port N]` | Print `export …` lines: `eval "$(llmtap env)"` |
+| `llmtap env [--port N] [--shell sh\|fish\|powershell]` | Print `export …` lines: `eval "$(llmtap env)"` |
 | `llmtap tail` | Stream new requests to the terminal as they happen |
 | `llmtap ls [-n 20] [-q text]` | List recent requests, optionally full-text filtered |
 | `llmtap show <id> [--raw]` | Full request/response for one exchange (id prefixes work) |
@@ -439,8 +441,9 @@ Every field, env var and flag: **[docs/configuration.md](docs/configuration.md)*
 | `llmtap clear [--yes]` | Delete recorded history |
 | `llmtap version` | Print the version |
 
-Common flags for `serve` / `wrap`: `--port --host --db --config --quiet --cache --cache-ttl --cassette --mode --allow-miss
---guard --pii --budget-daily --budget-session --loop-threshold --loop-window`.
+Common flags for `serve` / `wrap`: `--port --host --db --config --quiet --timeout --upstream NAME=URL[,STYLE] --cache
+--no-cache --cache-ttl --cassette --mode --allow-miss --guard --pii --budget-daily --budget-session --loop-threshold
+--loop-window`.
 
 ---
 
@@ -508,7 +511,7 @@ CI while production traces go to your hosted platform.
 <summary><b>Does my data leave my machine?</b></summary>
 
 Only the upstream call you were going to make anyway. llmtap has no telemetry, no accounts and no cloud
-component. History lives in a local SQLite file (`~/.llmtap/llmtap.db`, override with `--db` or `LLMTAP_HOME`), and
+component. History lives in a local SQLite file (`~/.llmtap/llmtap.db`, override with `--db`, `LLMTAP_DB_PATH` or `LLMTAP_HOME`), and
 `llmtap clear` deletes it. Request headers, where your API keys live, are forwarded but not stored. Prompts and responses
 *are* stored locally; use `--guard redact` if you don't want secrets in them, since redacted text is what gets stored.
 </details>

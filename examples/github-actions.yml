@@ -23,7 +23,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install git+https://github.com/AshishAgrawal101/llmtap -r requirements.txt pytest
+      - run: pip install llmtap-proxy -r requirements.txt pytest
       - name: Run tests against the cassette
         env:
           # SDKs require a key to be set; replayed requests never reach the provider.
@@ -56,7 +56,7 @@ jobs:
   #     - uses: actions/checkout@v4
   #     - uses: actions/setup-python@v5
   #       with: { python-version: "3.12" }
-  #     - run: pip install git+https://github.com/AshishAgrawal101/llmtap -r requirements.txt pytest
+  #     - run: pip install llmtap-proxy -r requirements.txt pytest
   #     - run: llmtap wrap --cassette tests/cassettes/llm.jsonl --mode record --budget-session 2 -- pytest -q
   #       env:
   #         ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

@@ -5,7 +5,7 @@ free** in CI by replaying a recorded cassette.
 
 ```bash
 cd examples/pytest_cassette
-pip install anthropic pytest
+pip install llmtap-proxy anthropic pytest
 ```
 
 **1. Record once, with a real key:**

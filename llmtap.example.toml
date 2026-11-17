@@ -30,12 +30,12 @@ loop_threshold = 0            # 0 = off; e.g. 5 = refuse an identical request se
 loop_window_s = 60            # ...within this many seconds
 
 # --- upstreams ----------------------------------------------------------------------------------
-# Built in: anthropic, openai, openrouter, groq, together, mistral, deepseek, ollama.
+# Built in: anthropic, openai, openrouter, groq, together, mistral, deepseek, ollama, gemini.
 # Each one is reachable at http://127.0.0.1:4141/<name>/... ; add or override below.
 
 # [upstreams.vllm]
 # base = "http://gpu-box:8000"
-# style = "openai"            # "openai" (any OpenAI-compatible server) or "anthropic"
+# style = "openai"            # "openai" (any OpenAI-compatible server), "anthropic" or "gemini"
 
 # [upstreams.lmstudio]
 # base = "http://localhost:1234"

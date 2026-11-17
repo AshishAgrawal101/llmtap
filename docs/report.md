@@ -32,7 +32,7 @@ What is in it:
 The numbers come from `llmtap.report.build_report(store, since) -> dict`; `render_html`,
 `render_markdown` and `render_json` just format that dict.
 
-Markdown example:
+Markdown example (abridged; the full output also has the metrics, model, day, tag, expensive-request and guard tables):
 
 ```text
 ## llmtap report — Nov 10, 2026 → Nov 16, 2026
@@ -46,8 +46,8 @@ Markdown example:
 
 | Prompt | Calls | Total | Saved with `--cache` |
 |---|---:|---:|---:|
-| Summarize the following incident report in 5 bullet points for the exec team: INC-4821… | ×14 | $2.02 | $1.87 |
-| Review this pull request diff for concurrency bugs and suggest fixes: diff --git a/wor… | ×23 | $0.9453 | $0.9042 |
+| Summarize the following incident report in 5 bullet points… | ×14 | $2.02 | $1.87 |
+| Review this pull request diff for concurrency bugs and sugg… | ×23 | $0.9453 | $0.9042 |
 ```
 
 `llmtap stats` also prints one extra line using the same logic:
@@ -64,19 +64,21 @@ llmtap doctor --online   # also HEAD/GET each upstream host (5s timeout)
 ```
 
 ```text
-llmtap doctor · v0.1.0
+llmtap doctor · v0.2.1
 
  ✓ Python 3.13.1
  ✓ Port 4141 is free
  ✓ Database writable: /home/you/.llmtap/llmtap.db  1,204 exchanges recorded
  ✓ SQLite 3.46.0
  · No config file found  using defaults
+     → copy llmtap.example.toml to llmtap.toml to customize
  · No LLMTAP_* env vars set  using defaults / config file
  ! ANTHROPIC_BASE_URL not set  this SDK talks to the provider directly
      → run `eval "$(llmtap env)"` or `llmtap wrap -- <your command>`
  ✓ OPENAI_BASE_URL points at llmtap  http://127.0.0.1:4141
  ✓ ANTHROPIC_API_KEY set
  · OPENAI_API_KEY not set
+     → export it if you call that provider (or use `llmtap demo` with no keys)
 
 All good, with 1 warning
 ```

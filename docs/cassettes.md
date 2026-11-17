@@ -150,7 +150,7 @@ Use the composite action that ships with this repo:
 Or call the CLI directly:
 
 ```yaml
-- run: pip install git+https://github.com/AshishAgrawal101/llmtap
+- run: pip install llmtap-proxy
 - run: llmtap wrap --cassette tests/cassettes/llm.jsonl --mode replay -- pytest -q
   env:
     ANTHROPIC_API_KEY: fake-key
