@@ -193,3 +193,50 @@ def test_short_path_only_abbreviates_inside_home(monkeypatch: pytest.MonkeyPatch
     other = home + "ice" + os.sep + "t.jsonl"
     assert term._short_path(other) == other
     assert term._short_path(home + os.sep + "t.jsonl") == "~" + os.sep + "t.jsonl"
+
+
+# ------------------------------------------------------------------ report / export while recording
+
+class _Growing:
+    """A store that records a newer exchange after every page read, like a running `llmtap serve`."""
+
+    def __init__(self, store: Store) -> None:
+        self.store = store
+        self.path = store.path
+        self.n = 0
+
+    def list(self, **kw: Any) -> list[Exchange]:
+        page = self.store.list(**kw)
+        self.n += 1
+        self.store.record(_ex(f"recorded meanwhile {self.n}", time.time() + 1000 + self.n))
+        return page
+
+    def close(self) -> None:
+        self.store.close()
+
+
+def _growing(tmp_path: Path, n: int = 7) -> _Growing:
+    s = Store(str(tmp_path / "g.db"))
+    now = time.time()
+    for i in range(n):
+        s.record(_ex(f"prompt {i}", now - 100 + i))
+    return _Growing(s)
+
+
+def test_report_does_not_double_count_rows_recorded_meanwhile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(report, "PAGE", 3)
+    g = _growing(tmp_path)
+    data = report.build_report(g, since=None)
+    assert data["waste"]["duplicate_requests"] == 0
+    assert data["totals"]["requests"] == 7
+
+
+def test_export_does_not_duplicate_rows_recorded_meanwhile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                           capfd: pytest.CaptureFixture[str]) -> None:
+    g = _growing(tmp_path, n=1203)  # more than one 500-row page
+    monkeypatch.setattr(cli, "_open_store", lambda args: g)
+    out = tmp_path / "x.jsonl"
+    assert cli.main(["export", "-o", str(out)]) == 0
+    capfd.readouterr()
+    ids = [json.loads(line)["id"] for line in out.read_text(encoding="utf-8").splitlines()]
+    assert len(ids) == len(set(ids))

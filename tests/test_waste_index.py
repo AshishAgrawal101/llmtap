@@ -100,3 +100,14 @@ def test_request_key_round_trips_and_old_databases_upgrade(tmp_path: Path):
     idx = {r[1] for r in s._c().execute("PRAGMA index_list(exchanges)")}
     assert "idx_exchanges_waste" in idx
     s.close()
+
+
+def test_iter_light_ignores_rows_recorded_mid_scan():
+    s = Store(":memory:")
+    for i in range(10):
+        s.record(Exchange(ts=BASE + i, request_body=f"r{i}"))
+    seen = []
+    for e in s.iter_light(page=3):
+        seen.append(e.id)
+        s.record(Exchange(ts=BASE + 1000 + len(seen), request_body="new"))   # newer than the cursor
+    assert len(seen) == len(set(seen)) == 10

@@ -181,16 +181,25 @@ def _request_key(ex: Exchange, memo: dict[bytes, str] | None = None) -> str:
 
 def _iter_exchanges(store: Any, since: float | None) -> Iterator[Exchange]:
     """Stream every exchange since ``since`` (newest first) so big DBs don't blow memory. Reports never
-    read response bodies, so a Store skips them (``iter_light``)."""
+    read response bodies, so a Store skips them (``iter_light``, keyset-paged: rows a running proxy
+    records meanwhile are newer than the cursor and never re-read).
+
+    Otherwise pages with OFFSET. A running proxy can record new (newest) rows between pages, shifting every
+    OFFSET by one; skip the rows that shift onto the next page, or they would be counted twice (and look
+    like duplicate prompts)."""
     if hasattr(store, "iter_light"):
         yield from store.iter_light(since)
         return
     offset = 0
+    seen: set[str] = set()
     while True:
         page = store.list(limit=PAGE, offset=offset, since=since)
         if not page:
             return
-        yield from page
+        for ex in page:
+            if ex.id not in seen:
+                seen.add(ex.id)
+                yield ex
         if len(page) < PAGE:
             return
         offset += PAGE

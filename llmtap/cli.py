@@ -811,14 +811,17 @@ def flatten(ex: Any) -> dict[str, Any]:
 
 def _iter_all(store: Any, since: float | None, limit: int) -> Iterable[Any]:
     page, offset, n = 500, 0, 0
+    seen: set[str] = set()  # rows recorded meanwhile shift OFFSET pages: don't export a row twice
     while True:
         want = page if not limit else min(page, limit - n)
         if want <= 0:
             return
         batch = store.list(limit=want, offset=offset, since=since)
         for ex in batch:
-            yield ex
-        n += len(batch)
+            if ex.id not in seen:
+                seen.add(ex.id)
+                n += 1
+                yield ex
         offset += len(batch)
         if len(batch) < want:
             return
