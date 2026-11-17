@@ -6,16 +6,13 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-16
+
 ### Added
 
 - **Native Gemini API** (`generateContent` / `streamGenerateContent`): routing, usage and text extraction, and
   Google-style errors. Thanks to @KEYUR141 for the original implementation (#6). Gemini "thinking" tokens are billed as
   output, the model is read from the URL, and Gemini calls are cached and budget/loop-checked like other LLM calls.
-
-## [0.2.0] - 2026-11-16
-
-### Added
-
 - **pytest plugin** (`llmtap` fixture, `@pytest.mark.llmtap`, `--llmtap-mode`, `--llmtap-record`): per-test cassettes that
   record on first run and replay offline in CI. See `docs/pytest-plugin.md`.
 - **`llmtap report`**: self-contained HTML / Markdown / JSON cost and safety report, including a waste finder that
@@ -73,5 +70,6 @@ First public release.
 - **`llmtap demo`**: built-in mock upstream and traffic generator for trying everything without an API key.
 - Composite GitHub Action (`action.yml`) for replaying cassettes in CI.
 
-[Unreleased]: https://github.com/AshishAgrawal101/llmtap/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/AshishAgrawal101/llmtap/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/AshishAgrawal101/llmtap/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/AshishAgrawal101/llmtap/releases/tag/v0.1.0
