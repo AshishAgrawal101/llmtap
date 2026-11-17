@@ -1,7 +1,9 @@
 """Model price table and cost calculation.
 
 Prices are **published list prices in USD per 1M tokens** as of ``PRICES_AS_OF``
-(standard tier: no batch discount, no long-context surcharge, no regional uplift).
+(standard tier: no batch discount, no regional uplift). Models that charge more for long
+prompts (``_LONG``: Claude Haiku 5.5 above 100K tokens, Gemini Pro above 200K, ...) bill
+the WHOLE request at the higher rate once the prompt crosses the threshold.
 They drift; override or extend them with the config ``pricing_overrides`` table
 (``[llmtap.pricing_overrides."my-model"] input = 1.0 output = 2.0``), which wins
 over this table.  Entries marked ``# est.`` are best estimates.
@@ -270,10 +272,26 @@ def _complete(key: str, entry: dict[str, Any]) -> dict[str, float]:
         cr = inp * (0.10 if _is_anthropic(key) else 0.50)
     if cw is None:
         cw = inp * 1.25
-    return {"input": inp, "output": out, "cache_read": float(cr), "cache_write": float(cw)}
+    # round away float noise from the defaults (0.1 * 0.10 = 0.010000000000000002)
+    return {"input": inp, "output": out, "cache_read": round(float(cr), 10), "cache_write": round(float(cw), 10)}
 
 
 PRICES: dict[str, dict[str, float]] = {k: _complete(k, v) for k, v in _RAW.items()}
+
+# Long-context rate cards: built-in key -> (prompt-token threshold, prices used ABOVE it). The prompt
+# is every input token of the request, cached ones included. Only applied when the price came from the
+# built-in table (a pricing_overrides entry replaces the model's pricing entirely).
+_LONG_RAW: dict[str, tuple[int, dict[str, float]]] = {
+    "claude-haiku-5-5": (100_000, _p(0.50, 2.50)),
+    "claude-sonnet-4": (200_000, _p(6, 22.50)),          # 1M-context beta rate
+    "claude-sonnet-4-5": (200_000, _p(6, 22.50)),
+    "gemini-3-pro": (200_000, _p(4, 18, 0.4)),           # est.
+    "gemini-2.5-pro": (200_000, _p(2.50, 15, 0.25)),
+    "gemini-1.5-pro": (128_000, _p(2.50, 10, 0.625)),
+}
+LONG_CONTEXT: dict[str, tuple[int, dict[str, float]]] = {
+    k: (t, _complete(k, v)) for k, (t, v) in _LONG_RAW.items()
+}
 
 _BEDROCK_PREFIX = re.compile(
     r"^(?:(?:us|eu|apac|au|ca|jp|global)\.)?(?:anthropic|meta|mistral|amazon|cohere|ai21|deepseek|openai|qwen)\."
@@ -328,10 +346,10 @@ def _best_key(name: str, table: dict[str, Any], local: frozenset[str] = frozense
     return best
 
 
-def price_for(model: str | None, overrides: dict | None = None) -> dict[str, float] | None:
-    """USD-per-1M-token prices for `model` ({"input","output","cache_read","cache_write"}), or None."""
+def _lookup(model: str | None, overrides: dict | None) -> tuple[dict[str, float] | None, str | None]:
+    """(prices, built-in key) - the key is None when an override or the free/local rule decided."""
     if not model or not isinstance(model, str) or not model.strip():
-        return None
+        return None, None
     name, free = _normalize(model)
     builtin_key = _best_key(name, PRICES, _LOCAL)
     if overrides:
@@ -345,12 +363,19 @@ def price_for(model: str | None, overrides: dict | None = None) -> dict[str, flo
             if builtin_key is not None and okey.startswith(builtin_key) and not free:
                 base = dict(_RAW[builtin_key])
             base.update({k: v for k, v in norm_over[okey].items() if v is not None})
-            return _complete(okey, base)
+            return _complete(okey, base), None
     if free:
-        return dict(_ZERO)
+        return dict(_ZERO), None
     if builtin_key is None:
-        return None
-    return dict(PRICES[builtin_key])
+        return None, None
+    return dict(PRICES[builtin_key]), builtin_key
+
+
+def price_for(model: str | None, overrides: dict | None = None) -> dict[str, float] | None:
+    """USD-per-1M-token prices for `model` ({"input","output","cache_read","cache_write"}), or None.
+
+    These are the standard (short-prompt) rates; see ``LONG_CONTEXT`` for the long-prompt rate cards."""
+    return _lookup(model, overrides)[0]
 
 
 def cost_usd(model: str | None, usage: Usage, overrides: dict | None = None, style: str | None = None) -> float:
@@ -360,7 +385,7 @@ def cost_usd(model: str | None, usage: Usage, overrides: dict | None = None, sty
     not the model: Claude through an OpenAI-compatible router (OpenRouter, ...) reports cached tokens as
     a subset of prompt_tokens. Without `style` the model name decides (Anthropic formula for claude-*).
     """
-    price = price_for(model, overrides)
+    price, key = _lookup(model, overrides)
     if price is None:
         return 0.0
     inp = max(int(usage.input_tokens or 0), 0)
@@ -369,6 +394,11 @@ def cost_usd(model: str | None, usage: Usage, overrides: dict | None = None, sty
     cw = max(int(usage.cache_write_tokens or 0), 0)
     name = normalize_model(model or "")
     anthropic_usage = (style == "anthropic") if style else _is_anthropic(name)
+    long = LONG_CONTEXT.get(key) if key else None
+    if long is not None:
+        prompt = inp + cr + cw if anthropic_usage else (inp if cr <= inp else inp + cr)
+        if prompt > long[0]:
+            price = long[1]
     if anthropic_usage:
         total = (inp * price["input"] + cr * price["cache_read"]
                  + cw * price["cache_write"] + out * price["output"])

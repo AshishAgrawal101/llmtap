@@ -867,11 +867,17 @@ def cmd_export(args: argparse.Namespace) -> int:
 
 def cmd_prices(args: argparse.Namespace) -> int:
     from llmtap import term
-    from llmtap.pricing import PRICES
+    from llmtap.pricing import LONG_CONTEXT, PRICES
     flt = (args.filter or "").lower()
     items = sorted((k, v) for k, v in PRICES.items() if flt in k.lower())
     if args.json:
-        _out(json.dumps(dict(items), indent=2))
+        data: dict[str, Any] = {}
+        for k, v in items:
+            data[k] = dict(v)
+            if k in LONG_CONTEXT:
+                above, lp = LONG_CONTEXT[k]
+                data[k]["long_context"] = {"above_prompt_tokens": above, **lp}
+        _out(json.dumps(data, indent=2))
         return 0
     if not items:
         _out(f"no models match {args.filter!r}")
@@ -881,7 +887,12 @@ def cmd_prices(args: argparse.Namespace) -> int:
         if v is None:
             return "-"
         v = float(v)
-        return "free" if v == 0 else (f"${v:,.2f}" if v >= 0.1 else f"${v:,.3f}")
+        if v == 0:
+            return "free"
+        txt = f"{v:,.4f}".rstrip("0")             # $0.125 stays $0.125, not $0.12
+        if len(txt.split(".")[1]) < 2:
+            txt = f"{v:,.2f}"
+        return "$" + txt
 
     rows = [[k, money(v.get("input")), money(v.get("output")), money(v.get("cache_read")), money(v.get("cache_write"))]
             for k, v in items]
@@ -889,6 +900,12 @@ def cmd_prices(args: argparse.Namespace) -> int:
     _out(term.table(rows, ["MODEL", "INPUT", "OUTPUT", "CACHE READ", "CACHE WRITE"],
                     align=["<", ">", ">", ">", ">"], color=color))
     _out(term.paint(f"{len(rows)} model(s) · USD per 1M tokens · override in llmtap.toml [pricing]", "dim", color=color))
+    longs = [(k, LONG_CONTEXT[k]) for k, _ in items if k in LONG_CONTEXT]
+    if longs:
+        _out(term.paint("Long prompts are billed at a higher rate for the whole request:", "dim", color=color))
+        for k, (above, lp) in longs:
+            _out(term.paint(f"  {k}: prompts over {above // 1000}K tokens cost "
+                            f"{money(lp['input'])} in / {money(lp['output'])} out", "dim", color=color))
     return 0
 
 

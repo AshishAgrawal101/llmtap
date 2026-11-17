@@ -319,3 +319,48 @@ def test_claude_5_family_prices_match_published_list():
 def test_paid_provider_models_not_priced_as_local(model: str) -> None:
     p = price_for(model)
     assert p is None or p["input"] > 0, (model, p)
+
+
+# ------------------------------------------------------------------ long-context rate cards
+
+def test_haiku_5_5_long_prompt_uses_higher_rate_card():
+    short = Usage(input_tokens=100_000, output_tokens=1_000)
+    long = Usage(input_tokens=100_001, output_tokens=1_000)
+    assert cost_usd("claude-haiku-5-5", short) == pytest.approx((100_000 * 0.10 + 1_000 * 0.50) / 1e6)
+    assert cost_usd("claude-haiku-5-5", long) == pytest.approx((100_001 * 0.50 + 1_000 * 2.50) / 1e6)
+
+
+def test_long_prompt_threshold_counts_cached_tokens_anthropic_style():
+    # 10K fresh + 95K cache read = a 105K-token prompt: every token at the long rate
+    u = Usage(input_tokens=10_000, cache_read_tokens=95_000, output_tokens=100)
+    assert cost_usd("claude-haiku-5-5", u) == pytest.approx((10_000 * 0.50 + 95_000 * 0.05 + 100 * 2.50) / 1e6)
+
+
+def test_long_prompt_threshold_openai_style_cached_is_subset():
+    # Gemini via an OpenAI-style API: prompt_tokens (250K) already includes the cached 50K
+    u = Usage(input_tokens=250_000, cache_read_tokens=50_000, output_tokens=10)
+    assert cost_usd("gemini-2.5-pro", u, style="openai") == pytest.approx((200_000 * 2.50 + 50_000 * 0.25 + 10 * 15) / 1e6)
+    u = Usage(input_tokens=150_000, cache_read_tokens=50_000, output_tokens=10)
+    assert cost_usd("gemini-2.5-pro", u, style="openai") == pytest.approx((100_000 * 1.25 + 50_000 * 0.125 + 10 * 10) / 1e6)
+
+
+def test_long_rate_card_not_inherited_by_other_models():
+    big = Usage(input_tokens=500_000, output_tokens=0)
+    assert cost_usd("claude-sonnet-4-6", big) == pytest.approx(500_000 * 3 / 1e6)     # 1M at standard price
+    assert cost_usd("claude-haiku-4-5", big) == pytest.approx(500_000 * 1 / 1e6)
+
+
+def test_long_rate_card_applies_through_routing_prefixes():
+    big = Usage(input_tokens=150_000, output_tokens=0)
+    assert cost_usd("anthropic.claude-haiku-5-5", big) == pytest.approx(150_000 * 0.50 / 1e6)
+
+
+def test_override_replaces_long_rate_card():
+    big = Usage(input_tokens=150_000, output_tokens=0)
+    over = {"claude-haiku-5-5": {"input": 0.2, "output": 1.0}}
+    assert cost_usd("claude-haiku-5-5", big, over) == pytest.approx(150_000 * 0.2 / 1e6)
+
+
+def test_price_for_still_returns_standard_rates():
+    assert price_for("claude-haiku-5-5")["input"] == 0.10
+    assert price_for("claude-haiku-5-5")["cache_read"] == 0.01        # no float noise

@@ -246,3 +246,16 @@ def test_cli_survives_non_unicode_output_encoding(argv: list[str], tmp_path: Pat
     assert b"codec can't encode" not in p.stderr, p.stderr
     assert p.returncode in (0, 1), p.stderr  # doctor may report setup problems (1); 2 is the crash path
     assert p.stdout
+
+
+def test_prices_shows_long_context_rates_and_exact_cents(capsys):
+    import json as _json
+    from llmtap import cli as _cli
+    assert _cli.main(["prices", "claude-haiku-5-5"]) == 0
+    out = capsys.readouterr().out
+    assert "$0.125" in out                      # cache write, not rounded to $0.12
+    assert "over 100K tokens" in out and "$0.50 in / $2.50 out" in out
+    assert _cli.main(["prices", "claude-haiku-5-5", "--json"]) == 0
+    data = _json.loads(capsys.readouterr().out)
+    assert data["claude-haiku-5-5"]["long_context"]["above_prompt_tokens"] == 100_000
+    assert data["claude-haiku-5-5"]["cache_read"] == 0.01
