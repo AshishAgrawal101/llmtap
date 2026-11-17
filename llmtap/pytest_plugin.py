@@ -1,6 +1,6 @@
 """pytest plugin: record real LLM calls once, replay them forever (free, deterministic, keyless).
 
-Registered through the ``pytest11`` entry point, so ``pip install llmtap`` is all it takes. The plugin is
+Registered through the ``pytest11`` entry point, so ``pip install llmtap-proxy`` is all it takes. The plugin is
 inert until a test requests the ``llmtap`` fixture or carries ``@pytest.mark.llmtap``: no servers, no env
 changes. The proxy modules are imported lazily, only when the fixture actually runs.
 

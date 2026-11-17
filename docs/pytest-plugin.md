@@ -1,6 +1,6 @@
 # pytest plugin: record once, replay forever
 
-`pip install llmtap` also installs a pytest plugin. It turns testing LLM code into this:
+`pip install llmtap-proxy` also installs a pytest plugin. It turns testing LLM code into this:
 
 - the **first** `pytest` run calls the real API and records every exchange next to the test;
 - every run after that **replays** the recording: free, instant, deterministic, no network and no API key;
@@ -12,7 +12,7 @@ in-process proxy and its own cassette file, and the Anthropic/OpenAI SDKs are po
 ## 60-second quickstart
 
 ```bash
-pip install llmtap pytest anthropic openai
+pip install llmtap-proxy pytest anthropic openai
 ```
 
 ```python
@@ -189,7 +189,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
-      - run: pip install llmtap pytest anthropic openai
+      - run: pip install llmtap-proxy pytest anthropic openai
       - run: pytest -q          # CI=true is set by GitHub => replay mode; no API keys, no secrets
 ```
 

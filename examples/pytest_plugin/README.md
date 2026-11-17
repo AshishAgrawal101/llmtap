@@ -3,7 +3,7 @@
 Three tests for a tiny LLM feature (`app.py`), recorded once and replayed forever by the llmtap pytest plugin.
 
 ```bash
-pip install llmtap pytest      # the plugin registers itself, there is nothing to configure
+pip install llmtap-proxy pytest      # the plugin registers itself, there is nothing to configure
 cd examples/pytest_plugin
 pytest                         # replays the committed cassettes: free, offline, no API key needed
 ```
@@ -23,4 +23,4 @@ Things to try:
 - `pytest -p no:llmtap` turns the plugin off.
 
 See [`docs/pytest-plugin.md`](../../docs/pytest-plugin.md) for the full guide. `conftest.py` only exists so the example
-works from a source checkout; with `pip install llmtap` you don't need it.
+works from a source checkout; with `pip install llmtap-proxy` you don't need it.

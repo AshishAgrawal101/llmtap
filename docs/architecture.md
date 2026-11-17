@@ -57,7 +57,7 @@ use the provider's own error JSON shape, so SDKs raise their normal exception ty
 **Base URL, not MITM.** llmtap is a reverse proxy addressed by base URL, not an `HTTP_PROXY` that intercepts TLS. No
 certificates to install, nothing to trust, and it works with every SDK that lets you set a base URL.
 
-**Standard library only.** `pip install llmtap` pulls in nothing else, so it can't conflict with your app's
+**Standard library only.** `pip install llmtap-proxy` pulls in nothing else, so it can't conflict with your app's
 dependencies and it installs in seconds in CI. The trade-off is that we write our own SSE parsing and use
 `http.client` directly.
 

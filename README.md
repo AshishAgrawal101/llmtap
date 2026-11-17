@@ -36,7 +36,7 @@ every cent.
 ## ⚡ 30-second start
 
 ```bash
-pipx install git+https://github.com/AshishAgrawal101/llmtap   # stdlib only, nothing else gets installed (PyPI release coming)
+pipx install llmtap-proxy     # stdlib only, nothing else gets installed; the command is `llmtap`
 llmtap demo                    # fake LLM traffic + the live dashboard in your browser. No API key needed.
 llmtap wrap -- python app.py   # now do it for real with your own app
 ```
