@@ -170,7 +170,7 @@ import anthropic
 
 client = anthropic.Anthropic(base_url="http://127.0.0.1:4141")
 msg = client.messages.create(
-    model="claude-sonnet-4-5",
+    model="claude-sonnet-5-5",
     max_tokens=512,
     messages=[{"role": "user", "content": "Explain SSE in one paragraph."}],
 )

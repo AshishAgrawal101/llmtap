@@ -36,7 +36,7 @@ client = anthropic.Anthropic()                                    # under `llmta
 client = anthropic.Anthropic(base_url="http://127.0.0.1:4141")    # explicit
 
 with client.messages.stream(
-    model="claude-sonnet-4-5", max_tokens=512,
+    model="claude-sonnet-5-5", max_tokens=512,
     messages=[{"role": "user", "content": "Stream me a limerick."}],
 ) as stream:
     for text in stream.text_stream:
@@ -133,7 +133,7 @@ curl http://127.0.0.1:4141/groq/v1/chat/completions \
 from langchain_anthropic import ChatAnthropic
 from langchain_openai import ChatOpenAI
 
-claude = ChatAnthropic(model="claude-sonnet-4-5", base_url="http://127.0.0.1:4141")
+claude = ChatAnthropic(model="claude-sonnet-5-5", base_url="http://127.0.0.1:4141")
 gpt = ChatOpenAI(model="gpt-4o-mini", base_url="http://127.0.0.1:4141/v1")
 ```
 
@@ -149,7 +149,7 @@ from llama_index.llms.anthropic import Anthropic
 from llama_index.llms.openai import OpenAI
 
 llm = OpenAI(model="gpt-4o-mini", api_base="http://127.0.0.1:4141/v1")
-claude = Anthropic(model="claude-sonnet-4-5", base_url="http://127.0.0.1:4141")
+claude = Anthropic(model="claude-sonnet-5-5", base_url="http://127.0.0.1:4141")
 ```
 
 ## Claude Agent SDK / Claude Code

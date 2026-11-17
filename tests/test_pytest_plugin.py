@@ -87,7 +87,8 @@ class Env:
                                            "-p", "no:cacheprovider", *args)
 
     def cassettes(self, sub: str = "cassettes") -> list[Path]:
-        return sorted((self.pt.path / sub).glob("*.jsonl"))
+        # Sort by name string: WindowsPath ordering is case-insensitive, POSIX ordering is not.
+        return sorted((self.pt.path / sub).glob("*.jsonl"), key=lambda p: p.name)
 
 
 @pytest.fixture(scope="module")
