@@ -52,6 +52,9 @@ All notable changes to this project are documented here. The format is based on
   database under a folder with `#` as unreadable.
 - Token and duration formatting rolled over wrongly at unit boundaries (`1000k`, `1000ms`, `60.0s`); `~` shortening
   matched paths that merely start with the home directory's name.
+- **Dashboard:** a tab left open on a stopped llmtap retried every second or so (tens of thousands of failed requests
+  over an afternoon). It now backs off to 30 s, skips hidden tabs, reconnects by itself and shows "Offline".
+- `llmtap stats` on an empty database showed `wrap`'s base-URL hint; it now says how to record traffic.
 - Docs: install with `pip install llmtap-proxy`; routing, config flags, pipeline order and the budget API match the
   code.
 
