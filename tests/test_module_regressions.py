@@ -171,3 +171,25 @@ def test_doctor_db_path_with_hash(tmp_path: Path) -> None:
     c = doctor.check_db(Config(db_path=str(p)))
     assert c.level == doctor.OK, c
     assert "1 exchanges recorded" in c.detail
+
+
+# ------------------------------------------------------------------ term
+
+@pytest.mark.parametrize("n,expected", [(999_499, "999k"), (999_500, "1M"), (999_999, "1M"),
+                                        (999_999_999, "1B"), (1_000_000, "1M")])
+def test_fmt_tokens_rounds_up_to_next_unit(n: int, expected: str) -> None:
+    assert term.fmt_tokens(n) == expected
+
+
+@pytest.mark.parametrize("ms,expected", [(999.4, "999ms"), (999.6, "1.00s"), (9_996, "10.0s"),
+                                         (59_960, "1m00s"), (59_940, "59.9s")])
+def test_fmt_ms_rounds_up_to_next_unit(ms: float, expected: str) -> None:
+    assert term.fmt_ms(ms) == expected
+
+
+def test_short_path_only_abbreviates_inside_home(monkeypatch: pytest.MonkeyPatch) -> None:
+    home = os.sep + "home" + os.sep + "al"
+    monkeypatch.setattr(term.os.path, "expanduser", lambda p: home if p == "~" else p)
+    other = home + "ice" + os.sep + "t.jsonl"
+    assert term._short_path(other) == other
+    assert term._short_path(home + os.sep + "t.jsonl") == "~" + os.sep + "t.jsonl"

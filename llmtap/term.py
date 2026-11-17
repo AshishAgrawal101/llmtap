@@ -138,6 +138,8 @@ def fmt_tokens(n: int | float | None) -> str:
             s = f"{v:.1f}" if v < 100 else f"{v:.0f}"
             if s.endswith(".0"):
                 s = s[:-2]
+            if s == "1000" and suffix != "B":  # 999_500 rounds to "1000k": that is 1M
+                return f"{sign}1{'M' if suffix == 'k' else 'B'}"
             return f"{sign}{s}{suffix}"
     return f"{sign}{n}"  # pragma: no cover
 
@@ -149,11 +151,12 @@ def fmt_ms(ms: float | None) -> str:
     ms = float(ms)
     if ms < 1:
         return f"{ms:.1f}ms" if ms > 0 else "0ms"
-    if ms < 1000:
+    # thresholds sit half a display unit below the boundary so rounding never prints 1000ms / 10.00s / 60.0s
+    if ms < 999.5:
         return f"{ms:.0f}ms"
     s = ms / 1000
-    if s < 60:
-        return f"{s:.2f}s" if s < 10 else f"{s:.1f}s"
+    if s < 59.95:
+        return f"{s:.2f}s" if s < 9.995 else f"{s:.1f}s"
     m, sec = divmod(int(round(s)), 60)
     if m < 60:
         return f"{m}m{sec:02d}s"
@@ -330,7 +333,7 @@ def banner(cfg: Any, base_url: str, color: bool | None = None) -> str:
 
 def _short_path(path: str, width: int = 36) -> str:
     home = os.path.expanduser("~")
-    if home and home != "/" and path.startswith(home):
+    if home and home != "/" and (path == home or path.startswith(home.rstrip(os.sep) + os.sep)):
         path = "~" + path[len(home):]
     if len(path) > width:
         path = "…" + path[-(width - 1):]
