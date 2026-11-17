@@ -467,11 +467,10 @@ def cmd_wrap(args: argparse.Namespace) -> int:
     base = getattr(tap, "base_url", None) or f"http://{cfg.host}:{getattr(tap, 'port', cfg.port)}"
     env = dict(os.environ)
     env.update(env_vars(base))
-    # make sure HTTP(S)_PROXY settings don't hijack traffic to the local proxy
-    for k in ("NO_PROXY", "no_proxy"):
-        cur = env.get(k, "")
-        extra = "127.0.0.1,localhost"
-        env[k] = f"{cur},{extra}" if cur else extra
+    # make sure HTTP(S)_PROXY settings don't hijack traffic to the local proxy. Both spellings get the
+    # same merged list: most clients prefer lowercase no_proxy, which must not drop the user's NO_PROXY hosts.
+    cur = ",".join(v for v in dict.fromkeys(env.get(k, "") for k in ("NO_PROXY", "no_proxy")) if v)
+    env["NO_PROXY"] = env["no_proxy"] = f"{cur},127.0.0.1,localhost" if cur else "127.0.0.1,localhost"
     color = term.color_enabled(sys.stderr)
     if not cfg.quiet:
         print(term.paint("◉ llmtap", "bold", "bright_magenta", color=color)
@@ -488,6 +487,10 @@ def cmd_wrap(args: argparse.Namespace) -> int:
         _shutdown(tap)
         _err(f"permission denied: {cmd[0]}")
         return 126
+    except OSError as e:  # e.g. ENOEXEC / WinError 193: not a program this OS can run
+        _shutdown(tap)
+        _err(f"cannot run {cmd[0]}: {e.strerror or e}")
+        return 126
 
     def forward(signum: int, _frame: Any) -> None:
         # A terminal Ctrl-C already reaches the child (same process group). Forward only if
@@ -497,7 +500,7 @@ def cmd_wrap(args: argparse.Namespace) -> int:
             if proc.poll() is None:
                 try:
                     proc.send_signal(signum)
-                except OSError:
+                except (OSError, ValueError):  # ValueError: Windows only supports SIGTERM/CTRL_*_EVENT
                     pass
         threading.Thread(target=later, daemon=True).start()
 

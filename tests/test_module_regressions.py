@@ -65,3 +65,72 @@ def test_demo_send_ignores_http_proxy(tap: Any, monkeypatch: pytest.MonkeyPatch)
     first, _pool = demo._script()
     status, _body = demo.send(t.base_url, first[2])
     assert status == 200
+
+
+# ------------------------------------------------------------------ wrap
+
+def test_wrap_exec_format_error_is_reported(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                            capfd: pytest.CaptureFixture[str]) -> None:
+    def boom(*_a: Any, **_k: Any) -> Any:
+        raise OSError(8, "Exec format error")
+
+    monkeypatch.setattr(cli.subprocess, "Popen", boom)
+    rc = cli.main(["wrap", "--db", str(tmp_path / "w.db"), "--quiet", "--", "./not-a-program.txt"])
+    _out, err = capfd.readouterr()
+    assert rc == 126
+    assert "Exec format error" in err and "Traceback" not in err
+
+
+def test_wrap_signal_forwarding_survives_unsupported_signal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                            capfd: pytest.CaptureFixture[str]) -> None:
+    """On Windows Popen.send_signal(SIGINT) raises ValueError; that must not escape the forwarding thread."""
+    errors: list[BaseException | None] = []
+    monkeypatch.setattr(threading, "excepthook", lambda a: errors.append(a.exc_value))
+
+    class SlowToExit:
+        def __init__(self, *_a: Any, **_k: Any) -> None:
+            pass
+
+        def poll(self) -> None:
+            return None
+
+        def send_signal(self, sig: int) -> None:
+            raise ValueError(f"Unsupported signal: {sig}")
+
+        def wait(self) -> int:
+            signal.getsignal(signal.SIGINT)(signal.SIGINT, None)  # what Ctrl-C does to llmtap
+            time.sleep(0.8)  # the child is still busy when the forwarder fires
+            return 0
+
+    monkeypatch.setattr(cli.subprocess, "Popen", SlowToExit)
+    rc = cli.main(["wrap", "--db", str(tmp_path / "w.db"), "--quiet", "--", "child"])
+    capfd.readouterr()
+    assert rc == 0
+    assert errors == []
+
+
+def test_wrap_keeps_users_no_proxy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                   capfd: pytest.CaptureFixture[str]) -> None:
+    """Python, curl & co. prefer lowercase no_proxy; it must still contain the user's own NO_PROXY hosts."""
+    seen: dict[str, str] = {}
+
+    class Done:
+        def __init__(self, _cmd: Any, env: dict[str, str] | None = None, **_k: Any) -> None:
+            seen.update(env or {})
+
+        def poll(self) -> int:
+            return 0
+
+        def wait(self) -> int:
+            return 0
+
+    monkeypatch.delenv("no_proxy", raising=False)
+    monkeypatch.delenv("NO_PROXY", raising=False)
+    monkeypatch.setenv("NO_PROXY", "corp.example")
+    monkeypatch.setattr(cli.subprocess, "Popen", Done)
+    assert cli.main(["wrap", "--db", str(tmp_path / "w.db"), "--quiet", "--", "child"]) == 0
+    capfd.readouterr()
+    values = [v for k, v in seen.items() if k.lower() == "no_proxy"]
+    assert values
+    for v in values:
+        assert "corp.example" in v.split(",") and "127.0.0.1" in v.split(",")
