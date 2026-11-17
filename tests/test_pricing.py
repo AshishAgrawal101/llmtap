@@ -396,3 +396,11 @@ def test_openai_flex_tier_is_half_price():
     assert cost_usd("gpt-5", u) == pytest.approx((1.25 + 10) / 2)
     u.service_tier = "default"
     assert cost_usd("gpt-5", u) == pytest.approx(1.25 + 10)
+
+
+def test_partial_override_keeps_long_context_card():
+    big = Usage(input_tokens=300_000, output_tokens=0)
+    over = {"claude-sonnet-4-5": {"cache_write": 4.0}}
+    assert cost_usd("claude-sonnet-4-5", big, over) == pytest.approx(300_000 * 6 / 1e6)
+    over = {"claude-sonnet-4-5": {"input": 1.0}}                          # a price change replaces it
+    assert cost_usd("claude-sonnet-4-5", big, over) == pytest.approx(300_000 * 1 / 1e6)

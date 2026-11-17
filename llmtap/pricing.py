@@ -367,8 +367,11 @@ def _lookup(model: str | None, overrides: dict | None) -> tuple[dict[str, float]
             base: dict[str, Any] = {}
             if builtin_key is not None and okey.startswith(builtin_key) and not free:
                 base = dict(_RAW[builtin_key])
-            base.update({k: v for k, v in norm_over[okey].items() if v is not None})
-            return _complete(okey, base), None
+            given = {k: v for k, v in norm_over[okey].items() if v is not None}
+            base.update(given)
+            # an override that only tweaks e.g. cache_write keeps the model's long-prompt rate card
+            keep_long = bool(base) and builtin_key is not None and not ({"input", "output"} & set(given))
+            return _complete(okey, base), (builtin_key if keep_long else None)
     if free:
         return dict(_ZERO), None
     if builtin_key is None:

@@ -6,6 +6,7 @@ the dashboard and tests don't care about ``http.server``. ``_Handler`` adapts
 """
 from __future__ import annotations
 
+import dataclasses
 import gzip
 import http.client
 import ipaddress
@@ -579,7 +580,7 @@ class LLMTap:
 
         cacheable = llm
         key = cache_key(route.provider, route.upstream_path, send_body) if cacheable else ""
-        ex.request_key = key or None
+        ex.request_key = key if key and send_body else None
 
         # loop breaker: counts every identical generation call, even ones the cache will answer (a stuck
         # agent replaying a cached request would otherwise loop forever)
@@ -902,7 +903,10 @@ class LLMTap:
 
     def _price(self, ex: Exchange) -> float:
         try:
-            return float(cost_usd(ex.model, ex.usage, self.cfg.pricing_overrides, style=ex.style) or 0.0)
+            usage = ex.usage
+            if usage.service_tier and ex.provider != "openai":     # only OpenAI's flex tier is half price
+                usage = dataclasses.replace(usage, service_tier="")
+            return float(cost_usd(ex.model, usage, self.cfg.pricing_overrides, style=ex.style) or 0.0)
         except Exception:
             return 0.0
 

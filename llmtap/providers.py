@@ -76,6 +76,28 @@ def _normalize_openai_path(path: str, base: str) -> str:
     return "/v1" + path
 
 
+def upstream_path_for(provider: str, path: str, cfg: Config | None = None) -> str:
+    """The upstream path the proxy sent for a request it recorded as (``provider``, client ``path``): strips a
+    ``/<provider>/`` routing prefix and applies OpenAI's ``/v1`` normalization, like :func:`resolve_route`.
+    Used to key rows that were recorded before the request key was stored."""
+    cfg = cfg or Config()
+    path = path or "/"
+    if not path.startswith("/"):
+        path = "/" + path
+    upstreams = getattr(cfg, "upstreams", None) or {}
+    if provider in upstreams and (path == f"/{provider}" or path.startswith(f"/{provider}/")
+                                  or path.startswith(f"/{provider}?")):
+        pure, sep, query = path.partition("?")
+        rest = pure[len(provider) + 1:] or "/"
+        base, style = _upstream(cfg, provider)
+        up = rest + (sep + query if sep else "")
+        return _normalize_openai_path(up, base) if style == "openai" else up
+    if provider == "openai":
+        base, style = _upstream(cfg, "openai")
+        return _normalize_openai_path(path, base) if style == "openai" else path
+    return path
+
+
 def resolve_route(path: str, headers: Mapping[str, str], cfg: Config) -> Route:
     """Decide which upstream a proxied request goes to (see module docstring for path rules)."""
     path = path or "/"

@@ -111,3 +111,81 @@ def test_iter_light_ignores_rows_recorded_mid_scan():
         seen.append(e.id)
         s.record(Exchange(ts=BASE + 1000 + len(seen), request_body="new"))   # newer than the cursor
     assert len(seen) == len(set(seen)) == 10
+
+
+def test_legacy_rows_on_prefix_routes_group_with_new_rows():
+    s = Store(":memory:")
+    old = ex("same", ts=BASE, cost=0.5, provider="groq", path="/groq/v1/chat/completions")    # pre-upgrade row
+    new = ex("same", ts=BASE + 5, cost=0.5, provider="groq", path="/groq/v1/chat/completions")
+    new.request_key = cache_key("groq", "/v1/chat/completions", new.request_body.encode())    # as the proxy keys it
+    s.record(old)
+    s.record(new)
+    old2 = ex("bare", ts=BASE, cost=0.2, path="/chat/completions")                             # openai without /v1
+    new2 = ex("bare", ts=BASE + 5, cost=0.2, path="/chat/completions")
+    new2.request_key = cache_key("openai", "/v1/chat/completions", new2.request_body.encode())
+    s.record(old2)
+    s.record(new2)
+    assert report.find_waste(s)["duplicate_requests"] == 2
+    assert report.build_report(s, since=None)["waste"]["duplicate_requests"] == 2
+
+
+def test_iter_legacy_waste_pages_without_losing_rows():
+    s = Store(":memory:")
+    for i in range(11):
+        s.record(ex(f"p{i}", ts=BASE + (i // 4)))
+    rows = list(s.iter_legacy_waste(page=3))
+    assert len(rows) == 11 and len({r[0] for r in rows}) == 11
+
+
+def test_migration_tolerates_a_column_another_process_just_added(tmp_path: Path):
+    db = tmp_path / "race.db"
+    Store(str(db)).close()
+
+    class Stale:
+        """A connection whose first table_info misses request_key, as if read just before another process
+        added it."""
+        def __init__(self, c):
+            self.c, self.stale = c, True
+
+        def execute(self, sql, *a):
+            cur = self.c.execute(sql, *a)
+            if self.stale and sql.startswith("PRAGMA table_info"):
+                self.stale = False
+                return [r for r in cur.fetchall() if r[1] != "request_key"]
+            return cur
+
+    c = sqlite3.connect(db)
+    Store._migrate(Stale(c))          # used to raise "duplicate column name: request_key"
+    c.close()
+
+
+def test_read_only_old_database_still_opens(tmp_path: Path):
+    import os
+    import stat
+    db = tmp_path / "ro.db"
+    c = sqlite3.connect(db)
+    c.execute("CREATE TABLE exchanges (id TEXT PRIMARY KEY, ts REAL NOT NULL, provider TEXT NOT NULL DEFAULT 'openai', "
+              "path TEXT NOT NULL DEFAULT '', request_body TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT 'upstream', "
+              "status INTEGER NOT NULL DEFAULT 200, cost_usd REAL NOT NULL DEFAULT 0)")
+    for i, t in enumerate((BASE, BASE + 1)):
+        c.execute("INSERT INTO exchanges (id, ts, request_body, cost_usd) VALUES (?, ?, '{\"m\":1}', 0.5)", (f"id{i}", t))
+    c.commit()
+    c.close()
+    os.chmod(db, stat.S_IREAD)
+    try:
+        s = Store(str(db))
+        assert len(s.list(limit=10)) == 2 and s.get("id0").request_key is None
+        assert report.find_waste(s)["duplicate_requests"] == 1
+        assert s.stats()["requests"] == 2
+        s.close()
+    finally:
+        os.chmod(db, stat.S_IREAD | stat.S_IWRITE)
+
+
+def test_iter_legacy_waste_window_and_all_time_agree():
+    s = Store(":memory:")
+    for i in range(13):
+        s.record(ex(f"p{i}", ts=BASE + i))
+    every = {r[0] for r in s.iter_legacy_waste(page=4)}
+    window = {r[0] for r in s.iter_legacy_waste(since=BASE + 6, page=4)}
+    assert len(every) == 13 and len(window) == 7 and window <= every

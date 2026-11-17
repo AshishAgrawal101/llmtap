@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 from pathlib import Path
@@ -57,6 +58,12 @@ _CACHE_SOURCES = ("cache", "cassette")
 _BLOCK_SOURCES = ("blocked", "budget", "loop")
 
 
+def _column_default(decl: str) -> str:
+    """The SQL DEFAULT of a column declaration (``"INTEGER NOT NULL DEFAULT 0"`` -> ``"0"``), else NULL."""
+    m = re.search(r"DEFAULT\s+('(?:[^']|'')*'|\S+)", decl)
+    return m.group(1) if m else "NULL"
+
+
 def _like_escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
@@ -90,19 +97,40 @@ class Store:
         cols = ",\n  ".join(f"{n} {t}" for n, t in COLUMNS)
         c.execute(f"CREATE TABLE IF NOT EXISTS exchanges (\n  {cols}\n)")
         existing = {row[1] for row in c.execute("PRAGMA table_info(exchanges)")}
-        for name, typ in COLUMNS:
-            if name not in existing:
-                # ADD COLUMN can't take PRIMARY KEY; strip constraints that ALTER disallows.
-                c.execute(f"ALTER TABLE exchanges ADD COLUMN {name} {typ.replace('PRIMARY KEY', '')}")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_exchanges_ts ON exchanges(ts)")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_exchanges_source_ts ON exchanges(source, ts)")
-        # Waste finder: duplicate generation calls are found from this index alone, without reading the
-        # (large) rows. Rows recorded before schema 2 have no key and take the slow path.
-        c.execute("CREATE INDEX IF NOT EXISTS idx_exchanges_waste "
-                  "ON exchanges(source, request_key, status, ts, cost_usd)")
-        version = c.execute("PRAGMA user_version").fetchone()[0]
-        if version < SCHEMA_VERSION:
-            c.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        missing = [(n, t) for n, t in COLUMNS if n not in existing]
+        try:
+            for name, typ in missing:
+                try:
+                    # ADD COLUMN can't take PRIMARY KEY; strip constraints that ALTER disallows.
+                    c.execute(f"ALTER TABLE exchanges ADD COLUMN {name} {typ.replace('PRIMARY KEY', '')}")
+                except sqlite3.OperationalError as e:
+                    if "duplicate column" not in str(e).lower():   # another process just added it
+                        raise
+            c.execute("CREATE INDEX IF NOT EXISTS idx_exchanges_ts ON exchanges(ts)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_exchanges_source_ts ON exchanges(source, ts)")
+            # Waste finder: duplicate generation calls are found from this index alone, without reading
+            # the (large) rows. Rows recorded before schema 2 have no key and take the slow path.
+            c.execute("CREATE INDEX IF NOT EXISTS idx_exchanges_waste "
+                      "ON exchanges(source, request_key, status, ts, cost_usd)")
+            version = c.execute("PRAGMA user_version").fetchone()[0]
+            if version < SCHEMA_VERSION:
+                c.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        except sqlite3.OperationalError as e:
+            if "readonly" not in str(e).lower().replace("-", "").replace(" ", ""):
+                raise
+            # A read-only database from an older version: present the missing columns as NULL through a
+            # TEMP view (temp objects are writable on a read-only connection and shadow main.exchanges).
+            still = {row[1] for row in c.execute("PRAGMA main.table_info(exchanges)")}
+            extra = ", ".join(f"{_column_default(t)} AS {n}" for n, t in COLUMNS if n not in still)
+            if extra:
+                # rowid is exposed as a column: queries order and page by it, and views have none of their own
+                c.execute(f"CREATE TEMP VIEW IF NOT EXISTS exchanges AS "
+                          f"SELECT rowid AS rowid, *, {extra} FROM main.exchanges")
+
+    def _has_waste_index(self) -> bool:
+        with self._lock:
+            return self._c().execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_exchanges_waste'").fetchone() is not None
 
     def schema_version(self) -> int:
         """Return the on-disk schema version (PRAGMA user_version)."""
@@ -267,31 +295,53 @@ class Store:
                 return
             last = (rows[-1][ts_i], rows[-1][0])
 
-    def waste_groups(self, since: float | None = None) -> tuple[list[tuple], list[tuple]]:
-        """Successful upstream generation calls for the waste finder, as two lists:
-
-        * groups: ``(request_key, count, total_cost, first_ts, first_cost, last_ts)`` for request keys
-          seen at least twice, computed from ``idx_exchanges_waste`` alone (SQLite returns the
-          ``cost_usd`` of the row that has ``MIN(ts)``);
-        * legacy: ``(id, ts, cost_usd, provider, path, model, request_body)`` for rows recorded
-          before request keys were stored (the caller has to compute their keys).
-        """
+    def waste_groups(self, since: float | None = None) -> list[tuple]:
+        """``(request_key, count, total_cost, first_ts, first_cost, last_ts)`` for request keys of successful
+        upstream calls seen at least twice, from ``idx_exchanges_waste`` alone (SQLite returns the
+        ``cost_usd`` of the row that has ``MIN(ts)``). Rows without a key: see :meth:`iter_legacy_waste`."""
         ok = "source = 'upstream' AND status >= 200 AND status < 300"
         span, args = ("", []) if since is None else (" AND ts >= ?", [float(since)])
+        hint = " INDEXED BY idx_exchanges_waste" if self._has_waste_index() else ""
         with self._lock:
             c = self._c()
-            base = (f"FROM exchanges INDEXED BY idx_exchanges_waste WHERE {ok} AND request_key IS NOT NULL{span} "
+            base = (f"FROM exchanges{hint} WHERE {ok} AND request_key IS NOT NULL{span} "
                     f"GROUP BY request_key HAVING COUNT(*) > 1")
             # a bare column comes from the MIN(ts) row only when MIN is the query's sole min/max aggregate
             first = c.execute(f"SELECT request_key, COUNT(*), SUM(cost_usd), MIN(ts), cost_usd {base}", args).fetchall()
             last = dict(c.execute(f"SELECT request_key, MAX(ts) {base}", args).fetchall())
-            groups = [(*row, last.get(row[0], row[3])) for row in first]
-            legacy = c.execute(
-                f"SELECT id, ts, cost_usd, provider, path, model, request_body FROM exchanges "
-                f"WHERE {ok} AND request_key IS NULL AND request_body != ''{span}",
-                args,
-            ).fetchall()
-        return groups, legacy
+        return [(*row, last.get(row[0], row[3])) for row in first]
+
+    def iter_legacy_waste(self, since: float | None = None, page: int = 500) -> Iterator[tuple]:
+        """``(id, ts, cost_usd, provider, path, model, request_body)`` for successful upstream calls that were
+        recorded without a request key (before schema 2, or by an older llmtap), in keyset pages so request
+        bodies are never all held in memory at once. Order is unspecified.
+
+        All-time scans walk the table in rowid (storage) order, which reads sequentially; time windows use the
+        ts index so a short window stays cheap on a big database."""
+        ok = "source = 'upstream' AND status >= 200 AND status < 300 AND request_key IS NULL AND request_body != ''"
+        by_rowid = since is None
+        table = "exchanges NOT INDEXED" if by_rowid and self._has_waste_index() else "exchanges"
+        last: tuple | None = None
+        while True:
+            where = [ok]
+            args: list[Any] = []
+            if since is not None:
+                where.append("ts >= ?")
+                args.append(float(since))
+            if last is not None:
+                where.append("rowid > ?" if by_rowid else "(ts, rowid) < (?, ?)")
+                args.extend(last)
+            order = "rowid" if by_rowid else "ts DESC, rowid DESC"
+            sql = (f"SELECT rowid, id, ts, cost_usd, provider, path, model, request_body FROM {table} "
+                   f"WHERE {' AND '.join(where)} ORDER BY {order} LIMIT ?")
+            args.append(int(page))
+            with self._lock:
+                rows = self._c().execute(sql, args).fetchall()
+            for r in rows:
+                yield r[1:]
+            if len(rows) < page:
+                return
+            last = (rows[-1][0],) if by_rowid else (rows[-1][2], rows[-1][0])
 
     def waste_detail(self, key: str, since: float | None = None) -> tuple[str | None, str | None, list[str]]:
         """(id of the earliest call, its provider, distinct models) for one request key."""

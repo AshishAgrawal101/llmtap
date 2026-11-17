@@ -203,4 +203,13 @@ def test_generation_calls_store_their_cache_key(mk):
     ex = last(tap)
     assert ex.request_key == cache_key("anthropic", "/v1/messages", ex.request_body.encode())
     call(tap, "GET", "/v1/models", None, {"x-api-key": "k"})
-    assert last(tap).request_key is None
+    assert last(tap, 2).request_key is None                       # wait for the GET's row, not the POST's
+
+
+def test_flex_discount_only_for_openai(mk):
+    from llmtap.models import Exchange
+    tap, up = mk()
+    u = Usage(input_tokens=1_000_000, output_tokens=0, service_tier="flex")
+    full = cost_usd("gpt-5", Usage(input_tokens=1_000_000))
+    assert tap._price(Exchange(provider="openai", style="openai", model="gpt-5", usage=u)) == pytest.approx(full / 2)
+    assert tap._price(Exchange(provider="groq", style="openai", model="gpt-5", usage=u)) == pytest.approx(full)

@@ -154,7 +154,8 @@ def safe_preview(p: Any) -> str:
 
 
 def _request_key(ex: Exchange, memo: dict[bytes, str] | None = None) -> str:
-    """Same key `--cache` would use (provider + path + canonical body), so 'savings' are real.
+    """Same key `--cache` would use (provider + upstream path + canonical body), so 'savings' are real, and so
+    rows recorded before keys were stored group with newer rows of the same request.
 
     ``memo`` caches keys by a digest of the raw request, so identical requests (the common case for
     waste) are canonicalized once instead of JSON-parsed and re-serialized every time."""
@@ -171,7 +172,8 @@ def _request_key(ex: Exchange, memo: dict[bytes, str] | None = None) -> str:
             return hit
     try:
         from llmtap.cache import cache_key
-        key = cache_key(ex.provider, ex.path or "", body)
+        from llmtap.providers import upstream_path_for
+        key = cache_key(ex.provider, upstream_path_for(ex.provider, ex.path or ""), body)
     except Exception:  # pragma: no cover - cache.py unavailable
         key = f"{ex.provider}\n{ex.path}\n{ex.request_body}"
     if memo is not None:
@@ -273,54 +275,55 @@ def find_waste(store: Any, since: float | None = None) -> dict[str, Any]:
 def _find_waste_indexed(store: Any, since: float | None) -> dict[str, Any]:
     """find_waste on a Store with stored request keys: duplicate groups come from an index-only SQL
     aggregate; only rows recorded before keys were stored are read and hashed in Python."""
-    groups, legacy = store.waste_groups(since)
+    groups = store.waste_groups(since)
+    legacy = store.iter_legacy_waste(since)
     aggs: dict[str, dict[str, Any]] = {}
     for key, n, total, first_ts, first_cost, last_ts in groups:
         aggs[key] = {"n": int(n), "total": float(total or 0.0), "first_ts": float(first_ts),
                      "first_cost": float(first_cost or 0.0), "last_ts": float(last_ts),
                      "first_id": None, "provider": None, "models": None}
-    if legacy:
-        memo: dict[bytes, str] = {}
-        legacy_aggs: dict[str, dict[str, Any]] = {}
-        for ex_id, ts, cost, provider, path, model, body in legacy:
-            key = _request_key(Exchange(id=ex_id, provider=provider, path=path, request_body=body), memo)
-            cost = float(cost or 0.0)
-            a = legacy_aggs.get(key)
-            if a is None:
-                legacy_aggs[key] = {"n": 1, "total": cost, "first_ts": ts, "first_cost": cost, "last_ts": ts,
-                                    "first_id": ex_id, "provider": provider, "models": {model} if model else set()}
-                continue
+    memo: dict[bytes, str] = {}
+    legacy_aggs: dict[str, dict[str, Any]] = {}
+    # rows recorded without a key, streamed in pages
+    for ex_id, ts, cost, provider, path, model, body in legacy:
+        key = _request_key(Exchange(id=ex_id, provider=provider, path=path, request_body=body), memo)
+        cost = float(cost or 0.0)
+        a = legacy_aggs.get(key)
+        if a is None:
+            legacy_aggs[key] = {"n": 1, "total": cost, "first_ts": ts, "first_cost": cost, "last_ts": ts,
+                                "first_id": ex_id, "provider": provider, "models": {model} if model else set()}
+            continue
+        a["n"] += 1
+        a["total"] += cost
+        if model:
+            a["models"].add(model)
+        if ts < a["first_ts"]:
+            a.update(first_ts=ts, first_cost=cost, first_id=ex_id, provider=provider)
+        a["last_ts"] = max(a["last_ts"], ts)
+    # merge with keyed groups; a legacy row may duplicate a keyed request seen only once
+    singles = [k for k in legacy_aggs if k not in aggs]
+    if singles and hasattr(store, "rows_for_keys"):
+        for key, ts, cost, ex_id, model, provider in store.rows_for_keys(singles, since):
+            a = legacy_aggs[key]
             a["n"] += 1
-            a["total"] += cost
+            a["total"] += float(cost or 0.0)
             if model:
                 a["models"].add(model)
             if ts < a["first_ts"]:
-                a.update(first_ts=ts, first_cost=cost, first_id=ex_id, provider=provider)
+                a.update(first_ts=ts, first_cost=float(cost or 0.0), first_id=ex_id, provider=provider)
             a["last_ts"] = max(a["last_ts"], ts)
-        # merge with keyed groups; a legacy row may duplicate a keyed request seen only once
-        singles = [k for k in legacy_aggs if k not in aggs]
-        if singles and hasattr(store, "rows_for_keys"):
-            for key, ts, cost, ex_id, model, provider in store.rows_for_keys(singles, since):
-                a = legacy_aggs[key]
-                a["n"] += 1
-                a["total"] += float(cost or 0.0)
-                if model:
-                    a["models"].add(model)
-                if ts < a["first_ts"]:
-                    a.update(first_ts=ts, first_cost=float(cost or 0.0), first_id=ex_id, provider=provider)
-                a["last_ts"] = max(a["last_ts"], ts)
-        for key, la in legacy_aggs.items():
-            a = aggs.get(key)
-            if a is None:
-                aggs[key] = la
-                continue
-            a["n"] += la["n"]
-            a["total"] += la["total"]
-            a["last_ts"] = max(a["last_ts"], la["last_ts"])
-            a["legacy_models"] = la["models"]
-            if la["first_ts"] < a["first_ts"]:
-                a.update(first_ts=la["first_ts"], first_cost=la["first_cost"], first_id=la["first_id"],
-                         provider=la["provider"])
+    for key, la in legacy_aggs.items():
+        a = aggs.get(key)
+        if a is None:
+            aggs[key] = la
+            continue
+        a["n"] += la["n"]
+        a["total"] += la["total"]
+        a["last_ts"] = max(a["last_ts"], la["last_ts"])
+        a["legacy_models"] = la["models"]
+        if la["first_ts"] < a["first_ts"]:
+            a.update(first_ts=la["first_ts"], first_cost=la["first_cost"], first_id=la["first_id"],
+                     provider=la["provider"])
 
     out: list[dict[str, Any]] = []
     dup_requests = 0
