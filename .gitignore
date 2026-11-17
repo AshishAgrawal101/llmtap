@@ -41,3 +41,5 @@ LAUNCH_KIT.md
 *.egg-info/
 __pycache__/
 .pytest_cache/
+launch/
+*.patch

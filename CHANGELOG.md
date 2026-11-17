@@ -6,6 +6,37 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-16
+
+### Added
+
+- **pytest plugin** (`llmtap` fixture, `@pytest.mark.llmtap`, `--llmtap-mode`, `--llmtap-record`): per-test cassettes that
+  record on first run and replay offline in CI. See `docs/pytest-plugin.md`.
+- **`llmtap report`**: self-contained HTML / Markdown / JSON cost and safety report, including a waste finder that
+  shows what `--cache` would have saved.
+- **`llmtap doctor [--online]`**: setup checks with fix hints.
+- `llmtap stats` shows potential savings from caching.
+
+### Fixed
+
+- `--by tag:<name>` on SQLite older than 3.45 (use `json_each` instead of a JSON path).
+- Non-generation endpoints (`count_tokens`, batches, files) are recorded but no longer cached, budget- or loop-checked,
+  or priced. In replay mode these requests now reach the real upstream.
+- Multipart and binary request bodies are forwarded byte-for-byte, even with `--guard redact`.
+- In-band stream errors (`event: error`, `response.failed`) are no longer recorded as successful, priced or cached.
+- Stored bodies are capped at 2M characters; undecodable (br/zstd) responses are relayed untouched and not cached.
+- HEAD/304 keep the upstream `Content-Length`; read timeouts after headers return 504.
+- Claude Code OAuth traffic (`anthropic-*` headers only) is routed to the Anthropic upstream.
+- Budget and cache updates now happen before the final response byte, fixing a race on rapid follow-up requests.
+
+### Security
+
+- Credentials echoed back by an upstream, and secret query parameters (`?key=...`), are scrubbed from the database,
+  cache and cassettes.
+- Dashboard routes reject requests with a non-local `Host` header (DNS-rebinding defense), and
+  `POST /_llmtap/api/clear` rejects cross-site requests.
+- A prominent warning is printed when binding to a non-loopback address.
+
 ## [0.1.0] - 2026-11-05
 
 First public release.

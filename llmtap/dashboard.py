@@ -6,6 +6,7 @@ Everything here talks to the proxy through a tiny surface: ``tap.store``, ``tap.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import queue
 import time
@@ -331,8 +332,42 @@ def _events(tap: "LLMTap", respond: Responder) -> None:
             pass
 
 
+def _hostname(host: str) -> str:
+    """Hostname part of a Host header value: ``[::1]:4141`` -> ``::1``, ``LocalHost:80`` -> ``localhost``."""
+    host = host.strip().lower()
+    if host.startswith("["):
+        return host[1:].split("]", 1)[0]
+    if host.count(":") == 1:
+        host = host.split(":", 1)[0]
+    return host.rstrip(".")
+
+
+def _host_allowed(tap: "LLMTap", headers: Any) -> bool:
+    """DNS-rebinding defense: the dashboard only answers to Host headers naming this machine.
+
+    Allowed: localhost, 127.0.0.1, ::1 (and any loopback IP literal), the configured host, and -- only when
+    llmtap is deliberately bound to a non-loopback address -- any IP literal (a rebinding page can only ever
+    send a *hostname*). A missing Host header (HTTP/1.0 tools) is allowed.
+    """
+    raw = _header(headers, "host")
+    if raw is None or not raw.strip():
+        return True
+    name = _hostname(raw)
+    cfg_host = _hostname(str(getattr(tap.cfg, "host", "") or ""))
+    if name in ("localhost", "127.0.0.1", "::1") or (cfg_host and name == cfg_host):
+        return True
+    try:
+        ip = ipaddress.ip_address(name)
+    except ValueError:
+        return False
+    return ip.is_loopback or bool(getattr(tap, "is_exposed", False))
+
+
 def _same_origin(headers: Any) -> bool:
     """Reject cross-site POSTs (a random web page must not be able to wipe your history)."""
+    fetch_site = _header(headers, "sec-fetch-site")
+    if fetch_site is not None and fetch_site.strip().lower() not in ("same-origin", "none"):
+        return False
     origin = _header(headers, "origin")
     if not origin or origin == "null":
         return origin is None
@@ -349,6 +384,10 @@ def handle_internal(tap: "LLMTap", method: str, path: str, headers: Any, body: b
     qs = parse_qs(parts.query, keep_blank_values=False)
     sub = route[len(PREFIX):] or ""
     method = method.upper()
+    if not _host_allowed(tap, headers):
+        _error(respond, 403, "llmtap: request rejected (Host header is not this machine; "
+                             "possible DNS-rebinding attack). Use http://localhost or http://127.0.0.1.")
+        return True
 
     try:
         if sub == "":

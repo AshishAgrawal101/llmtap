@@ -223,6 +223,20 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--delay", type=float, default=0.3, help="seconds between demo requests")
     sp.add_argument("--exit", action="store_true", help="exit (with a summary) once the demo traffic is done")
     sp.add_argument("--quiet", "-q", action="store_true", help="no per-request log lines")
+
+    sp = add("report", "shareable cost & safety report: spend, waste finder, guard findings (HTML / md / json)", [db])
+    sp.add_argument("--since", type=_since_arg, default="7d", metavar="WHEN",
+                    help="30m, 24h, 7d, today, 2026-01-31 or all (default 7d)")
+    sp.add_argument("-o", "--output", default=None, metavar="FILE",
+                    help="output file (default llmtap-report.html; '-' = stdout)")
+    sp.add_argument("--format", "-f", choices=["html", "md", "json"], default=None,
+                    help="html (default; or inferred from -o extension), md or json")
+    sp.add_argument("--open", action="store_true", help="open the HTML report in your browser")
+
+    sp = add("doctor", "check your setup (port, db, env vars, SDK base URLs) and print fix hints", [db])
+    sp.add_argument("--online", action="store_true", help="also check that the upstream API hosts are reachable (5s timeout)")
+    sp.add_argument("--host", default=S)
+    sp.add_argument("--port", type=int, default=S)
     return parser
 
 
@@ -510,18 +524,22 @@ def cmd_stats(args: argparse.Namespace) -> int:
     group = args.by or "model"
     try:
         st = store.stats(since=args.since, group_by=group)
+        waste_usd, waste_n = _potential_savings(store, args.since)
     except ValueError as e:
         _err(str(e))
         return 2
     finally:
         store.close()
     if args.json:
+        st = dict(st, potential_savings_usd=waste_usd, duplicate_requests=waste_n)
         _out(json.dumps(st, indent=2, default=str))
         return 0
     color = _color_out()
     label = "all time" if args.since is None else "since " + time.strftime("%Y-%m-%d %H:%M", time.localtime(args.since))
     totals = {k: v for k, v in st.items() if k != "groups"}
     _out(term.summary(totals, float(st.get("cost_usd", 0) or 0), color=color, title=f"llmtap stats · {label}"))
+    if int(st.get("requests", 0) or 0) > 0:
+        _out(_savings_line(waste_usd, waste_n, color))
     groups = st.get("groups") or []
     if groups:
         total_cost = float(st.get("cost_usd", 0) or 0)
@@ -539,6 +557,21 @@ def cmd_stats(args: argparse.Namespace) -> int:
             ])
         _out(term.table(rows, [group.upper(), "REQS", "IN", "OUT", "COST", "SHARE"], color=color))
     return 0
+
+
+def _potential_savings(store: Any, since: float | None) -> tuple[float, int]:
+    """Waste-finder numbers for ``stats``; (0, 0) if the report module is unavailable."""
+    try:
+        from llmtap.report import potential_savings
+        return potential_savings(store, since)
+    except ImportError:  # pragma: no cover
+        return 0.0, 0
+
+
+def _savings_line(usd: float, n: int, color: bool) -> str:
+    from llmtap import term
+    amount = term.paint(term.fmt_usd(usd), "bold", "green" if usd > 0 else "dim", color=color)
+    return f"Potential savings from caching: {amount} ({n} duplicate request{'s' if n != 1 else ''})"
 
 
 def fmt_int(n: Any) -> str:
@@ -919,10 +952,67 @@ def cmd_demo(args: argparse.Namespace) -> int:
     return 0
 
 
+_REPORT_EXT = {".md": "md", ".markdown": "md", ".json": "json", ".html": "html", ".htm": "html"}
+
+
+def cmd_report(args: argparse.Namespace) -> int:
+    """`llmtap report`: build the cost & safety report and write/print it."""
+    from llmtap import report, term
+    out = args.output
+    fmt = args.format
+    if fmt is None:
+        ext = os.path.splitext(out)[1].lower() if out and out != "-" else ""
+        fmt = _REPORT_EXT.get(ext, "html")
+    store = _open_store(args)
+    try:
+        data = report.build_report(store, since=args.since)
+    finally:
+        store.close()
+    text = {"html": report.render_html, "md": report.render_markdown, "json": report.render_json}[fmt](data)
+    if out is None:
+        out = "llmtap-report.html" if fmt == "html" else "-"
+    if out == "-":
+        sys.stdout.write(text if text.endswith("\n") else text + "\n")
+        sys.stdout.flush()
+        return 0
+    with open(out, "w", encoding="utf-8") as f:
+        f.write(text)
+    t, w = data["totals"], data["waste"]
+    color = _color_out()
+    path = os.path.abspath(out)
+    _out(f"{term.paint('✓', 'bold', 'green', color=color)} wrote {out} "
+         + term.paint(f"({fmt}, {t['requests']:,} requests, {term.fmt_usd(t['cost_usd'])} spend", "dim", color=color)
+         + (term.paint(f", {term.fmt_usd(w['savings_usd'])} avoidable waste", "yellow", color=color) if w["savings_usd"] > 0 else "")
+         + term.paint(")", "dim", color=color))
+    if fmt == "html":
+        _out(term.paint("  file://" + path, "dim", color=color))
+        if args.open:
+            try:
+                import webbrowser
+                webbrowser.open("file://" + path)
+            except Exception:
+                pass
+    return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """`llmtap doctor`: print checks with fix hints; exit 1 on a hard failure."""
+    from llmtap import doctor
+    cfg = make_config(args)
+    checks = doctor.run_checks(cfg, getattr(args, "config", None), online=args.online)
+    _out(doctor.render(checks, color=_color_out()))
+    return doctor.exit_code(checks)
+
+
 COMMANDS: dict[str, Callable[[argparse.Namespace], int]] = {
     "serve": cmd_serve, "wrap": cmd_wrap, "env": cmd_env, "stats": cmd_stats, "ls": cmd_ls,
     "show": cmd_show, "tail": cmd_tail, "export": cmd_export, "prices": cmd_prices, "scan": cmd_scan,
     "clear": cmd_clear, "version": cmd_version, "demo": cmd_demo,
+}
+
+# Added later; kept apart so the core table (and tests that pin it) stay stable.
+EXTRA_COMMANDS: dict[str, Callable[[argparse.Namespace], int]] = {
+    "report": cmd_report, "doctor": cmd_doctor,
 }
 
 
@@ -953,7 +1043,7 @@ def main(argv: list[str] | None = None) -> int:
     if not getattr(args, "command", None):
         build_parser().print_help()
         return 0
-    fn = COMMANDS[args.command]
+    fn = COMMANDS.get(args.command) or EXTRA_COMMANDS[args.command]
     try:
         return int(fn(args) or 0)
     except KeyboardInterrupt:

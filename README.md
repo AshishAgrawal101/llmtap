@@ -321,6 +321,29 @@ replayed in order and the last one repeats. Streaming responses are replayed as 
 
 Full guide with a pytest example: **[docs/cassettes.md](docs/cassettes.md)** · [examples/pytest_cassette](examples/pytest_cassette) · [examples/github-actions.yml](examples/github-actions.yml)
 
+## 🧪 pytest plugin: free, deterministic LLM tests
+
+```python
+def test_summary(llmtap):          # `llmtap` fixture ships with the package
+    out = summarize("...")         # your normal code, calling the real SDK
+    assert "refund" in out.lower()
+```
+
+The first run (with real keys) records to `cassettes/<test>.jsonl`. Commit it. After that the test replays offline:
+no API key, no cost, no flakiness. In CI (`CI=1`) it defaults to replay, and a request with no recording fails the test
+with a message telling you to re-record (`pytest --llmtap-record`). Details: [docs/pytest-plugin.md](docs/pytest-plugin.md).
+
+## 📊 Find where the money goes
+
+```bash
+llmtap report --since 7d -o report.html   # shareable, self-contained HTML (or --format md / json)
+llmtap stats                              # ... "Potential savings from caching: $X (N duplicate requests)"
+llmtap doctor                             # checks your setup and tells you how to fix it
+```
+
+The report's **waste finder** groups identical requests and tells you what `--cache` would have saved.
+See [docs/report.md](docs/report.md) and a [sample report](assets/sample-report.html).
+
 ## ♻️ Dev cache
 
 ```bash
@@ -409,6 +432,8 @@ Every field, env var and flag: **[docs/configuration.md](docs/configuration.md)*
 | `llmtap show <id> [--raw]` | Full request/response for one exchange (id prefixes work) |
 | `llmtap stats [--since 24h] [--by model]` | Totals and breakdowns: `model`, `provider`, `source`, `day`, `hour`, `tag:<name>` |
 | `llmtap export [--format jsonl\|csv] [-o file]` | Dump everything for your own analysis |
+| `llmtap report [--since 7d] [-o file]` | Self-contained HTML / Markdown / JSON cost + safety report with a waste finder |
+| `llmtap doctor [--online]` | Check your setup (port, db, env vars, SQLite) and get fix hints |
 | `llmtap prices [filter]` | Show the built-in price table |
 | `llmtap scan [file\|-]` | Scan text for secrets; exit 1 on findings |
 | `llmtap clear [--yes]` | Delete recorded history |
@@ -542,7 +567,6 @@ Ideas we'd love help with. None of these exist yet:
 - [ ] Native Gemini API (`generateContent`) routing and pricing
 - [ ] Configurable cassette matching (ignore fields, fuzzy match on model)
 - [ ] `llmtap diff` between two cassettes or two runs
-- [ ] A pytest plugin (`--llmtap-cassette`) as an alternative to `wrap`
 - [ ] Per-tag budgets (e.g. cap a single feature or session)
 - [ ] OpenTelemetry / OTLP export
 - [ ] Homebrew formula and a single-file zipapp release

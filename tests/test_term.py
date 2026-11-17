@@ -110,7 +110,7 @@ def test_banner_contents() -> None:
     cfg = Config(cache=True, cassette="tapes/ci.jsonl", mode="replay", guard="redact",
                  budget_daily_usd=5, loop_threshold=4)
     out = term.strip_ansi(term.banner(cfg, "http://127.0.0.1:4141", color=False))
-    assert "llmtap v0.1.0" in out and "recording LLM traffic" in out
+    assert "llmtap v0.2.0" in out and "recording LLM traffic" in out
     assert "http://127.0.0.1:4141/_llmtap/" in out
     assert "export ANTHROPIC_BASE_URL=http://127.0.0.1:4141" in out
     assert "export OPENAI_BASE_URL=http://127.0.0.1:4141/v1" in out

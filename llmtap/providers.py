@@ -22,6 +22,7 @@ from .models import Route, Usage
 
 __all__ = [
     "HOP_BY_HOP",
+    "body_error",
     "error_body",
     "estimate_tokens",
     "estimate_usage",
@@ -34,6 +35,7 @@ __all__ = [
     "request_model",
     "resolve_route",
     "response_model",
+    "sse_error",
     "tags_from_headers",
 ]
 
@@ -98,8 +100,10 @@ def resolve_route(path: str, headers: Mapping[str, str], cfg: Config) -> Route:
     if (
         pure.startswith("/v1/messages")
         or pure.startswith("/v1/complete")
-        or "anthropic-version" in hdrs
         or "x-api-key" in hdrs
+        # any anthropic-* header (anthropic-version, anthropic-beta, anthropic-dangerous-direct-browser-access):
+        # Claude Code with an OAuth bearer token sends no x-api-key / anthropic-version on e.g. /api/oauth/*
+        or any(h.startswith("anthropic-") for h in hdrs)
     ):
         base, style = _upstream(cfg, "anthropic")
         return Route(provider="anthropic", upstream_base=base, upstream_path=path, style=style)
@@ -415,6 +419,51 @@ def parse_sse(style: str, raw: str) -> tuple[Usage, str, str | None]:
     return usage, text, model
 
 
+def _error_message(err: Any) -> str:
+    if isinstance(err, dict):
+        m = err.get("message")
+        t = err.get("type") or err.get("code")
+        if isinstance(m, str) and m:
+            return m[:500]
+        if isinstance(t, str) and t:
+            return t[:500]
+        return "upstream error"
+    if isinstance(err, str) and err:
+        return err[:500]
+    return ""
+
+
+def body_error(resp: Any) -> str | None:
+    """Message of a top-level ``error`` in a (successful-status) JSON response, e.g. gateways that answer
+    HTTP 200 with ``{"error": {...}}``; None otherwise."""
+    if isinstance(resp, dict) and resp.get("error"):
+        return _error_message(resp["error"]) or "upstream error"
+    return None
+
+
+def sse_error(raw: str) -> str | None:
+    """Message of the first in-band error in an SSE transcript (anthropic ``event: error``, openai
+    ``data: {"error": ...}``, responses ``response.failed``); None when the stream carried no error."""
+    if not isinstance(raw, str) or "error" not in raw and "response.failed" not in raw:
+        return None
+    for name, data in _sse_events(raw):
+        payload = data.strip()
+        if not payload.startswith("{"):
+            continue
+        try:
+            obj = json.loads(payload)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        etype = obj.get("type") if isinstance(obj.get("type"), str) else name
+        if etype == "error" or (obj.get("error") and "choices" not in obj and etype != "message_start"):
+            return _error_message(obj.get("error")) or _error_message(obj.get("message")) or "upstream stream error"
+        if etype == "response.failed":
+            return _error_message(_dict(obj.get("response")).get("error")) or "response failed"
+    return None
+
+
 # --------------------------------------------------------------------------------------------
 # estimation
 # --------------------------------------------------------------------------------------------
@@ -491,7 +540,8 @@ def forward_headers(headers: Mapping[str, str]) -> dict[str, str]:
     out: dict[str, str] = {}
     for k, v in items:
         lk = k.lower()
-        if lk in HOP_BY_HOP or lk in extra or lk.startswith("x-llmtap-"):
+        # `expect` is answered by llmtap itself (100-continue); the body is re-sent with a Content-Length
+        if lk in HOP_BY_HOP or lk in extra or lk == "expect" or lk.startswith("x-llmtap-"):
             continue
         out[k] = v
     out["accept-encoding"] = "identity"

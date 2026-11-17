@@ -8,18 +8,21 @@ from __future__ import annotations
 
 import gzip
 import http.client
+import ipaddress
 import json
 import queue
+import re
 import socket
 import socketserver
 import ssl
+import sys
 import threading
 import time
 import zlib
 from collections.abc import Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Protocol
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 from . import __version__
 from .budget import Budget
@@ -30,6 +33,7 @@ from .guard import apply_guard
 from .models import CachedResponse, Exchange, Route, Usage
 from .pricing import cost_usd
 from .providers import (
+    body_error,
     error_body,
     estimate_usage,
     extract_text,
@@ -41,6 +45,7 @@ from .providers import (
     request_model,
     resolve_route,
     response_model,
+    sse_error,
     tags_from_headers,
 )
 from .store import Store
@@ -55,7 +60,9 @@ _RESP_HOP = frozenset({
 # Headers never stored for replay (body is stored decoded, framing is recomputed).
 _STORE_DROP = _RESP_HOP | {"content-encoding", "date", "server", "x-llmtap-id", "x-llmtap-source",
                            "access-control-allow-origin", "access-control-expose-headers"}
-_CLIENT_GONE = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
+_CLIENT_GONE = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError)
+# Per-exchange cap (characters) for what is *stored* (db / cache / cassette). Relayed bytes are never capped.
+MAX_STORED_CHARS = 2 * 1024 * 1024
 _CORS_BASE = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Expose-Headers": "x-llmtap-id, x-llmtap-source, request-id, x-request-id",
@@ -185,11 +192,8 @@ def _lower(headers: Mapping[str, str] | None) -> dict[str, str]:
     return out
 
 
-def _decode_body(raw: bytes, encoding: str) -> bytes:
-    """Undo content-encoding for parsing; returns raw on failure / unknown encodings."""
-    enc = (encoding or "").strip().lower()
-    if not raw or enc in ("", "identity"):
-        return raw
+def _try_decode(raw: bytes, enc: str) -> bytes | None:
+    """Undo content-encoding; None when we can't (br, zstd, compress, corrupt gzip...)."""
     try:
         if enc in ("gzip", "x-gzip"):
             return gzip.decompress(raw)
@@ -199,18 +203,148 @@ def _decode_body(raw: bytes, encoding: str) -> bytes:
             except zlib.error:
                 return zlib.decompress(raw, -zlib.MAX_WBITS)
     except Exception:
-        return raw
-    return raw
+        return None
+    return None
 
 
-def _storable_headers(headers: list[tuple[str, str]]) -> dict[str, str]:
+_BINARY_PREFIXES = ("audio/", "image/", "video/", "font/")
+_BINARY_TYPES = frozenset({"application/octet-stream", "application/zip", "application/pdf", "application/gzip",
+                           "application/x-tar", "application/x-zip-compressed", "application/x-protobuf"})
+
+
+def _decode_response(raw: bytes, encoding: str, ctype: str) -> tuple[str, bool]:
+    """(text, parseable). Binary / undecodable bodies yield a short placeholder and parseable=False
+    so we never dump megabytes of mojibake into the db or cache (the client still gets the raw bytes)."""
+    if not raw:
+        return "", True
+    enc = (encoding or "").strip().lower()
+    data = raw
+    if enc not in ("", "identity"):
+        dec = _try_decode(raw, enc)
+        if dec is None:
+            return (f"[response body not stored: content-encoding '{enc}' is not decodable by llmtap, "
+                    f"{len(raw)} bytes]"), False
+        data = dec
+    main = (ctype or "").split(";")[0].strip().lower()
+    if main.startswith(_BINARY_PREFIXES) or main in _BINARY_TYPES:
+        return f"[binary response body not stored: {main}, {len(data)} bytes]", False
+    try:
+        return data.decode("utf-8"), True
+    except UnicodeDecodeError:
+        if any(t in main for t in ("json", "text", "event-stream", "xml")):
+            return data.decode("utf-8", "replace"), True
+        return f"[binary response body not stored: {main or 'unknown content-type'}, {len(data)} bytes]", False
+
+
+def _decode_request(body: bytes, ctype: str) -> tuple[str, bool]:
+    """(text to store, truncated). Multipart / binary request bodies are stored as a short placeholder."""
+    main = (ctype or "").split(";")[0].strip().lower()
+    if main.startswith("multipart/") or main in _BINARY_TYPES or main.startswith(_BINARY_PREFIXES):
+        return f"[{main} request body not stored: {len(body)} bytes]", False
+    try:
+        text = body[:MAX_STORED_CHARS * 4].decode("utf-8")
+    except UnicodeDecodeError as e:
+        if e.start > MAX_STORED_CHARS * 4 - 8 or len(body) > MAX_STORED_CHARS * 4:
+            text = body[:MAX_STORED_CHARS * 4].decode("utf-8", "ignore")
+        else:
+            return f"[binary request body not stored: {main or 'unknown content-type'}, {len(body)} bytes]", False
+    if len(text) > MAX_STORED_CHARS or len(body) > MAX_STORED_CHARS * 4:
+        return text[:MAX_STORED_CHARS] + f"\n[llmtap: truncated, {len(body)} bytes in total]", True
+    return text, False
+
+
+_SENSITIVE_QS = frozenset({"key", "api_key", "apikey", "api-key", "token", "access_token", "x-api-key",
+                           "signature", "sig", "auth", "password", "secret", "client_secret"})
+_SENSITIVE_QS_RE = re.compile(r"([?&](?:" + "|".join(sorted(re.escape(k) for k in _SENSITIVE_QS)) + r")=)[^&#]*",
+                              re.IGNORECASE)
+_CRED_HEADERS = ("authorization", "proxy-authorization", "x-api-key", "api-key", "x-goog-api-key", "cookie",
+                 "x-auth-token", "openai-api-key", "anthropic-auth-token")
+REDACTED = "[REDACTED]"
+
+
+def _mask_path(path: str) -> str:
+    """Mask secret-looking query parameters (``?key=AIza...``) before the path is ever stored."""
+    return _SENSITIVE_QS_RE.sub(lambda m: m.group(1) + REDACTED, path) if "?" in path else path
+
+
+def _credentials(hdrs: Mapping[str, str], path: str) -> list[str]:
+    """Credential strings of this request (>= 8 chars), longest first, so they can be scrubbed from anything stored."""
+    vals: set[str] = set()
+    for name in _CRED_HEADERS:
+        v = (hdrs.get(name) or "").strip()
+        if not v:
+            continue
+        vals.add(v)
+        if name == "cookie":
+            for part in v.split(";"):
+                vals.add(part.strip().partition("=")[2].strip())
+        else:
+            vals.add(v.split(None, 1)[-1])      # "Bearer abc" -> "abc"
+    for k, v in parse_qsl(path.partition("?")[2], keep_blank_values=True):
+        if k.lower() in _SENSITIVE_QS:
+            vals.add(v)
+    return sorted({v for v in vals if len(v) >= 8}, key=len, reverse=True)
+
+
+def _scrub(text: str, secrets: list[str]) -> str:
+    for sec in secrets:
+        if sec in text:
+            text = text.replace(sec, REDACTED)
+    return text
+
+
+def _storable_headers(headers: list[tuple[str, str]], secrets: list[str] | None = None) -> dict[str, str]:
     out: dict[str, str] = {}
     for k, v in headers:
         lk = k.lower()
-        if lk in _STORE_DROP or lk.startswith("x-llmtap-") or lk == "set-cookie":
+        if lk in _STORE_DROP or lk.startswith("x-llmtap-") or lk == "set-cookie" or lk in _CRED_HEADERS:
+            continue
+        if secrets and any(sec in v for sec in secrets):     # upstream echoed a credential back
             continue
         out[lk] = v
     return out
+
+
+def _note(ex: Exchange, text: str) -> None:
+    """Attach a non-fatal note (e.g. truncation); folded into ``ex.error`` when the exchange is sealed."""
+    ex.__dict__.setdefault("_notes", []).append(text)
+
+
+def _seal(ex: Exchange) -> None:
+    """Final pass before an exchange is persisted: fold notes into ``error``, scrub credentials."""
+    notes = ex.__dict__.pop("_notes", None)
+    if notes:
+        ex.error = "; ".join(x for x in [ex.error, *notes] if x)
+    secrets = ex.__dict__.pop("_secrets", None)
+    if secrets:
+        for f in ("path", "request_body", "response_body", "error", "output_text"):
+            v = getattr(ex, f, None)
+            if v:
+                setattr(ex, f, _scrub(v, secrets))
+
+
+_LLM_TAIL = re.compile(r"(?:/(?:chat/completions|completions|embeddings)|(?:^|/)v\d+[a-z0-9]*/(?:messages|complete|responses))$")
+
+
+def _is_llm_call(method: str, upstream_path: str) -> bool:
+    """True for billable generation endpoints (chat / messages / responses / embeddings / completions).
+    Everything else (models, files, batches, count_tokens, ...) is forwarded untouched: recorded, but
+    never cached, budget-checked, loop-checked or priced."""
+    if method != "POST":
+        return False
+    return bool(_LLM_TAIL.search(upstream_path.split("?", 1)[0].rstrip("/")))
+
+
+def _is_json_doc(body: bytes) -> bool:
+    """Cheap check that a (non-object) body is a JSON document, e.g. an array."""
+    head = body.lstrip()[:1]
+    if head not in (b"[", b'"'):
+        return False
+    try:
+        json.loads(body.decode("utf-8-sig"))
+        return True
+    except Exception:
+        return False
 
 
 def _split_sse(body: str) -> list[str]:
@@ -270,11 +404,30 @@ class LLMTap:
             host = f"[{host}]"
         return f"http://{host}:{self.port}"
 
+    @property
+    def is_exposed(self) -> bool:
+        """True when the listen address is reachable beyond this machine (0.0.0.0, ::, a LAN address...)."""
+        return _host_is_exposed(self.cfg.host)
+
     def _bind(self) -> "_Server":
         if self._server is None:
             self._server = _Server((self.cfg.host, self.cfg.port), _Handler, self)
             self.port = int(self._server.server_address[1])
+            if self.is_exposed:
+                self._warn_exposed()
         return self._server
+
+    def _warn_exposed(self) -> None:
+        """Prominent stderr warning: prompts, responses and the dashboard are served without authentication."""
+        try:
+            from .term import color_enabled, paint
+            msg = (f"WARNING: llmtap is listening on {self.cfg.host or '0.0.0.0'}:{self.port} and is exposed to "
+                   "your network. The dashboard and every recorded prompt/response are readable by anyone who "
+                   "can reach this port, and nothing is authenticated. Bind to 127.0.0.1 unless you mean this.")
+            sys.stderr.write(paint(msg, "bold", "yellow", color=color_enabled(sys.stderr)) + "\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
 
     def serve_forever(self) -> None:
         """Serve in the calling thread until shutdown() (or KeyboardInterrupt propagates)."""
@@ -359,7 +512,8 @@ class LLMTap:
             return ex
 
         # -- proxied LLM call ---------------------------------------------------------------
-        ex = Exchange(method=method, path=path)
+        ex = Exchange(method=method, path=_mask_path(path))
+        ex.__dict__["_secrets"] = _credentials(hdrs, path)
         t0 = time.perf_counter()
         out = _Tracked(respond, dict(_CORS_BASE))
         style = "openai"
@@ -391,13 +545,22 @@ class LLMTap:
         stream_req = is_stream_request(req)
         ex.tags = tags_from_headers(hdrs)
 
-        # guard
+        llm = _is_llm_call(method, route.upstream_path)
+        ctype = hdrs.get("content-type", "")
+
+        # guard. Only JSON documents may ever be rewritten: multipart / binary / unparseable bodies are
+        # scanned as text (warn / block) but forwarded byte-for-byte even in redact mode.
         send_body = body
-        if body and (cfg.guard or "off") != "off":
-            send_body, findings, blocked = apply_guard(body, cfg.guard, cfg.guard_pii)
+        mode = cfg.guard or "off"
+        if body and mode != "off":
+            if mode == "redact" and req is None and not _is_json_doc(body):
+                mode = "warn"
+            send_body, findings, blocked = apply_guard(body, mode, cfg.guard_pii)
             ex.guard_findings = [f.to_dict() if hasattr(f, "to_dict") else dict(f) for f in findings]
             if blocked:
-                ex.request_body = body.decode("utf-8", "replace")
+                ex.request_body, trunc = _decode_request(body, ctype)
+                if trunc:
+                    _note(ex, f"request body truncated to {MAX_STORED_CHARS} characters in llmtap storage")
                 kinds = ", ".join(sorted({str(f.get("kind", "?")) for f in ex.guard_findings}))
                 ex.source = "blocked"
                 msg = (f"llmtap guard blocked this request: detected {kinds} in the prompt. "
@@ -406,12 +569,14 @@ class LLMTap:
                 return
             if send_body is not body:
                 req = parse_json(send_body) if req is not None else req
-        ex.request_body = send_body.decode("utf-8", "replace")
+        ex.request_body, trunc = _decode_request(send_body, ctype)
+        if trunc:
+            _note(ex, f"request body truncated to {MAX_STORED_CHARS} characters in llmtap storage (forwarded in full)")
 
-        cacheable = method == "POST"
+        cacheable = llm
         key = cache_key(route.provider, route.upstream_path, send_body) if cacheable else ""
 
-        # budget / loop breaker
+        # budget / loop breaker (generation calls only: models/files/batches/count_tokens are not chat traffic)
         if cacheable:
             verdict = self.budget.check(key)
             if not verdict.allowed:
@@ -446,6 +611,7 @@ class LLMTap:
     # ---------------------------------------------------------------- upstream
     def _forward(self, ex: Exchange, route: Route, method: str, hdrs: dict[str, str], body: bytes,
                  req: dict | None, stream_req: bool, key: str, out: _Tracked, t0: float) -> None:
+        llm = _is_llm_call(method, route.upstream_path)
         scheme, host, port, full_path = _upstream_target(route)
         timeout = float(self.cfg.upstream_timeout_s or 600.0)
         conn: http.client.HTTPConnection
@@ -473,10 +639,14 @@ class LLMTap:
             encoding = low.get("content-encoding", "")
             relay = [(k, v) for k, v in up_headers if k.lower() not in _RESP_HOP]
             client_h = _merge_headers(relay, {"x-llmtap-id": ex.id, "x-llmtap-source": "upstream"})
-            streaming = _is_streaming_response(ctype, stream_req, "content-length" in low)
+            bodyless = method == "HEAD" or resp.status in (204, 304) or resp.status < 200
+            if bodyless and resp.status != 204 and "content-length" in low:
+                client_h["Content-Length"] = low["content-length"]   # HEAD / 304 describe the entity: keep its length
+            streaming = not bodyless and _is_streaming_response(ctype, stream_req, "content-length" in low)
             ex.streamed = streaming
             raw = bytearray()
             client_gone = False
+            finalized = False
             upstream_err: str | None = None
 
             if streaming:
@@ -501,24 +671,30 @@ class LLMTap:
                 if client_gone or upstream_err:
                     out.abort()
                 else:
+                    self._finalize(ex, route, req, key, llm, bytes(raw), encoding, ctype, streaming, up_headers)
+                    finalized = True
                     try:
                         out.end()
                     except ClientGone:
                         client_gone = True
             else:
                 try:
-                    data = resp.read()
+                    data = resp.read() if not bodyless else b""
                 except (OSError, http.client.HTTPException) as e:
                     ex.source = "error"
                     msg = f"llmtap: upstream read failed: {type(e).__name__}: {e}"
-                    self._error(out, ex, route.style, 502, msg, "llmtap_upstream_error")
+                    status = 504 if isinstance(e, (socket.timeout, TimeoutError)) else 502
+                    self._error(out, ex, route.style, status, msg, "llmtap_upstream_error")
                     return
                 raw += data
                 ex.ttft_ms = round((time.perf_counter() - t0) * 1000.0, 2)
-                client_h["Content-Length"] = str(len(raw))
+                if not bodyless:
+                    client_h["Content-Length"] = str(len(raw))
+                self._finalize(ex, route, req, key, llm, bytes(raw), encoding, ctype, streaming, up_headers)
+                finalized = True
                 try:
                     out.start(resp.status, client_h)
-                    if raw and method != "HEAD":
+                    if raw and not bodyless:
                         out.write(bytes(raw))
                     out.end()
                 except ClientGone:
@@ -530,25 +706,47 @@ class LLMTap:
             except Exception:
                 pass
 
-        text = _decode_body(bytes(raw), encoding).decode("utf-8", "replace")
+        if not finalized:
+            self._finalize(ex, route, req, key, llm, bytes(raw), encoding, ctype, streaming, up_headers,
+                           client_gone, upstream_err)
+        elif client_gone:
+            ex.error = "client disconnected"
+
+    def _finalize(self, ex: Exchange, route: Route, req: dict | None, key: str, llm: bool, raw: bytes,
+                  encoding: str, ctype: str, streaming: bool, up_headers: list[tuple[str, str]],
+                  client_gone: bool = False, upstream_err: str | None = None) -> None:
+        """Usage, cost, budget, cache and cassette for a finished upstream response. Runs *before* the last
+        byte reaches the client (when possible) so a client that immediately sends its next request already
+        sees the updated budget / cache."""
+        raw = bytes(raw)
+        text, parseable = _decode_response(bytes(raw), encoding, ctype)
         ex.response_body = text
         if client_gone:
             ex.error = "client disconnected"
         elif upstream_err:
             ex.error = upstream_err
-        if resp.status >= 400 and not ex.error:
-            ex.error = _upstream_error_message(text) or f"upstream HTTP {resp.status}"
+        if ex.status >= 400 and not ex.error:
+            ex.error = _upstream_error_message(text) or f"upstream HTTP {ex.status}"
 
-        self._account(ex, route, req, text, streaming)
+        in_band_err = self._account(ex, route, req, text, streaming, llm=llm, parseable=parseable)
         ex.cost_usd = self._price(ex) if ex.usage.total() else 0.0
         try:
             self.budget.add_spend(ex.cost_usd)
         except Exception:
             pass
 
-        if 200 <= ex.status < 300 and not client_gone and not upstream_err and key:
-            cached = CachedResponse(status=ex.status, headers=_storable_headers(up_headers), body=text,
-                                    streamed=streaming, cost_usd=ex.cost_usd)
+        oversize = len(text) > MAX_STORED_CHARS or len(ex.output_text) > MAX_STORED_CHARS
+        if oversize:
+            ex.response_body = text[:MAX_STORED_CHARS] + f"\n[llmtap: truncated, {len(raw)} bytes in total]"
+            ex.output_text = ex.output_text[:MAX_STORED_CHARS]
+            _note(ex, f"response body truncated to {MAX_STORED_CHARS} characters in llmtap storage "
+                      "(relayed to the client in full; not cached)")
+
+        if (200 <= ex.status < 300 and not (streaming and client_gone) and not upstream_err and key and parseable
+                and not oversize and not in_band_err):
+            secrets = ex.__dict__.get("_secrets") or []
+            cached = CachedResponse(status=ex.status, headers=_storable_headers(up_headers, secrets),
+                                    body=_scrub(text, secrets), streamed=streaming, cost_usd=ex.cost_usd)
             if self.cache is not None:
                 try:
                     self.cache.put(key, cached)
@@ -556,7 +754,10 @@ class LLMTap:
                     ex.error = ex.error or f"cache write failed: {e}"
             if self.cassette is not None and self.cassette.should_record():
                 try:
-                    self.cassette.record(key, req if req is not None else ex.request_body, cached)
+                    rec_req: Any = req if req is not None else ex.request_body
+                    if secrets and isinstance(rec_req, dict):
+                        rec_req = json.loads(_scrub(json.dumps(rec_req, ensure_ascii=False), secrets))
+                    self.cassette.record(key, rec_req, cached)
                 except Exception as e:
                     ex.error = ex.error or f"cassette write failed: {e}"
 
@@ -606,21 +807,32 @@ class LLMTap:
         self._account(ex, route, req, stored.body, ex.streamed)
 
     # ---------------------------------------------------------------- accounting
-    def _account(self, ex: Exchange, route: Route, req: dict | None, text: str, streamed: bool) -> None:
-        """Fill usage / output_text / model from a response body (never raises)."""
-        usage, out_text, model = Usage(), "", None
-        try:
-            if streamed:
-                usage, out_text, model = parse_sse(route.style, text)
-            else:
-                j = parse_json(text.encode("utf-8"))
-                if j is not None:
-                    usage = extract_usage(route.style, j)
-                    out_text = extract_text(route.style, j)
-                    model = response_model(route.style, j)
-        except Exception:
-            pass
-        if 200 <= ex.status < 300 and usage.input_tokens == 0 and usage.output_tokens == 0:
+    def _account(self, ex: Exchange, route: Route, req: dict | None, text: str, streamed: bool,
+                 llm: bool = True, parseable: bool = True) -> str | None:
+        """Fill usage / output_text / model from a response body (never raises).
+
+        Returns an in-band error message (stream ``error`` event, or HTTP 200 with an ``error`` body) if any.
+        Usage is only *estimated* for successful generation calls whose body carried no usage and no error.
+        """
+        usage, out_text, model, err = Usage(), "", None, None
+        if parseable:
+            try:
+                if streamed:
+                    usage, out_text, model = parse_sse(route.style, text)
+                    err = sse_error(text)
+                else:
+                    j = parse_json(text.encode("utf-8"))
+                    if j is not None:
+                        usage = extract_usage(route.style, j)
+                        out_text = extract_text(route.style, j)
+                        model = response_model(route.style, j)
+                        err = body_error(j)
+            except Exception:
+                pass
+        ok = 200 <= ex.status < 300
+        if err and ok:
+            ex.error = ex.error or err
+        if ok and llm and not err and usage.input_tokens == 0 and usage.output_tokens == 0:
             try:
                 usage = estimate_usage(req, out_text)
             except Exception:
@@ -629,6 +841,7 @@ class LLMTap:
         ex.output_text = out_text or ""
         if model:
             ex.model = model
+        return err if ok else None
 
     def _price(self, ex: Exchange) -> float:
         try:
@@ -695,6 +908,10 @@ class LLMTap:
     def _finish(self, ex: Exchange) -> None:
         """Persist, publish and log; each step isolated so none can break the request."""
         try:
+            _seal(ex)
+        except Exception:
+            ex.__dict__.pop("_secrets", None)
+        try:
             self.store.record(ex)
         except Exception as e:
             ex.error = ex.error or f"store write failed: {e}"
@@ -708,6 +925,16 @@ class LLMTap:
                 log_exchange(ex)
             except Exception:
                 pass
+
+
+def _host_is_exposed(host: str) -> bool:
+    h = (host or "").strip().strip("[]").lower()
+    if h == "localhost":
+        return False
+    try:
+        return not ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return True   # "" (all interfaces) or a hostname we can't prove is loopback
 
 
 def _merge_headers(relay: list[tuple[str, str]], extra: dict[str, str]) -> dict[str, str]:
@@ -843,6 +1070,7 @@ class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "llmtap/" + __version__
     sys_version = ""
+    timeout = 900          # reap idle keep-alive connections / stalled clients instead of leaking threads
     server: _Server
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - silence default logging
