@@ -364,3 +364,28 @@ def test_override_replaces_long_rate_card():
 def test_price_for_still_returns_standard_rates():
     assert price_for("claude-haiku-5-5")["input"] == 0.10
     assert price_for("claude-haiku-5-5")["cache_read"] == 0.01        # no float noise
+
+
+# ------------------------------------------------------------------ anthropic billing extras
+
+def test_one_hour_cache_writes_cost_twice_input():
+    u = Usage(input_tokens=0, cache_write_tokens=1_000_000, cache_write_1h_tokens=400_000)
+    # 600K at the 5-minute rate (1.25x of $4) + 400K at 2x of $4
+    assert cost_usd("claude-opus-5-5", u) == pytest.approx(600_000 * 5 / 1e6 + 400_000 * 8 / 1e6)
+
+
+def test_one_hour_cache_writes_never_exceed_total_writes():
+    u = Usage(cache_write_tokens=100, cache_write_1h_tokens=10_000)
+    assert cost_usd("claude-opus-5-5", u) == pytest.approx(100 * 8 / 1e6)
+
+
+def test_fast_mode_doubles_token_cost():
+    u = Usage(input_tokens=1_000_000, output_tokens=1_000_000)
+    assert cost_usd("claude-opus-5-5", u) == pytest.approx(4 + 20)
+    u.speed = "fast"
+    assert cost_usd("claude-opus-5-5", u) == pytest.approx(8 + 40)            # published fast-mode list price
+
+
+def test_web_searches_billed_per_request():
+    u = Usage(input_tokens=1000, output_tokens=100, web_search_requests=3)
+    assert cost_usd("claude-sonnet-5-5", u) == pytest.approx((1000 * 2 + 100 * 10) / 1e6 + 0.03)

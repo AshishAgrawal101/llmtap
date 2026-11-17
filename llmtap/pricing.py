@@ -29,7 +29,9 @@ Cost (``cost_usd``) - the providers report cached tokens differently:
     (cache writes are not billed).  If ``cache_read > input`` the numbers are clearly
     exclusive, so the input is charged in full.
 Missing cache prices default to 10% of input (Anthropic) / 50% (others); cache-write
-price defaults to 125% of input.
+price defaults to 125% of input (5-minute TTL). Anthropic extras: 1-hour cache writes cost
+2x input, fast mode (``usage.speed == "fast"``) doubles the token cost, and server-side web
+searches add ``WEB_SEARCH_USD`` each.
 """
 from __future__ import annotations
 
@@ -39,6 +41,8 @@ from typing import Any
 from .models import Usage
 
 PRICES_AS_OF = "2026-11"
+WEB_SEARCH_USD = 0.01        # Anthropic web search tool: $10 per 1,000 searches
+FAST_MODE_MULTIPLIER = 2.0   # Anthropic fast mode list price = 2x standard (Opus 5.5 $8/$40 vs $4/$20)
 
 _ZERO: dict[str, float] = {"input": 0.0, "output": 0.0, "cache_read": 0.0, "cache_write": 0.0}
 
@@ -400,12 +404,17 @@ def cost_usd(model: str | None, usage: Usage, overrides: dict | None = None, sty
         if prompt > long[0]:
             price = long[1]
     if anthropic_usage:
+        cw_1h = min(max(int(usage.cache_write_1h_tokens or 0), 0), cw)
         total = (inp * price["input"] + cr * price["cache_read"]
-                 + cw * price["cache_write"] + out * price["output"])
+                 + (cw - cw_1h) * price["cache_write"] + cw_1h * price["input"] * 2.0
+                 + out * price["output"])
     else:
         uncached = inp - cr if cr <= inp else inp
         total = uncached * price["input"] + cr * price["cache_read"] + out * price["output"]
-    return round(total / 1_000_000, 10)
+    if usage.speed == "fast":
+        total *= FAST_MODE_MULTIPLIER
+    usd = total / 1_000_000 + max(int(usage.web_search_requests or 0), 0) * WEB_SEARCH_USD
+    return round(usd, 10)
 
 
 def format_usd(x: float) -> str:

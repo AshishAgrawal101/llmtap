@@ -14,6 +14,10 @@ class Usage:
     cache_read_tokens: int = 0     # anthropic cache_read_input_tokens / openai cached_tokens
     cache_write_tokens: int = 0    # anthropic cache_creation_input_tokens
     estimated: bool = False        # True when tokens were guessed (chars/4), not reported
+    # Billing details used for pricing only (not stored in the database: the computed cost is).
+    cache_write_1h_tokens: int = 0  # anthropic cache_creation.ephemeral_1h_input_tokens (subset of cache_write)
+    speed: str = ""                # anthropic usage.speed ("fast" = fast mode, billed at 2x)
+    web_search_requests: int = 0   # anthropic server_tool_use.web_search_requests (billed per search)
 
     def total(self) -> int:
         return self.input_tokens + self.output_tokens

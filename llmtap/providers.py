@@ -209,11 +209,15 @@ def _usage_from_dict(u: Any) -> Usage:
         cache_read = _dict(u.get("prompt_tokens_details")).get("cached_tokens")
     if cache_read is None:
         cache_read = _dict(u.get("input_tokens_details")).get("cached_tokens")
+    speed = u.get("speed")
     return Usage(
         input_tokens=_int(inp),
         output_tokens=_int(out),
         cache_read_tokens=_int(cache_read),
         cache_write_tokens=_int(u.get("cache_creation_input_tokens")),
+        cache_write_1h_tokens=_int(_dict(u.get("cache_creation")).get("ephemeral_1h_input_tokens")),
+        speed=speed if isinstance(speed, str) else "",
+        web_search_requests=_int(_dict(u.get("server_tool_use")).get("web_search_requests")),
     )
 
 
@@ -383,6 +387,12 @@ def _merge_usage(dst: Usage, src: dict, override_output: bool = True) -> None:
         dst.cache_read_tokens = u.cache_read_tokens
     if u.cache_write_tokens:
         dst.cache_write_tokens = u.cache_write_tokens
+    if u.cache_write_1h_tokens:
+        dst.cache_write_1h_tokens = u.cache_write_1h_tokens
+    if u.speed:
+        dst.speed = u.speed
+    if u.web_search_requests:
+        dst.web_search_requests = u.web_search_requests
 
 
 def parse_sse(style: str, raw: str) -> tuple[Usage, str, str | None]:

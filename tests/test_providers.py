@@ -625,3 +625,21 @@ class TestErrorsAndHeaders:
              "X-LLMTap-Tag-": "ignored", "Authorization": "x"}
         assert tags_from_headers(h) == {"feature": "summarize", "user-id": "42", "session": "run-7"}
         assert tags_from_headers({}) == {}
+
+
+def test_anthropic_billing_extras_parsed_from_json_and_stream():
+    from llmtap.providers import extract_usage, parse_sse
+    usage = {"input_tokens": 10, "output_tokens": 5, "cache_creation_input_tokens": 300,
+             "cache_creation": {"ephemeral_5m_input_tokens": 100, "ephemeral_1h_input_tokens": 200},
+             "server_tool_use": {"web_search_requests": 2}, "speed": "fast"}
+    u = extract_usage("anthropic", {"usage": usage})
+    assert (u.cache_write_tokens, u.cache_write_1h_tokens, u.web_search_requests, u.speed) == (300, 200, 2, "fast")
+
+    start = dict(usage, output_tokens=1)
+    del start["server_tool_use"]
+    raw = (f'event: message_start\ndata: {{"type":"message_start","message":{{"model":"claude-opus-5-5","usage":{json.dumps(start)}}}}}\n\n'
+           'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},'
+           '"usage":{"output_tokens":42,"server_tool_use":{"web_search_requests":3}}}\n\n')
+    u, _, model = parse_sse("anthropic", raw)
+    assert model == "claude-opus-5-5"
+    assert (u.output_tokens, u.cache_write_1h_tokens, u.web_search_requests, u.speed) == (42, 200, 3, "fast")
