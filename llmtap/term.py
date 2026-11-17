@@ -437,8 +437,11 @@ def log_exchange(ex: Any, stream: IO[Any] | None = None) -> None:
 # --------------------------------------------------------------------------------------------
 # end-of-run summary
 
-def summary(stats: dict, session_spent: float, color: bool | None = None, title: str = "llmtap session summary") -> str:
-    """Report box for ``llmtap wrap``: requests, tokens, cost, savings, latency, errors, guard, top models."""
+def summary(stats: dict, session_spent: float, color: bool | None = None, title: str = "llmtap session summary",
+            empty_hint: str = "Does the command use ANTHROPIC_BASE_URL / OPENAI_BASE_URL?") -> str:
+    """Report box for ``llmtap wrap``: requests, tokens, cost, savings, latency, errors, guard, top models.
+
+    ``empty_hint`` is the second line shown when nothing was recorded."""
     if color is None:
         color = color_enabled()
     p = lambda s, *st: paint(s, *st, color=color)  # noqa: E731
@@ -485,7 +488,6 @@ def summary(stats: dict, session_spent: float, color: bool | None = None, title:
                 f"{p(pad(fmt_usd(float(g.get('cost_usd', 0) or 0)), 9, '>'), 'yellow')}"
             )
     if req == 0:
-        lines = [p("No LLM requests were recorded.", "dim"),
-                 p("Does the command use ANTHROPIC_BASE_URL / OPENAI_BASE_URL?", "dim")]
+        lines = [p("No LLM requests were recorded.", "dim")] + ([p(empty_hint, "dim")] if empty_hint else [])
     head = p("◉ " + title, "bold", "bright_magenta")
     return box(lines, title=head, color=color, border="magenta")

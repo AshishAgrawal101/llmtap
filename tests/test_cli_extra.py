@@ -259,3 +259,13 @@ def test_prices_shows_long_context_rates_and_exact_cents(capsys):
     data = _json.loads(capsys.readouterr().out)
     assert data["claude-haiku-5-5"]["long_context"]["above_prompt_tokens"] == 100_000
     assert data["claude-haiku-5-5"]["cache_read"] == 0.01
+
+
+def test_stats_on_empty_db_gives_a_stats_hint_not_the_wrap_one(tmp_path, capsys):
+    from llmtap import cli as _cli
+    db = str(tmp_path / "empty.db")
+    assert _cli.main(["stats", "--db", db]) == 0
+    out = capsys.readouterr().out
+    assert "llmtap serve" in out and "ANTHROPIC_BASE_URL" not in out
+    assert _cli.main(["stats", "--db", db, "--since", "1h"]) == 0
+    assert "--since all" in capsys.readouterr().out

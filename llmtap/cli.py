@@ -564,7 +564,10 @@ def cmd_stats(args: argparse.Namespace) -> int:
     except (OverflowError, OSError, ValueError):  # e.g. --since 99999d: before the platform's epoch
         label = "all time"
     totals = {k: v for k, v in st.items() if k != "groups"}
-    _out(term.summary(totals, float(st.get("cost_usd", 0) or 0), color=color, title=f"llmtap stats · {label}"))
+    hint = ("Record traffic with `llmtap serve` or `llmtap wrap -- <command>`." if args.since is None
+            else "Nothing in this window; try --since all.")
+    _out(term.summary(totals, float(st.get("cost_usd", 0) or 0), color=color, title=f"llmtap stats · {label}",
+                      empty_hint=hint))
     if int(st.get("requests", 0) or 0) > 0:
         _out(_savings_line(waste_usd, waste_n, color))
     groups = st.get("groups") or []
