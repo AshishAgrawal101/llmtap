@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **Native Gemini API** (`generateContent` / `streamGenerateContent`): routing, usage and text extraction, and
+  Google-style errors. Thanks to @KEYUR141 for the original implementation (#6). Gemini "thinking" tokens are billed as
+  output, the model is read from the URL, and Gemini calls are cached and budget/loop-checked like other LLM calls.
+
 ## [0.2.0] - 2026-11-16
 
 ### Added

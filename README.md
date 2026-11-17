@@ -564,7 +564,7 @@ miss fails immediately. See [docs/cassettes.md](docs/cassettes.md).
 
 Ideas we'd love help with. None of these exist yet:
 
-- [ ] Native Gemini API (`generateContent`) routing and pricing
+- [ ] Gemini `countTokens` and embeddings endpoints (`generateContent` routing already works)
 - [ ] Configurable cassette matching (ignore fields, fuzzy match on model)
 - [ ] `llmtap diff` between two cassettes or two runs
 - [ ] Per-tag budgets (e.g. cap a single feature or session)
