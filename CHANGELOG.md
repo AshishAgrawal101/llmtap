@@ -6,6 +6,16 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- Windows: `prices`, `doctor`, `scan` and other commands no longer crash with a `charmap` codec error when output is
+  redirected to a file, a pipe or a CI log. Output falls back to UTF-8 when the console encoding can't show tables.
+
+### Changed
+
+- Published on PyPI as `llmtap-proxy` (`llmtap` was too close to an existing project). The command and the import name
+  are still `llmtap`.
+
 ## [0.2.0] - 2026-11-16
 
 ### Added

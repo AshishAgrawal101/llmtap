@@ -1034,8 +1034,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def _ensure_unicode_output() -> None:
+    """Switch stdout/stderr to UTF-8 when their encoding can't represent llmtap's output.
+
+    On Windows, output redirected to a file or pipe (CI logs, ``> out.txt``) uses the ANSI code page
+    (e.g. cp1252), which has no box-drawing or check-mark characters, so printing a table crashed.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            "┌─✓".encode(getattr(stream, "encoding", None) or "ascii")
+        except (LookupError, UnicodeEncodeError):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+            except Exception:
+                pass
+
+
 def main(argv: list[str] | None = None) -> int:
     """Entry point for the ``llmtap`` console script."""
+    _ensure_unicode_output()
     try:
         args = parse_args(argv)
     except SystemExit as e:  # argparse --help / errors

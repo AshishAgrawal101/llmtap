@@ -232,3 +232,17 @@ def test_new_commands_listed_in_help(capsys: pytest.CaptureFixture[str]) -> None
     assert cli.main(["--help"]) == 0
     out = capsys.readouterr().out
     assert "report" in out and "doctor" in out
+
+
+@pytest.mark.parametrize("argv", [["prices", "claude"], ["doctor"], ["scan", "-"]])
+def test_cli_survives_non_unicode_output_encoding(argv: list[str], tmp_path: Path) -> None:
+    """Windows redirects output in the ANSI code page (cp1252); tables and check marks must not crash."""
+    import subprocess
+    import sys
+
+    env = dict(os.environ, PYTHONIOENCODING="cp1252", LLMTAP_HOME=str(tmp_path / "home"))
+    p = subprocess.run([sys.executable, "-m", "llmtap", *argv], input=b"nothing secret here\n",
+                       capture_output=True, env=env, timeout=60)
+    assert b"codec can't encode" not in p.stderr, p.stderr
+    assert p.returncode in (0, 1), p.stderr  # doctor may report setup problems (1); 2 is the crash path
+    assert p.stdout
