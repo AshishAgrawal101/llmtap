@@ -42,6 +42,7 @@ from .providers import (
     is_stream_request,
     parse_json,
     parse_sse,
+    model_from_path,
     request_model,
     resolve_route,
     response_model,
@@ -323,7 +324,7 @@ def _seal(ex: Exchange) -> None:
                 setattr(ex, f, _scrub(v, secrets))
 
 
-_LLM_TAIL = re.compile(r"(?:/(?:chat/completions|completions|embeddings)|(?:^|/)v\d+[a-z0-9]*/(?:messages|complete|responses))$")
+_LLM_TAIL = re.compile(r"(?:/(?:chat/completions|completions|embeddings)|:(?:stream)?[gG]enerateContent|(?:^|/)v\d+[a-z0-9]*/(?:messages|complete|responses))$")
 
 
 def _is_llm_call(method: str, upstream_path: str) -> bool:
@@ -541,7 +542,7 @@ class LLMTap:
                   out: _Tracked, t0: float) -> None:
         cfg = self.cfg
         req = parse_json(body)
-        ex.model = request_model(req)
+        ex.model = request_model(req) or model_from_path(route.upstream_path)
         stream_req = is_stream_request(req)
         ex.tags = tags_from_headers(hdrs)
 

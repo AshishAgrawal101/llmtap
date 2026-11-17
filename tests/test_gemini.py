@@ -213,6 +213,18 @@ class GeminiStubHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
 
+def _recorded(tap, n=1, timeout=5.0):
+    """The proxy stores an exchange just after sending the final byte, so wait for it."""
+    import time
+    end = time.time() + timeout
+    while time.time() < end:
+        got = tap.store.list(limit=50)
+        if len(got) >= n:
+            return got
+        time.sleep(0.02)
+    return tap.store.list(limit=50)
+
+
 def test_proxy_e2e_gemini_generate_content(tmp_path) -> None:
     """Test LLMTap proxying a non-streaming Gemini call to a local stub."""
     server = ThreadingHTTPServer(("127.0.0.1", 0), GeminiStubHandler)
@@ -241,7 +253,7 @@ def test_proxy_e2e_gemini_generate_content(tmp_path) -> None:
                 assert "candidates" in data
 
             # Verify proxy recorded the exchange correctly
-            exchanges = tap.store.list(limit=10)
+            exchanges = _recorded(tap)
             assert len(exchanges) == 1
             ex = exchanges[0]
             assert ex.provider == "gemini"
@@ -279,10 +291,11 @@ def test_proxy_e2e_gemini_stream_generate_content(tmp_path) -> None:
                 assert resp.status == 200
                 assert "text/event-stream" in resp.headers.get("Content-Type", "")
                 raw_body = resp.read().decode()
-                assert "Streamed Gemini response" in raw_body
+                # the stub sends the text in two SSE chunks; the joined text is asserted on the recorded exchange below
+                assert "Streamed " in raw_body and "Gemini response" in raw_body
 
             # Verify recorded exchange in proxy
-            exchanges = tap.store.list(limit=10)
+            exchanges = _recorded(tap)
             assert len(exchanges) == 1
             ex = exchanges[0]
             assert ex.provider == "gemini"
@@ -290,6 +303,54 @@ def test_proxy_e2e_gemini_stream_generate_content(tmp_path) -> None:
             assert ex.usage.input_tokens == 12
             assert ex.usage.output_tokens == 4
             assert ex.output_text == "Streamed Gemini response"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+# ---- integration with the v0.2.0 proxy: model-from-URL pricing, LLM gating, thinking tokens ----
+
+def test_model_from_path():
+    from llmtap.providers import model_from_path
+    assert model_from_path("/v1beta/models/gemini-2.5-flash:generateContent") == "gemini-2.5-flash"
+    assert model_from_path("/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse&key=x") == "gemini-2.5-pro"
+    assert model_from_path("/v1/messages") is None
+    assert model_from_path(None) is None
+
+
+def test_gemini_thinking_and_tool_tokens_are_billed():
+    from llmtap.providers import extract_usage
+    u = extract_usage("gemini", {"usageMetadata": {
+        "promptTokenCount": 100, "toolUsePromptTokenCount": 20,
+        "candidatesTokenCount": 10, "thoughtsTokenCount": 90, "cachedContentTokenCount": 40}})
+    assert (u.input_tokens, u.output_tokens, u.cache_read_tokens) == (120, 100, 40)
+
+
+def test_gemini_call_is_priced_cached_and_key_is_masked(tmp_path) -> None:
+    """Model comes from the URL, so cost is non-zero; the call is cacheable; ?key= never reaches the db."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), GeminiStubHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    secret = "AIza" + "SyD" * 4 + "abcdefghijklmnopqrstuvwxyz0"[:20]
+    try:
+        cfg = Config(port=0, db_path=str(tmp_path / "llmtap.db"), cache=True)
+        cfg.upstreams["gemini"] = {"base": f"http://127.0.0.1:{server.server_address[1]}", "style": "gemini"}
+        with LLMTap(cfg) as tap:
+            url = f"{tap.base_url}/v1beta/models/gemini-2.5-flash:generateContent?key={secret}"
+            def call():
+                req = urllib.request.Request(url, data=json.dumps({"contents": [{"parts": [{"text": "Hi"}]}]}).encode(),
+                                             headers={"Content-Type": "application/json"}, method="POST")
+                with urllib.request.urlopen(req) as r:
+                    r.read()
+            call()
+            _recorded(tap, 1)
+            call()
+            ex = _recorded(tap, 2)
+            by_time = sorted(ex, key=lambda e: e.ts)
+            first, second = by_time[0], by_time[1]
+            assert first.model == "gemini-2.5-flash" and first.cost_usd > 0
+            assert second.source == "cache" and second.saved_usd > 0
+        raw = (tmp_path / "llmtap.db").read_bytes()
+        assert secret.encode() not in raw
     finally:
         server.shutdown()
         server.server_close()

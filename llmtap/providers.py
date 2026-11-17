@@ -149,6 +149,19 @@ def request_model(req: dict | None) -> str | None:
     return m if isinstance(m, str) and m else None
 
 
+_PATH_MODEL_RE = re.compile(r"/models/([^/:?#]+)(?::[A-Za-z]+)?")
+
+
+def model_from_path(path: str | None) -> str | None:
+    """Model name embedded in a URL path, e.g. /v1beta/models/gemini-2.5-flash:generateContent -> gemini-2.5-flash.
+    Gemini carries the model in the URL rather than the request body."""
+    if not isinstance(path, str):
+        return None
+    m = _PATH_MODEL_RE.search(path.split("?", 1)[0])
+    return m.group(1) if m else None
+
+
+
 def is_stream_request(req: dict | None) -> bool:
     """True when the request asks for a streamed (SSE) response."""
     return isinstance(req, dict) and req.get("stream") is True
@@ -198,6 +211,17 @@ def _usage_from_dict(u: Any) -> Usage:
     )
 
 
+def _gemini_usage(meta: dict) -> Usage:
+    """Gemini usageMetadata -> Usage. promptTokenCount already includes cached tokens; thinking tokens
+    (thoughtsTokenCount) are billed as output but reported separately from candidatesTokenCount."""
+    return Usage(
+        input_tokens=_int(meta.get("promptTokenCount")) + _int(meta.get("toolUsePromptTokenCount")),
+        output_tokens=_int(meta.get("candidatesTokenCount")) + _int(meta.get("thoughtsTokenCount")),
+        cache_read_tokens=_int(meta.get("cachedContentTokenCount")),
+    )
+
+
+
 def extract_usage(style: str, resp: dict) -> Usage:
     """Token usage from a non-streaming response JSON. Missing fields -> 0."""
     if not isinstance(resp, dict):
@@ -205,11 +229,7 @@ def extract_usage(style: str, resp: dict) -> Usage:
     if "usageMetadata" in resp or style=="gemini": 
         meta = resp.get("usageMetadata")
         if isinstance(meta,dict):
-            return Usage(
-            input_tokens=_int(meta.get("promptTokenCount")),
-            output_tokens=_int(meta.get("candidatesTokenCount")),
-            cache_read_tokens=_int(meta.get("cachedContentTokenCount")),
-            )
+            return _gemini_usage(meta)
     usage = resp.get("usage")
     if usage is None and isinstance(resp.get("response"), dict):  # wrapped responses-API object
         usage = resp["response"].get("usage")
@@ -435,13 +455,14 @@ def parse_sse(style: str, raw: str) -> tuple[Usage, str, str | None]:
                 
                 # 2. Extract usage if present in this chunk
                 if isinstance(obj.get("usageMetadata"), dict):
-                    meta = obj["usageMetadata"]
-                    if meta.get("promptTokenCount"):
-                        usage.input_tokens = _int(meta.get("promptTokenCount"))
-                    if meta.get("candidatesTokenCount"):
-                        usage.output_tokens = _int(meta.get("candidatesTokenCount"))
-                    if meta.get("cachedContentTokenCount"):
-                        usage.cache_read_tokens = _int(meta.get("cachedContentTokenCount"))
+                    g = _gemini_usage(obj["usageMetadata"])
+                    # usageMetadata is cumulative per chunk: keep the latest non-empty totals
+                    if g.input_tokens:
+                        usage.input_tokens = g.input_tokens
+                    if g.output_tokens:
+                        usage.output_tokens = g.output_tokens
+                    if g.cache_read_tokens:
+                        usage.cache_read_tokens = g.cache_read_tokens
                 if not model and isinstance(obj.get("modelVersion"), str):
                     model = obj["modelVersion"]
                 continue
