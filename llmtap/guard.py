@@ -20,7 +20,7 @@ KINDS: dict[str, str] = {
     "anthropic_key": "Anthropic API key (sk-ant-…)",
     "openai_key": "OpenAI API key (sk-…/sk-proj-…)",
     "github_token": "GitHub token (ghp_/gho_/ghs_/github_pat_…)",
-    "slack_token": "Slack token (xoxb-/xoxp-…)",
+    "slack_token": "Slack token (xoxb-/xoxp-/xoxe-/xapp-…) or incoming-webhook URL",
     "stripe_key": "Stripe live secret key (sk_live_/rk_live_…)",
     "google_api_key": "Google API key (AIza…)",
     "private_key": "PEM private key block",
@@ -160,7 +160,9 @@ _GENERIC_KW = (r"(?:password|passwd|passphrase|secret[_-]?key|secret|token|api[_
 _PATTERNS: tuple[_Pattern, ...] = (
     _Pattern("private_key", re.compile(
         r"-----BEGIN (?:[A-Z0-9]+ ){0,3}PRIVATE KEY(?: BLOCK)?-----"
-        r"(?:(?:[^-]|-(?!----)){0,20000}-----END (?:[A-Z0-9]+ ){0,3}PRIVATE KEY(?: BLOCK)?-----)?"),
+        r"(?:(?:[^-]|-(?!----)){0,20000}-----END (?:[A-Z0-9]+ ){0,3}PRIVATE KEY(?: BLOCK)?-----"
+        # no END line (truncated paste): still cover the base64 body lines after the header
+        r"|(?:(?:\r?\n|(?:\\r)?\\n)[A-Za-z0-9+/=]{1,128}){0,400})"),
         0, 0, ("PRIVATE KEY",)),
     _Pattern("anthropic_key", re.compile(r"(?<![A-Za-z0-9_-])sk-ant-[A-Za-z0-9_-]{20,}"),
              0, 1, ("sk-ant-",)),
@@ -169,8 +171,13 @@ _PATTERNS: tuple[_Pattern, ...] = (
     _Pattern("github_token", re.compile(
         r"(?<![A-Za-z0-9_])(?:gh[pousr]_[A-Za-z0-9]{36,255}|github_pat_[A-Za-z0-9_]{30,255})(?![A-Za-z0-9_])"),
         0, 1, ("ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_")),
-    _Pattern("slack_token", re.compile(r"(?<![A-Za-z0-9_-])xox[baprs]-(?=[A-Za-z0-9-]*\d)[A-Za-z0-9-]{10,255}"),
-             0, 1, ("xox",)),
+    _Pattern("slack_token", re.compile(
+        r"(?<![A-Za-z0-9_-])(?:xox[abeprs]|xapp)-(?=[A-Za-z0-9-]*\d)[A-Za-z0-9-]{10,255}"),
+        0, 1, ("xox", "xapp-")),
+    _Pattern("slack_token", re.compile(
+        r"https://hooks\.slack\.com/services/T[A-Za-z0-9_]{6,15}/B[A-Za-z0-9_]{6,15}/[A-Za-z0-9]{20,48}"
+        r"(?![A-Za-z0-9])"),
+        0, 1, ("hooks.slack.com",), False, lambda v: _plausible_secret_value(v.rsplit("/", 1)[1])),
     _Pattern("stripe_key", re.compile(r"(?<![A-Za-z0-9_])(?:sk|rk)_live_[A-Za-z0-9]{16,255}"),
              0, 1, ("_live_",)),
     _Pattern("google_api_key", re.compile(r"(?<![A-Za-z0-9_-])AIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])"),
@@ -194,7 +201,7 @@ _PATTERNS: tuple[_Pattern, ...] = (
     # .env style: DB_PASSWORD=s3cr3tP4ss
     _Pattern("generic_secret", re.compile(
         r"(?im)^[ \t]{0,16}(?:export[ \t]+)?[A-Za-z0-9_]{0,48}" + _GENERIC_KW +
-        r"[A-Za-z0-9_]{0,32}[ \t]{0,4}=[ \t]{0,4}([^\s\"'`#;,()\[\]{}]{8,256})[ \t]*$"),
+        r"[A-Za-z0-9_]{0,32}[ \t]{0,4}=[ \t]{0,4}([^\s\"'`#;,()\[\]{}]{8,256})[ \t]*\r?$"),
         1, 5, ("pass", "secret", "token", "key", "credential"), True, _plausible_secret_value),
     # Authorization: Bearer <token>
     _Pattern("generic_secret", re.compile(r"(?i)(?<![A-Za-z0-9])bearer\s+([A-Za-z0-9._~+/-]{20,}=*)"),
@@ -209,7 +216,8 @@ _PATTERNS: tuple[_Pattern, ...] = (
     _Pattern("phone", re.compile(
         r"(?<![\w.+-])(?:\+?1[ .-]?)?(?:\(\d{3}\)[ ]?|\d{3}[ .-])\d{3}[ .-]\d{4}(?![\w-])"),
         0, 8, (), False, _phone_ok),
-    _Pattern("phone", re.compile(r"(?<![\w.+-])\+[1-9]\d{0,2}(?:[ .-]?\(?\d{1,4}\)?){2,5}(?![\w-])"),
+    # atomic group: a long digit run after "+" must not be re-split thousands of ways (backtracking)
+    _Pattern("phone", re.compile(r"(?<![\w.+-])\+[1-9]\d{0,2}(?>[ .-]?\(?\d{1,4}\)?){2,5}(?![\w-])"),
              0, 8, ("+",), False, _phone_ok),
 )
 
@@ -310,10 +318,29 @@ def _skip_key(d: dict[str, Any], key: str, parent_key: Any) -> bool:
     return False
 
 
+_KEYED_NAME = re.compile(r"(?i)(?<![A-Za-z0-9])" + _GENERIC_KW + r"\Z")
+_KEYED_VALUE = re.compile(r"[^\s\"'`\\]{8,256}")
+_TOOL_USE_TYPES = frozenset({"tool_use", "server_tool_use", "mcp_tool_use"})
+
+
+def _is_tool_args(d: dict[str, Any], key: Any, parent_key: Any) -> bool:
+    """Structured tool-call arguments: Anthropic `tool_use.input`, Gemini `functionCall.args`.
+
+    OpenAI sends arguments as a JSON *string*, where `"password": "..."` is caught by the text
+    pattern; inside these objects the key name is separate from the value, so check it explicitly.
+    """
+    if key == "input":
+        return d.get("type") in _TOOL_USE_TYPES
+    return key == "args" and parent_key in ("functionCall", "function_call")
+
+
 def _walk(obj: Any, pii: bool, path: str, parent_key: Any, out: list[Finding],
-          redact: bool) -> Any:
+          redact: bool, args: bool = False, keyed: bool = False) -> Any:
     if isinstance(obj, str):
         found = scan_text(obj, pii, path)
+        if (not found and keyed and isinstance(parent_key, str) and _KEYED_NAME.search(parent_key)
+                and _KEYED_VALUE.fullmatch(obj) and _plausible_secret_value(obj)):
+            found = [Finding("generic_secret", path, _mask("generic_secret", obj), 0, len(obj))]
         if not found:
             return obj
         out.extend(found)
@@ -326,10 +353,12 @@ def _walk(obj: Any, pii: bool, path: str, parent_key: Any, out: list[Finding],
             if isinstance(v, str) and _skip_key(obj, k, parent_key):
                 res[k] = v
             else:
-                res[k] = _walk(v, pii, _child_path(path, k), k, out, redact)
+                res[k] = _walk(v, pii, _child_path(path, k), k, out, redact,
+                               args or _is_tool_args(obj, k, parent_key), args)
         return res if redact else obj
     if isinstance(obj, (list, tuple)):
-        items = [_walk(v, pii, _child_path(path, i), parent_key, out, redact) for i, v in enumerate(obj)]
+        items = [_walk(v, pii, _child_path(path, i), parent_key, out, redact, args)
+                 for i, v in enumerate(obj)]
         return (type(obj)(items) if isinstance(obj, tuple) else items) if redact else obj
     return obj
 
@@ -370,7 +399,7 @@ def apply_guard(body: bytes, mode: str, pii: bool = False) -> tuple[bytes, list[
     obj: Any = None
     is_json = False
     try:
-        obj = json.loads(text)
+        obj = json.loads(text[1:] if text.startswith("\ufeff") else text)  # the proxy accepts a BOM too
         is_json = True
     except ValueError:
         pass
@@ -380,7 +409,11 @@ def apply_guard(body: bytes, mode: str, pii: bool = False) -> tuple[bytes, list[
             new, findings = redact_obj(obj, pii)
             if not findings:
                 return body, [], False
-            return json.dumps(new, ensure_ascii=False).encode("utf-8", errors="surrogateescape"), findings, False
+            try:
+                out = json.dumps(new, ensure_ascii=False).encode("utf-8", errors="surrogateescape")
+            except UnicodeEncodeError:  # a lone "\ud83d" escape in the input: keep it escaped
+                out = json.dumps(new).encode("ascii")
+            return out, findings, False
         findings = scan_text(text, pii)
         if not findings:
             return body, [], False

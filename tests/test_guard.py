@@ -552,3 +552,98 @@ def test_performance_adversarial(text: str) -> None:
     scan_text(text, pii=True)
     elapsed = time.perf_counter() - t0
     assert elapsed < 1.0, f"scan took {elapsed:.3f}s"
+
+
+# ------------------------------------------------------------------------------------ regressions
+
+@pytest.mark.parametrize("secret", [
+    "xoxe-1-" + "My0xLTEyMzQ1Njc4OTAxMi0xMjM0NTY3ODkwMTIz",            # rotating refresh token
+    "xapp-1-" + "A0123456789-1234567890123-" + "a1b2c3d4e5f6a1b2c3d4e5f6",  # app-level token
+    "https://hooks.slack.com/services/" + "T0A1B2C3D/B0A1B2C3D/" + "aB3dE5fG7hJ9kL1mN3pQ5rS7",
+])
+def test_slack_current_formats(secret: str) -> None:
+    text = f"slack: {secret} end"
+    found = scan_text(text)
+    assert [f.kind for f in found] == ["slack_token"]
+    assert text[found[0].start:found[0].end] == secret
+
+
+def test_slack_lookalikes_not_flagged() -> None:
+    assert scan_text("see https://hooks.slack.com/services/ for docs, xapp-store, xoxe-") == []
+    # the placeholder URL from Slack's own docs
+    assert scan_text("https://hooks.slack.com/services/" + "T00000000/B00000000/" + "X" * 24) == []
+
+
+def test_env_secret_with_crlf_line_endings() -> None:
+    text = "HOST=db\r\nDB_PASSWORD=s3cr3tP4ss\r\nPORT=5432\r\n"
+    found = scan_text(text)
+    assert [(f.kind, text[f.start:f.end]) for f in found] == [("generic_secret", "s3cr3tP4ss")]
+
+
+def test_truncated_private_key_body_redacted() -> None:
+    body = ("MIIEowIBAAKCAQEA1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1v2w3x4y\n"
+            "z5A6B7C8D9E0F1G2H3I4J5K6L7M8N9O0P1Q2R3S4T5U6V7W8X9Y0Z1a2b3c4d5e6")
+    text = "my key:\n-----BEGIN RSA PRIVATE KEY-----\n" + body + "\n\nwhy does ssh reject it?"
+    new, found = redact_obj({"m": text})
+    assert [f.kind for f in found] == ["private_key"]
+    assert new["m"] == "my key:\n[REDACTED:private_key]\n\nwhy does ssh reject it?"
+
+
+def test_redact_json_with_lone_surrogate_escape() -> None:
+    b = ('{"messages": [{"role": "user", "content": "\\ud83d broken emoji ' + GITHUB + '"}]}').encode()
+    out, found, blocked = apply_guard(b, "redact")
+    assert [f.kind for f in found] == ["github_token"] and not blocked
+    assert GITHUB.encode() not in out
+    assert json.loads(out)["messages"][0]["content"] == "\ud83d broken emoji [REDACTED:github_token]"
+
+
+def test_json_body_with_utf8_bom_is_parsed() -> None:
+    doc = {"messages": [{"role": "user",
+                         "content": "aws_secret_access_key=" + AWS_SECRET},
+                        {"role": "user", "content": [{"type": "image", "source": {
+                            "type": "base64", "media_type": "image/png", "data": "QUtJQS" * 400}}]}]}
+    b = b"\xef\xbb\xbf" + json.dumps(doc).replace("/", r"\/").encode()   # some encoders escape '/'
+    _, found, blocked = apply_guard(b, "block")
+    assert blocked and [(f.kind, f.path) for f in found] == [("aws_secret_key", "messages[0].content")]
+    out, found, _ = apply_guard(b, "redact")
+    assert AWS_SECRET not in out.decode("utf-8-sig")
+    assert json.loads(out.decode("utf-8-sig"))["messages"][0]["content"] == \
+        "aws_secret_access_key=[REDACTED:aws_secret_key]"
+
+
+@pytest.mark.parametrize("body", [
+    # Anthropic tool_use block (input is an object, not a JSON string as with OpenAI)
+    {"messages": [{"role": "assistant", "content": [
+        {"type": "tool_use", "id": "toolu_1", "name": "login",
+         "input": {"user": "admin", "db_password": "S3cr3tP4ssw0rd!"}}]}]},
+    # Gemini functionCall.args
+    {"contents": [{"role": "model", "parts": [
+        {"functionCall": {"name": "login", "args": {"user": "admin", "db_password": "S3cr3tP4ssw0rd!"}}}]}]},
+])
+def test_structured_tool_arguments_keyed_secret(body: dict) -> None:
+    _, found, blocked = apply_guard(_body(body), "block")
+    assert blocked and [f.kind for f in found] == ["generic_secret"]
+    out, _, _ = apply_guard(_body(body), "redact")
+    assert b"S3cr3tP4ssw0rd!" not in out and b'"user": "admin"' in out
+    # same arguments as an OpenAI JSON string were already caught; keep the two consistent
+    oai = {"messages": [{"role": "assistant", "tool_calls": [{"type": "function", "function": {
+        "name": "login", "arguments": json.dumps({"user": "admin", "db_password": "S3cr3tP4ssw0rd!"})}}]}]}
+    assert [f.kind for f in apply_guard(_body(oai), "block")[1]] == ["generic_secret"]
+
+
+def test_keyed_secret_only_inside_tool_arguments() -> None:
+    # top-level request fields (e.g. an MCP connector's authorization_token) are deliberate, not leaks
+    body = {"mcp_servers": [{"type": "url", "name": "x", "authorization_token": "S3cr3tP4ssw0rd!"}],
+            "messages": [{"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t", "name": "f",
+                 "input": {"password_hint": "S3cr3tP4ssw0rd!", "token": "short", "api_key": "${API_KEY}",
+                           "max_tokens": 12345678, "secret": {"x": 1}}}]}]}
+    assert apply_guard(_body(body), "block") == (_body(body), [], False)
+
+
+def test_phone_plus_digit_runs_linear() -> None:
+    text = ("+" + "1" * 40 + " ") * 24000   # ~1 MB of '+' followed by long digit runs
+    t0 = time.perf_counter()
+    scan_text(text, pii=True)
+    elapsed = time.perf_counter() - t0
+    assert elapsed < 1.0, f"scan took {elapsed:.3f}s"
