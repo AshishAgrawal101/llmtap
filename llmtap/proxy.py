@@ -118,6 +118,21 @@ class EventBus:
             except ValueError:
                 pass
 
+    def close(self) -> None:
+        """Send every subscriber the ``None`` sentinel (ends live dashboard streams), even when its queue is full."""
+        with self._lock:
+            subs = list(self._subs)
+        for q in subs:
+            for _ in range(2):
+                try:
+                    q.put_nowait(None)
+                    break
+                except queue.Full:
+                    try:
+                        q.get_nowait()
+                    except queue.Empty:
+                        pass
+
     def subscriber_count(self) -> int:
         with self._lock:
             return len(self._subs)
@@ -477,6 +492,10 @@ class LLMTap:
                 srv.server_close()
             except Exception:
                 pass
+        try:
+            self.bus.close()   # live SSE feeds would otherwise keep their handler threads (and clients) forever
+        except Exception:
+            pass
         if self._thread is not None:
             self._thread.join(timeout=5)
         for obj in (self.cache, self.store):

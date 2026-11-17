@@ -308,6 +308,7 @@ def _events(tap: "LLMTap", respond: Responder) -> None:
     """Server-sent events: one ``data:`` frame per bus event, ``: ping`` heartbeats."""
     bus = tap.bus
     q = bus.subscribe()
+    stopped = False
     try:
         respond.start(200, {
             "content-type": "text/event-stream; charset=utf-8",
@@ -322,7 +323,8 @@ def _events(tap: "LLMTap", respond: Responder) -> None:
             except queue.Empty:
                 respond.write(b": ping\n\n")
                 continue
-            if event is None:  # sentinel: shut down this stream
+            if event is None:  # sentinel (proxy shutdown): end this stream
+                stopped = True
                 break
             data = json.dumps(_event_payload(event), default=str, separators=(",", ":"))
             respond.write(f"data: {data}\n\n".encode("utf-8"))
@@ -337,6 +339,9 @@ def _events(tap: "LLMTap", respond: Responder) -> None:
             respond.end()
         except Exception:
             pass
+        abort = getattr(respond, "abort", None)
+        if stopped and abort is not None:
+            abort()   # after the clean end: close the connection so the handler thread exits too
 
 
 def _hostname(host: str) -> str:
@@ -432,7 +437,10 @@ def handle_internal(tap: "LLMTap", method: str, path: str, headers: Any, body: b
                 _json(respond, _timeseries(tap, qs))
                 return True
             if sub == "/api/events":
-                _events(tap, respond)
+                if method == "HEAD":   # bodyless: writes are no-ops, so a stream would never notice the client left
+                    _send(respond, 200, b"", "text/event-stream; charset=utf-8")
+                else:
+                    _events(tap, respond)
                 return True
         elif method == "POST":
             if sub == "/api/clear":

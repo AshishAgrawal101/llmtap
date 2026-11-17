@@ -187,6 +187,38 @@ def test_slow_upstream_first_byte_times_out_with_504(mk):
 
 
 # ------------------------------------------------------------------------------------------------
+# dashboard live feed
+# ------------------------------------------------------------------------------------------------
+def test_head_on_live_feed_does_not_leak_a_subscriber(mk):
+    tap, _ = mk()
+    out = raw_http(tap.port, b"HEAD /_llmtap/api/events HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+                   timeout=2)
+    assert out.startswith(b"HTTP/1.1 200") and b"event-stream" in out
+    assert _wait(lambda: tap.bus.subscriber_count() == 0, 1.0)
+
+
+def test_shutdown_ends_live_feeds(mk):
+    tap, _ = mk()
+    socks = []
+    for _ in range(3):
+        s = socket.create_connection(("127.0.0.1", tap.port), timeout=3)
+        s.sendall(b"GET /_llmtap/api/events HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+        socks.append(s)
+    assert _wait(lambda: tap.bus.subscriber_count() == 3)
+    tap.shutdown()
+    for s in socks:
+        buf = b""
+        while True:
+            c = s.recv(65536)   # socket.timeout here means the stream outlived the proxy
+            if not c:
+                break
+            buf += c
+        s.close()
+        assert buf.endswith(b"0\r\n\r\n")
+    assert tap.bus.subscriber_count() == 0
+
+
+# ------------------------------------------------------------------------------------------------
 # concurrency
 # ------------------------------------------------------------------------------------------------
 def test_many_concurrent_connections_complete_and_release_threads(mk):
