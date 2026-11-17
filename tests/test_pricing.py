@@ -389,3 +389,10 @@ def test_fast_mode_doubles_token_cost():
 def test_web_searches_billed_per_request():
     u = Usage(input_tokens=1000, output_tokens=100, web_search_requests=3)
     assert cost_usd("claude-sonnet-5-5", u) == pytest.approx((1000 * 2 + 100 * 10) / 1e6 + 0.03)
+
+
+def test_openai_flex_tier_is_half_price():
+    u = Usage(input_tokens=1_000_000, output_tokens=1_000_000, service_tier="flex")
+    assert cost_usd("gpt-5", u) == pytest.approx((1.25 + 10) / 2)
+    u.service_tier = "default"
+    assert cost_usd("gpt-5", u) == pytest.approx(1.25 + 10)

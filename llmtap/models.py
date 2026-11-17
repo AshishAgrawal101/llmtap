@@ -18,6 +18,7 @@ class Usage:
     cache_write_1h_tokens: int = 0  # anthropic cache_creation.ephemeral_1h_input_tokens (subset of cache_write)
     speed: str = ""                # anthropic usage.speed ("fast" = fast mode, billed at 2x)
     web_search_requests: int = 0   # anthropic server_tool_use.web_search_requests (billed per search)
+    service_tier: str = ""         # openai response service_tier ("flex" = half price)
 
     def total(self) -> int:
         return self.input_tokens + self.output_tokens

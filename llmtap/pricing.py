@@ -31,7 +31,8 @@ Cost (``cost_usd``) - the providers report cached tokens differently:
 Missing cache prices default to 10% of input (Anthropic) / 50% (others); cache-write
 price defaults to 125% of input (5-minute TTL). Anthropic extras: 1-hour cache writes cost
 2x input, fast mode (``usage.speed == "fast"``) doubles the token cost, and server-side web
-searches add ``WEB_SEARCH_USD`` each.
+searches add ``WEB_SEARCH_USD`` each. OpenAI's ``service_tier: "flex"`` is billed at half
+price (the Batch rates); the ``priority`` tier's per-model uplift is not modelled.
 """
 from __future__ import annotations
 
@@ -413,6 +414,8 @@ def cost_usd(model: str | None, usage: Usage, overrides: dict | None = None, sty
         total = uncached * price["input"] + cr * price["cache_read"] + out * price["output"]
     if usage.speed == "fast":
         total *= FAST_MODE_MULTIPLIER
+    if usage.service_tier == "flex":
+        total *= 0.5
     usd = total / 1_000_000 + max(int(usage.web_search_requests or 0), 0) * WEB_SEARCH_USD
     return round(usd, 10)
 

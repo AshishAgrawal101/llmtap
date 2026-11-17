@@ -643,3 +643,18 @@ def test_anthropic_billing_extras_parsed_from_json_and_stream():
     u, _, model = parse_sse("anthropic", raw)
     assert model == "claude-opus-5-5"
     assert (u.output_tokens, u.cache_write_1h_tokens, u.web_search_requests, u.speed) == (42, 200, 3, "fast")
+
+
+def test_openai_service_tier_parsed_from_json_and_streams():
+    from llmtap.providers import extract_usage, parse_sse
+    u = extract_usage("openai", {"service_tier": "flex", "usage": {"prompt_tokens": 5, "completion_tokens": 1}})
+    assert u.service_tier == "flex"
+    u = extract_usage("openai", {"response": {"service_tier": "flex", "usage": {"input_tokens": 5}}})
+    assert u.service_tier == "flex"
+    chat = ('data: {"model":"gpt-5","service_tier":"flex","choices":[{"index":0,"delta":{"content":"hi"}}]}\n\n'
+            'data: {"model":"gpt-5","service_tier":"flex","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":1}}\n\n'
+            'data: [DONE]\n\n')
+    assert parse_sse("openai", chat)[0].service_tier == "flex"
+    responses = ('event: response.completed\ndata: {"type":"response.completed","response":{"model":"gpt-5",'
+                 '"service_tier":"flex","usage":{"input_tokens":5,"output_tokens":1},"output":[]}}\n\n')
+    assert parse_sse("openai", responses)[0].service_tier == "flex"

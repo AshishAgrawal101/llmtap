@@ -243,7 +243,11 @@ def extract_usage(style: str, resp: dict) -> Usage:
     usage = resp.get("usage")
     if usage is None and isinstance(resp.get("response"), dict):  # wrapped responses-API object
         usage = resp["response"].get("usage")
-    return _usage_from_dict(usage)
+    u = _usage_from_dict(usage)
+    tier = resp.get("service_tier") or _dict(resp.get("response")).get("service_tier")
+    if isinstance(tier, str):
+        u.service_tier = tier
+    return u
 
 
 def _anthropic_text(content: Any) -> str:
@@ -454,6 +458,8 @@ def parse_sse(style: str, raw: str) -> tuple[Usage, str, str | None]:
                     model = model or resp["model"]
                 if isinstance(resp.get("usage"), dict):
                     _merge_usage(usage, resp["usage"])
+                if isinstance(resp.get("service_tier"), str) and resp["service_tier"]:
+                    usage.service_tier = resp["service_tier"]
                 if etype != "response.created" and etype != "response.in_progress":
                     completed_text = _responses_text(resp) or completed_text
                 continue
@@ -485,6 +491,8 @@ def parse_sse(style: str, raw: str) -> tuple[Usage, str, str | None]:
             # ---- openai chat / legacy completions chunks ----
             if not model and isinstance(obj.get("model"), str) and obj["model"]:
                 model = obj["model"]
+            if isinstance(obj.get("service_tier"), str) and obj["service_tier"]:
+                usage.service_tier = obj["service_tier"]
             choices = obj.get("choices")
             if isinstance(choices, list):
                 for ch in choices:
