@@ -226,7 +226,10 @@ def _growing(tmp_path: Path, n: int = 7) -> _Growing:
 def test_report_does_not_double_count_rows_recorded_meanwhile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(report, "PAGE", 3)
     g = _growing(tmp_path)
-    data = report.build_report(g, since=None)
+    try:
+        data = report.build_report(g, since=None)
+    finally:
+        g.close()
     assert data["waste"]["duplicate_requests"] == 0
     assert data["totals"]["requests"] == 7
 
