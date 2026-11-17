@@ -74,12 +74,20 @@ def _port_in_use(host: str, port: int) -> bool:
         s.close()
 
 
+def _http_base(host: str, port: int) -> str:
+    """``http://host:port`` for a bind address (wildcards -> loopback, IPv6 literals bracketed)."""
+    h = {"0.0.0.0": "127.0.0.1", "": "127.0.0.1", "::": "::1"}.get(host, host)
+    if ":" in h and not h.startswith("["):
+        h = f"[{h}]"
+    return f"http://{h}:{port}"
+
+
 def _is_llmtap(host: str, port: int) -> str | None:
     """Return the llmtap version if /_llmtap/health answers on host:port."""
     import json
     try:
-        h = "127.0.0.1" if host in ("0.0.0.0", "") else host
-        with urllib.request.urlopen(f"http://{h}:{port}/_llmtap/health", timeout=1.5) as r:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # local: never via HTTP_PROXY
+        with opener.open(f"{_http_base(host, port)}/_llmtap/health", timeout=1.5) as r:
             data = json.loads(r.read().decode("utf-8", "replace"))
         if isinstance(data, dict) and data.get("ok"):
             return str(data.get("version") or "?")
@@ -95,7 +103,7 @@ def check_port(host: str, port: int) -> Check:
         return Check(OK, f"Port {port} is free")
     ver = _is_llmtap(host, port)
     if ver is not None:
-        return Check(OK, f"Port {port}: llmtap v{ver} is already running", f"dashboard: http://{host}:{port}/_llmtap/")
+        return Check(OK, f"Port {port}: llmtap v{ver} is already running", f"dashboard: {_http_base(host, port)}/_llmtap/")
     who = _listener_info(port)
     return Check(WARN, f"Port {port} is in use" + (f" ({who})" if who else ""), "",
                  f"stop that process, or run `llmtap serve --port {port + 1}`")
@@ -120,7 +128,8 @@ def check_db(cfg: Any) -> Check:
     detail = ""
     if p.is_file():
         try:
-            c = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=2)
+            # as_uri() percent-encodes '#', '?' and '%', which a raw "file:{p}" URI would misparse
+            c = sqlite3.connect(p.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
             try:
                 n = c.execute("SELECT COUNT(*) FROM exchanges").fetchone()[0]
                 detail = f"{n:,} exchanges recorded"

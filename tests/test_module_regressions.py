@@ -134,3 +134,40 @@ def test_wrap_keeps_users_no_proxy(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert values
     for v in values:
         assert "corp.example" in v.split(",") and "127.0.0.1" in v.split(",")
+
+
+# ------------------------------------------------------------------ doctor
+
+def test_doctor_health_probe_brackets_ipv6(monkeypatch: pytest.MonkeyPatch) -> None:
+    urls: list[str] = []
+
+    def fake_open(self: Any, url: Any, data: Any = None, timeout: Any = None) -> Any:
+        urls.append(url if isinstance(url, str) else url.full_url)
+        raise urllib.error.URLError("refused")
+
+    monkeypatch.setattr(doctor, "_port_in_use", lambda h, p: True)
+    monkeypatch.setattr(doctor, "_listener_info", lambda p: "")
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", fake_open)
+    doctor.check_port("::1", 4141)
+    assert urls == ["http://[::1]:4141/_llmtap/health"]
+
+    monkeypatch.setattr(doctor, "_is_llmtap", lambda h, p: "9.9")
+    c = doctor.check_port("::1", 4141)
+    assert "http://[::1]:4141/_llmtap/" in c.detail
+
+
+def test_doctor_detects_running_llmtap_despite_http_proxy(tap: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    _no_proxy_env(monkeypatch)
+    t = tap()
+    c = doctor.check_port("127.0.0.1", t.port)
+    assert c.level == doctor.OK and "already running" in c.title
+
+
+def test_doctor_db_path_with_hash(tmp_path: Path) -> None:
+    p = tmp_path / "a#b" / "llmtap.db"
+    s = Store(str(p))
+    s.record(_ex("hi", time.time()))
+    s.close()
+    c = doctor.check_db(Config(db_path=str(p)))
+    assert c.level == doctor.OK, c
+    assert "1 exchanges recorded" in c.detail
