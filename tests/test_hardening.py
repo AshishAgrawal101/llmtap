@@ -617,7 +617,8 @@ def test_d_anthropic_stream_crlf_ping_comments_and_cache_usage(mk):
     u = ex.usage
     assert (u.input_tokens, u.cache_read_tokens, u.cache_write_tokens, u.output_tokens) == (100, 400, 50, 77)
     assert not u.estimated and ex.output_text == "Hello"
-    assert abs(ex.cost_usd - cost_usd("claude-sonnet-4-5", Usage(100, 77, 400, 50))) < 1e-9
+    assert abs(ex.cost_usd - cost_usd("claude-sonnet-4-5", Usage(100, 77, 400, 50, web_search_requests=1))) < 1e-9
+    assert abs(ex.cost_usd - cost_usd("claude-sonnet-4-5", Usage(100, 77, 400, 50)) - 0.01) < 1e-9
 
 
 def test_d_midstream_error_event_flagged_not_priced_not_cached(mk):
