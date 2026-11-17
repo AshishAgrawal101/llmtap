@@ -12,6 +12,11 @@ All notable changes to this project are documented here. The format is based on
 - Gemini calls other than `generateContent` (e.g. `:embedContent?key=…`, `GET /v1beta/models?key=…`) were routed to
   the OpenAI upstream, sending the Google API key to api.openai.com. Any Generative Language path, `x-goog-api-key`
   header or `?key=` parameter now routes to Gemini.
+- **Guard gaps:** Slack refresh/app tokens (`xoxe-`, `xapp-`) and incoming-webhook URLs are detected; `.env` lines
+  with CRLF endings, keyed secrets inside structured tool arguments (Anthropic `tool_use.input`, Gemini
+  `functionCall.args`) and UTF-8-BOM request bodies are scanned properly; a private key without its END line now
+  has its key body redacted, not just the header.
+- `llmtap scan` read UTF-16 files (what Windows PowerShell 5.1 writes) as NUL-interleaved text and missed every secret.
 
 ### Fixed
 
@@ -36,10 +41,33 @@ All notable changes to this project are documented here. The format is based on
   were only thinking showed as blank; the chart total was clipped on phones; personal data was labelled "secrets";
   invalid `group_by` returned 500 instead of 400.
 - `llmtap report` printed a `file://` link that doesn't open on Windows.
+- Guard: a lone surrogate escape in a JSON body crashed redact mode with a 500; the phone-number detector
+  backtracked for ~20 s on 2 MB of digits.
+- `report` / `stats` / `export` counted (or exported) rows twice when a running proxy recorded new rows meanwhile.
+- `llmtap demo` wrote fake traffic into a project's configured cassette, obeyed its budgets, and went through
+  `HTTP_PROXY`.
+- `llmtap wrap`: a command the OS can't execute exits 126 with a message instead of a traceback; Ctrl-C on Windows no
+  longer prints a thread traceback; the user's `NO_PROXY` / `no_proxy` hosts are kept.
+- `llmtap doctor` reported a running llmtap as "port in use" with an IPv6 `--host` or behind `HTTP_PROXY`, and a
+  database under a folder with `#` as unreadable.
+- Token and duration formatting rolled over wrongly at unit boundaries (`1000k`, `1000ms`, `60.0s`); `~` shortening
+  matched paths that merely start with the home directory's name.
+- Docs: install with `pip install llmtap-proxy`; routing, config flags, pipeline order and the budget API match the
+  code.
 
 ### Added
 
 - Dashboard: an "errors (HTTP 4xx/5xx)" source filter, and search now matches tags and session ids.
+- **Pricing follows more of the bill:** long-prompt rate cards (Claude Haiku 5.5 costs $0.50/$2.50 instead of
+  $0.10/$0.50 once a prompt is over 100K tokens; Gemini 2.5/3 Pro and Claude Sonnet 4/4.5 above 200K), Anthropic fast
+  mode (2x), 1-hour cache writes (2x input instead of 1.25x), server-side web searches ($10 per 1,000) and OpenAI's
+  flex tier (half price). `llmtap prices` lists the long-prompt rates (and `--json` has a `long_context` key).
+
+### Performance
+
+- `llmtap stats` and `llmtap report` on large databases: on 200k rows `stats` went from 17 s to 3 s. Generation calls
+  now store their cache key (database schema 2, upgraded in place), so the "potential savings" waste finder runs
+  from an index; reports page with a keyset and skip response bodies.
 
 ## [0.2.1] - 2026-11-16
 

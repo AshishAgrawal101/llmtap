@@ -62,8 +62,12 @@ openai responses/embeddings `input_tokens`/`output_tokens` or `prompt_tokens`. M
 PRICES: dict[str, dict[str, float]]    # model-prefix -> {"input","output","cache_read","cache_write"} USD per 1M tokens
 def price_for(model: str | None, overrides: dict | None = None) -> dict[str, float] | None
     # exact match, then longest prefix match (strip provider prefixes like "anthropic/" or "openai/"), overrides win. None if unknown.
+LONG_CONTEXT: dict[str, tuple[int, dict[str, float]]]  # key -> (prompt-token threshold, prices above it)
 def cost_usd(model: str | None, usage: Usage, overrides: dict | None = None, style: str | None = None) -> float
-    # 0.0 if unknown model; `style` = wire format the usage came from (decides how cached tokens are counted)
+    # 0.0 if unknown model; `style` = wire format the usage came from (decides how cached tokens are counted).
+    # Long prompts use the LONG_CONTEXT card for the whole request; usage.speed == "fast" doubles token cost;
+    # usage.cache_write_1h_tokens bill at 2x input; usage.web_search_requests add $0.01 each;
+    # usage.service_tier == "flex" halves the cost.
 def format_usd(x: float) -> str        # "$0.0042", "$1.23", "$0.00" (4 decimals under $1 if nonzero, else 2)
 ```
 Cover Claude (opus/sonnet/haiku 3.x, 4.x, 4.5, 5 families), GPT-4o/4o-mini/4.1/4.1-mini/nano, o1/o3/o4-mini, gpt-5/5-mini/5-nano,

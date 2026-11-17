@@ -545,6 +545,10 @@ by base URL, and llmtap makes a normal, verified HTTPS request upstream. Tools t
 Claude (3.x, 4.x, 4.5, 5 families), GPT-4o / 4.1 / 5 families, o1 / o3 / o4-mini, OpenAI embeddings, Gemini via OpenRouter, and
 common Llama / Mixtral / DeepSeek names. Local models (Ollama) are $0. Run `llmtap prices` to see the table, and
 add or override prices under `[pricing_overrides]` in `llmtap.toml`. Unknown models are recorded with cost $0.
+
+Costs follow what the response reports: long-prompt rate cards (Claude Haiku 5.5 above 100K tokens, Gemini Pro above
+200K, ...), Anthropic fast mode (2x), 1-hour cache writes (2x input), web searches ($10 per 1,000) and OpenAI's flex
+tier (half price).
 </details>
 
 <details>
