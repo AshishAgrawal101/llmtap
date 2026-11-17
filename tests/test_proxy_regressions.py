@@ -195,3 +195,12 @@ def test_gemini_json_array_stream_gets_real_usage(mk):
     assert (ex.usage.input_tokens, ex.usage.output_tokens) == (500, 60)
     assert ex.output_text == "Hello"
     assert ex.cost_usd > 0
+
+
+def test_generation_calls_store_their_cache_key(mk):
+    tap, up = mk(up=llm_up())
+    assert call(tap, "POST", "/v1/messages", msg("k"), {"x-api-key": "k"})[0] == 200
+    ex = last(tap)
+    assert ex.request_key == cache_key("anthropic", "/v1/messages", ex.request_body.encode())
+    call(tap, "GET", "/v1/models", None, {"x-api-key": "k"})
+    assert last(tap).request_key is None

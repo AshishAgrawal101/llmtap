@@ -9,6 +9,7 @@ single self-contained file (inline CSS + SVG, no JS, no network) and every piece
 """
 from __future__ import annotations
 
+import hashlib
 import heapq
 import html
 import json
@@ -152,17 +153,38 @@ def safe_preview(p: Any) -> str:
     return s[:3] + "…" + s[-2:]
 
 
-def _request_key(ex: Exchange) -> str:
-    """Same key `--cache` would use (provider + path + canonical body), so 'savings' are real."""
+def _request_key(ex: Exchange, memo: dict[bytes, str] | None = None) -> str:
+    """Same key `--cache` would use (provider + path + canonical body), so 'savings' are real.
+
+    ``memo`` caches keys by a digest of the raw request, so identical requests (the common case for
+    waste) are canonicalized once instead of JSON-parsed and re-serialized every time."""
+    body = (ex.request_body or "").encode("utf-8")
+    digest = b""
+    if memo is not None:
+        h = hashlib.blake2b(digest_size=16)
+        for part in (ex.provider or "", "\n", ex.path or "", "\n"):
+            h.update(part.encode("utf-8"))
+        h.update(body)
+        digest = h.digest()
+        hit = memo.get(digest)
+        if hit is not None:
+            return hit
     try:
         from llmtap.cache import cache_key
-        return cache_key(ex.provider, ex.path or "", (ex.request_body or "").encode("utf-8"))
+        key = cache_key(ex.provider, ex.path or "", body)
     except Exception:  # pragma: no cover - cache.py unavailable
-        return f"{ex.provider}\n{ex.path}\n{ex.request_body}"
+        key = f"{ex.provider}\n{ex.path}\n{ex.request_body}"
+    if memo is not None:
+        memo[digest] = key
+    return key
 
 
 def _iter_exchanges(store: Any, since: float | None) -> Iterator[Exchange]:
-    """Stream every exchange since ``since`` in pages (newest first) so big DBs don't blow memory."""
+    """Stream every exchange since ``since`` (newest first) so big DBs don't blow memory. Reports never
+    read response bodies, so a Store skips them (``iter_light``)."""
+    if hasattr(store, "iter_light"):
+        yield from store.iter_light(since)
+        return
     offset = 0
     while True:
         page = store.list(limit=PAGE, offset=offset, since=since)
@@ -182,8 +204,12 @@ def _is_ok(ex: Exchange) -> bool:
 # waste finder
 
 
-def _waste_from(records: dict[str, list[tuple[float, float, str, str | None, str]]]) -> dict[str, Any]:
-    """records: key -> [(ts, cost, preview, model, provider)] of successful upstream calls."""
+def _waste_from(records: dict[str, list[tuple[float, float, str, str | None, str]]],
+                preview_of: Any = None) -> dict[str, Any]:
+    """records: key -> [(ts, cost, preview, model, provider)] of successful upstream calls.
+
+    With ``preview_of``, the third field is an exchange id and ``preview_of(id)`` is called only for the
+    groups that are returned (previews are costly and most records are never shown)."""
     groups: list[dict[str, Any]] = []
     dup_requests = 0
     dup_groups = 0
@@ -211,6 +237,9 @@ def _waste_from(records: dict[str, list[tuple[float, float, str, str | None, str
             "last_ts": calls[-1][0],
         })
     groups.sort(key=lambda g: (-g["savings_usd"], -g["count"], g["key"]))
+    if preview_of is not None:
+        for g in groups[:TOP_N]:
+            g["preview"] = preview_of(g["preview"]) if g["preview"] else ""
     return {
         "duplicate_requests": dup_requests,
         "duplicate_groups": dup_groups,
@@ -222,11 +251,111 @@ def _waste_from(records: dict[str, list[tuple[float, float, str, str | None, str
 def find_waste(store: Any, since: float | None = None) -> dict[str, Any]:
     """Waste finder on its own: duplicated upstream prompts and what ``--cache`` would have saved."""
     records: dict[str, list[tuple[float, float, str, str | None, str]]] = {}
+    memo: dict[bytes, str] = {}
+    if hasattr(store, "waste_groups"):
+        return _find_waste_indexed(store, since)
     for ex in _iter_exchanges(store, since):
         if _is_ok(ex) and ex.request_body:
-            records.setdefault(_request_key(ex), []).append(
-                (ex.ts, float(ex.cost_usd or 0.0), prompt_preview(ex.request_body), ex.model, ex.provider))
-    return _waste_from(records)
+            records.setdefault(ex.request_key or _request_key(ex, memo), []).append(
+                (ex.ts, float(ex.cost_usd or 0.0), ex.id, ex.model, ex.provider))
+    return _waste_from(records, _preview_lookup(store))
+
+
+def _find_waste_indexed(store: Any, since: float | None) -> dict[str, Any]:
+    """find_waste on a Store with stored request keys: duplicate groups come from an index-only SQL
+    aggregate; only rows recorded before keys were stored are read and hashed in Python."""
+    groups, legacy = store.waste_groups(since)
+    aggs: dict[str, dict[str, Any]] = {}
+    for key, n, total, first_ts, first_cost, last_ts in groups:
+        aggs[key] = {"n": int(n), "total": float(total or 0.0), "first_ts": float(first_ts),
+                     "first_cost": float(first_cost or 0.0), "last_ts": float(last_ts),
+                     "first_id": None, "provider": None, "models": None}
+    if legacy:
+        memo: dict[bytes, str] = {}
+        legacy_aggs: dict[str, dict[str, Any]] = {}
+        for ex_id, ts, cost, provider, path, model, body in legacy:
+            key = _request_key(Exchange(id=ex_id, provider=provider, path=path, request_body=body), memo)
+            cost = float(cost or 0.0)
+            a = legacy_aggs.get(key)
+            if a is None:
+                legacy_aggs[key] = {"n": 1, "total": cost, "first_ts": ts, "first_cost": cost, "last_ts": ts,
+                                    "first_id": ex_id, "provider": provider, "models": {model} if model else set()}
+                continue
+            a["n"] += 1
+            a["total"] += cost
+            if model:
+                a["models"].add(model)
+            if ts < a["first_ts"]:
+                a.update(first_ts=ts, first_cost=cost, first_id=ex_id, provider=provider)
+            a["last_ts"] = max(a["last_ts"], ts)
+        # merge with keyed groups; a legacy row may duplicate a keyed request seen only once
+        singles = [k for k in legacy_aggs if k not in aggs]
+        if singles and hasattr(store, "rows_for_keys"):
+            for key, ts, cost, ex_id, model, provider in store.rows_for_keys(singles, since):
+                a = legacy_aggs[key]
+                a["n"] += 1
+                a["total"] += float(cost or 0.0)
+                if model:
+                    a["models"].add(model)
+                if ts < a["first_ts"]:
+                    a.update(first_ts=ts, first_cost=float(cost or 0.0), first_id=ex_id, provider=provider)
+                a["last_ts"] = max(a["last_ts"], ts)
+        for key, la in legacy_aggs.items():
+            a = aggs.get(key)
+            if a is None:
+                aggs[key] = la
+                continue
+            a["n"] += la["n"]
+            a["total"] += la["total"]
+            a["last_ts"] = max(a["last_ts"], la["last_ts"])
+            a["legacy_models"] = la["models"]
+            if la["first_ts"] < a["first_ts"]:
+                a.update(first_ts=la["first_ts"], first_cost=la["first_cost"], first_id=la["first_id"],
+                         provider=la["provider"])
+
+    out: list[dict[str, Any]] = []
+    dup_requests = 0
+    total_savings = 0.0
+    for key, a in aggs.items():
+        if a["n"] < 2:
+            continue
+        savings = a["total"] - a["first_cost"]
+        dup_requests += a["n"] - 1
+        total_savings += savings
+        out.append({"key": key[:12], "_key": key, "_a": a, "count": a["n"], "duplicates": a["n"] - 1,
+                    "total_cost_usd": a["total"], "savings_usd": savings,
+                    "first_ts": a["first_ts"], "last_ts": a["last_ts"]})
+    out.sort(key=lambda g: (-g["savings_usd"], -g["count"], g["key"]))
+    top = out[:TOP_N]
+    preview_of = _preview_lookup(store)
+    for g in top:
+        a = g.pop("_a")
+        full_key = g.pop("_key")
+        models = set(a["models"] or ())
+        if a["models"] is None or a["first_id"] is None:      # keyed: look the details up now
+            first_id, provider, keyed_models = store.waste_detail(full_key, since)
+            models.update(keyed_models)
+            models.update(a.get("legacy_models") or ())
+            if a["first_id"] is None:
+                a["first_id"], a["provider"] = first_id, provider
+        g["preview"] = preview_of(a["first_id"]) if a["first_id"] else ""
+        g["model"] = ", ".join(sorted(models)) if models else None
+        g["provider"] = a["provider"]
+    ordered = ["key", "preview", "model", "provider", "count", "duplicates", "total_cost_usd", "savings_usd",
+               "first_ts", "last_ts"]
+    return {
+        "duplicate_requests": dup_requests,
+        "duplicate_groups": sum(1 for _ in out),
+        "savings_usd": total_savings,
+        "groups": [{k: g[k] for k in ordered} for g in top],
+    }
+
+
+def _preview_lookup(store: Any) -> Any:
+    def preview_of(ex_id: str) -> str:
+        ex = store.get(ex_id) if hasattr(store, "get") else None
+        return prompt_preview(ex.request_body) if ex is not None else ""
+    return preview_of
 
 
 def potential_savings(store: Any, since: float | None = None) -> tuple[float, int]:
@@ -306,6 +435,7 @@ def build_report(store: Any, since: float | None = None, now: float | None = Non
     first_ts: float | None = None
     last_ts: float | None = None
     seq = 0
+    key_memo: dict[bytes, str] = {}
 
     for ex in _iter_exchanges(store, since):
         seq += 1
@@ -350,10 +480,10 @@ def build_report(store: Any, since: float | None = None, now: float | None = Non
 
         key = None
         if ex.request_body and (_is_ok(ex) or ex.source == "loop"):
-            key = _request_key(ex)
+            key = ex.request_key or _request_key(ex, key_memo)
         if key is not None and _is_ok(ex):
             waste_records.setdefault(key, []).append(
-                (ex.ts, float(ex.cost_usd or 0.0), prompt_preview(ex.request_body), ex.model, ex.provider))
+                (ex.ts, float(ex.cost_usd or 0.0), ex.id, ex.model, ex.provider))
             kc = key_cost.setdefault(key, [0.0, 0.0])
             kc[0] += float(ex.cost_usd or 0.0)
             kc[1] += 1
@@ -386,7 +516,7 @@ def build_report(store: Any, since: float | None = None, now: float | None = Non
                     gk["previews"].append(pv)
 
     # ---- derived
-    waste = _waste_from(waste_records)
+    waste = _waste_from(waste_records, _preview_lookup(store))
 
     loop_rows = []
     prevented = 0.0

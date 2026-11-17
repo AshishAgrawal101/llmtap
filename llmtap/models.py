@@ -56,6 +56,7 @@ class Exchange:
     guard_findings: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None
     output_text: str = ""          # assistant text extracted from response (for UI/search)
+    request_key: str | None = None  # the --cache key of a generation call (groups identical requests)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

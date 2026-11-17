@@ -579,6 +579,7 @@ class LLMTap:
 
         cacheable = llm
         key = cache_key(route.provider, route.upstream_path, send_body) if cacheable else ""
+        ex.request_key = key or None
 
         # loop breaker: counts every identical generation call, even ones the cache will answer (a stuck
         # agent replaying a cached request would otherwise loop forever)

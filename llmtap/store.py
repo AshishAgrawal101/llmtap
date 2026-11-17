@@ -5,11 +5,11 @@ import json
 import sqlite3
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .models import Exchange, Usage
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # (column name, SQL type/default). Order matters only for readability.
 # To add a column in the future: append it here (with a DEFAULT) and bump SCHEMA_VERSION;
@@ -40,6 +40,7 @@ COLUMNS: list[tuple[str, str]] = [
     ("guard_findings", "TEXT NOT NULL DEFAULT '[]'"),
     ("error", "TEXT"),
     ("output_text", "TEXT NOT NULL DEFAULT ''"),
+    ("request_key", "TEXT"),
 ]
 _COL_NAMES = [c for c, _ in COLUMNS]
 _SELECT = ", ".join(_COL_NAMES)
@@ -95,6 +96,10 @@ class Store:
                 c.execute(f"ALTER TABLE exchanges ADD COLUMN {name} {typ.replace('PRIMARY KEY', '')}")
         c.execute("CREATE INDEX IF NOT EXISTS idx_exchanges_ts ON exchanges(ts)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_exchanges_source_ts ON exchanges(source, ts)")
+        # Waste finder: duplicate generation calls are found from this index alone, without reading the
+        # (large) rows. Rows recorded before schema 2 have no key and take the slow path.
+        c.execute("CREATE INDEX IF NOT EXISTS idx_exchanges_waste "
+                  "ON exchanges(source, request_key, status, ts, cost_usd)")
         version = c.execute("PRAGMA user_version").fetchone()[0]
         if version < SCHEMA_VERSION:
             c.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
@@ -121,7 +126,7 @@ class Store:
             1 if u.estimated else 0, float(ex.cost_usd), float(ex.saved_usd), ex.source,
             json.dumps(ex.tags or {}, ensure_ascii=False),
             json.dumps(ex.guard_findings or [], ensure_ascii=False, default=str),
-            ex.error, ex.output_text or "",
+            ex.error, ex.output_text or "", ex.request_key or None,
         )
 
     @staticmethod
@@ -152,7 +157,7 @@ class Store:
             "usage": usage.__dict__, "cost_usd": float(r["cost_usd"]), "saved_usd": float(r["saved_usd"]),
             "source": r["source"], "tags": tags if isinstance(tags, dict) else {},
             "guard_findings": findings if isinstance(findings, list) else [],
-            "error": r["error"], "output_text": r["output_text"],
+            "error": r["error"], "output_text": r["output_text"], "request_key": r.get("request_key"),
         })
 
     # ------------------------------------------------------------------ writes
@@ -228,6 +233,94 @@ class Store:
         with self._lock:
             rows = self._c().execute(sql, args).fetchall()
         return [self._from_row(r) for r in rows]
+
+    _LIGHT_SKIP = ("response_body", "output_text")
+
+    def iter_light(self, since: float | None = None, page: int = 2000) -> Iterator[Exchange]:
+        """Every exchange since ``since``, newest first, WITHOUT response_body / output_text (left empty).
+
+        For whole-database scans (reports, the waste finder): pages with a (ts, rowid) keyset instead of
+        OFFSET, so each page is an index seek rather than a re-scan of everything before it.
+        """
+        cols = ", ".join(f"'' AS {c}" if c in self._LIGHT_SKIP else c for c in _COL_NAMES)
+        ts_i = _COL_NAMES.index("ts") + 1
+        last: tuple[float, int] | None = None
+        while True:
+            where: list[str] = []
+            args: list[Any] = []
+            if since is not None:
+                where.append("ts >= ?")
+                args.append(float(since))
+            if last is not None:
+                where.append("(ts, rowid) < (?, ?)")
+                args.extend(last)
+            sql = f"SELECT rowid, {cols} FROM exchanges"
+            if where:
+                sql += " WHERE " + " AND ".join(where)
+            sql += " ORDER BY ts DESC, rowid DESC LIMIT ?"
+            args.append(int(page))
+            with self._lock:
+                rows = self._c().execute(sql, args).fetchall()
+            for r in rows:
+                yield self._from_row(r[1:])
+            if len(rows) < page:
+                return
+            last = (rows[-1][ts_i], rows[-1][0])
+
+    def waste_groups(self, since: float | None = None) -> tuple[list[tuple], list[tuple]]:
+        """Successful upstream generation calls for the waste finder, as two lists:
+
+        * groups: ``(request_key, count, total_cost, first_ts, first_cost, last_ts)`` for request keys
+          seen at least twice, computed from ``idx_exchanges_waste`` alone (SQLite returns the
+          ``cost_usd`` of the row that has ``MIN(ts)``);
+        * legacy: ``(id, ts, cost_usd, provider, path, model, request_body)`` for rows recorded
+          before request keys were stored (the caller has to compute their keys).
+        """
+        ok = "source = 'upstream' AND status >= 200 AND status < 300"
+        span, args = ("", []) if since is None else (" AND ts >= ?", [float(since)])
+        with self._lock:
+            c = self._c()
+            base = (f"FROM exchanges INDEXED BY idx_exchanges_waste WHERE {ok} AND request_key IS NOT NULL{span} "
+                    f"GROUP BY request_key HAVING COUNT(*) > 1")
+            # a bare column comes from the MIN(ts) row only when MIN is the query's sole min/max aggregate
+            first = c.execute(f"SELECT request_key, COUNT(*), SUM(cost_usd), MIN(ts), cost_usd {base}", args).fetchall()
+            last = dict(c.execute(f"SELECT request_key, MAX(ts) {base}", args).fetchall())
+            groups = [(*row, last.get(row[0], row[3])) for row in first]
+            legacy = c.execute(
+                f"SELECT id, ts, cost_usd, provider, path, model, request_body FROM exchanges "
+                f"WHERE {ok} AND request_key IS NULL AND request_body != ''{span}",
+                args,
+            ).fetchall()
+        return groups, legacy
+
+    def waste_detail(self, key: str, since: float | None = None) -> tuple[str | None, str | None, list[str]]:
+        """(id of the earliest call, its provider, distinct models) for one request key."""
+        ok = "source = 'upstream' AND status >= 200 AND status < 300"
+        span, args = ("", []) if since is None else (" AND ts >= ?", [float(since)])
+        with self._lock:
+            c = self._c()
+            first = c.execute(
+                f"SELECT id, provider FROM exchanges WHERE {ok} AND request_key = ?{span} "
+                f"ORDER BY ts, rowid LIMIT 1", [key] + args).fetchone()
+            models = [r[0] for r in c.execute(
+                f"SELECT DISTINCT model FROM exchanges WHERE {ok} AND request_key = ?{span} "
+                f"AND model IS NOT NULL AND model != ''", [key] + args)]
+        return (first[0], first[1], models) if first else (None, None, models)
+
+    def rows_for_keys(self, keys: list[str], since: float | None = None) -> list[tuple]:
+        """Keyed waste rows ``(request_key, ts, cost_usd, id, model, provider)`` for specific keys."""
+        out: list[tuple] = []
+        ok = "source = 'upstream' AND status >= 200 AND status < 300"
+        span, extra = ("", []) if since is None else (" AND ts >= ?", [float(since)])
+        keys = list(keys)
+        for i in range(0, len(keys), 500):
+            chunk = keys[i:i + 500]
+            marks = ",".join("?" for _ in chunk)
+            with self._lock:
+                out.extend(self._c().execute(
+                    f"SELECT request_key, ts, cost_usd, id, model, provider FROM exchanges "
+                    f"WHERE {ok} AND request_key IN ({marks}){span}", chunk + extra).fetchall())
+        return out
 
     def count(self) -> int:
         """Total number of stored exchanges."""
