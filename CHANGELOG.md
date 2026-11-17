@@ -17,6 +17,10 @@ All notable changes to this project are documented here. The format is based on
   `functionCall.args`) and UTF-8-BOM request bodies are scanned properly; a private key without its END line now
   has its key body redacted, not just the header.
 - `llmtap scan` read UTF-16 files (what Windows PowerShell 5.1 writes) as NUL-interleaved text and missed every secret.
+- **Request smuggling:** with two different `Content-Length` headers the proxy used the first and ran the rest of the
+  body as a second request. Ambiguous framing (conflicting lengths, `+7`/`0x7`-style numbers, malformed chunks, a
+  `Transfer-Encoding` other than `chunked`) now gets a 400, and a body is never read with one huge allocation (a
+  3-byte body claiming `Content-Length: 3000000000` used to cost 2.9 GB).
 
 ### Fixed
 
@@ -55,6 +59,9 @@ All notable changes to this project are documented here. The format is based on
 - **Dashboard:** a tab left open on a stopped llmtap retried every second or so (tens of thousands of failed requests
   over an afternoon). It now backs off to 30 s, skips hidden tabs, reconnects by itself and shows "Offline".
 - `llmtap stats` on an empty database showed `wrap`'s base-URL hint; it now says how to record traffic.
+- An upstream's `102` / `103 Early Hints` interim response was relayed and recorded as the final response (and the
+  real one dropped).
+- Dashboard live feed: `HEAD /_llmtap/api/events` leaked a thread per request, and open feeds outlived `shutdown()`.
 - Docs: install with `pip install llmtap-proxy`; routing, config flags, pipeline order and the budget API match the
   code.
 
@@ -69,8 +76,9 @@ All notable changes to this project are documented here. The format is based on
 ### Performance
 
 - `llmtap stats` and `llmtap report` on large databases: on 200k rows `stats` went from 17 s to 3 s. Generation calls
-  now store their cache key (database schema 2, upgraded in place), so the "potential savings" waste finder runs
-  from an index; reports page with a keyset and skip response bodies.
+  now store their cache key (database schema 2, upgraded in place; read-only and older databases still open), so
+  the "potential savings" waste finder runs from an index; rows recorded before the upgrade are streamed instead of
+  loaded at once; reports page with a keyset and skip response bodies.
 
 ## [0.2.1] - 2026-11-16
 
