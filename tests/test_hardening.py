@@ -209,6 +209,15 @@ def llm_up(usage: dict | None = None) -> Up:
 # ================================================================================================
 # A. passthrough fidelity
 # ================================================================================================
+
+def _open_fds() -> int:
+    """Number of open file descriptors (Linux: /proc/self/fd, macOS/BSD: /dev/fd)."""
+    for d in ("/proc/self/fd", "/dev/fd"):
+        if os.path.isdir(d):
+            return len(os.listdir(d))
+    pytest.skip("cannot count open fds on this platform")
+
+
 def test_a_headers_and_query_forwarded(mk):
     tap, up = mk()
     hdrs = {**ANTH_H, "anthropic-beta": "prompt-caching-2024-07-31,files-api-2025-04-14",
@@ -705,7 +714,7 @@ def test_d_aborted_streams_do_not_leak(mk):
     up = Up(fn)
     tap, _ = mk(up)
     base_threads = threading.active_count()
-    base_fds = len(os.listdir("/proc/self/fd"))
+    base_fds = _open_fds()
     body = json.dumps(msg(stream=True)).encode()
     for _ in range(50):
         s = socket.create_connection(("127.0.0.1", tap.port), timeout=5)
@@ -722,7 +731,7 @@ def test_d_aborted_streams_do_not_leak(mk):
     assert all("disconnect" in (e.error or "") for e in tap.store.list(limit=50))
     time.sleep(0.3)
     assert threading.active_count() <= base_threads + 3
-    assert len(os.listdir("/proc/self/fd")) <= base_fds + 6
+    assert _open_fds() <= base_fds + 6
 
 
 # ================================================================================================
