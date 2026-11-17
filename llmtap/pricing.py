@@ -250,6 +250,11 @@ _RAW: dict[str, dict[str, float]] = {
 # models such as "mistral-large" or "qwen-max").
 _EXACT_ONLY: frozenset[str] = frozenset({"mistral", "mixtral", "qwen", "phi", "gemma"})
 
+# Free local entries extend only to point releases ("llama3.1"); anything else after them is a
+# hosted variant ("qwen2.5-14b-instruct", Bedrock "meta.llama3-1-70b-instruct-v1:0"), not free.
+_LOCAL: frozenset[str] = frozenset(k for k, v in _RAW.items() if v is _ZERO)
+_POINT_RELEASE = re.compile(r"(?:\.\d+)+")
+
 
 def _is_anthropic(key: str) -> bool:
     return key.startswith("claude")
@@ -305,7 +310,7 @@ def normalize_model(model: str) -> str:
     return _normalize(model)[0]
 
 
-def _best_key(name: str, table: dict[str, Any]) -> str | None:
+def _best_key(name: str, table: dict[str, Any], local: frozenset[str] = frozenset()) -> str | None:
     """Exact key, else the longest key that prefixes `name` at a word boundary."""
     if name in table:
         return name
@@ -315,6 +320,8 @@ def _best_key(name: str, table: dict[str, Any]) -> str | None:
             continue
         nxt = name[len(key):len(key) + 1]
         if nxt and nxt.isalnum():
+            continue
+        if key in local and not _POINT_RELEASE.fullmatch(name[len(key):]):
             continue
         if best is None or len(key) > len(best):
             best = key
@@ -326,7 +333,7 @@ def price_for(model: str | None, overrides: dict | None = None) -> dict[str, flo
     if not model or not isinstance(model, str) or not model.strip():
         return None
     name, free = _normalize(model)
-    builtin_key = _best_key(name, PRICES)
+    builtin_key = _best_key(name, PRICES, _LOCAL)
     if overrides:
         norm_over: dict[str, dict[str, Any]] = {}
         for k, v in overrides.items():
@@ -346,8 +353,13 @@ def price_for(model: str | None, overrides: dict | None = None) -> dict[str, flo
     return dict(PRICES[builtin_key])
 
 
-def cost_usd(model: str | None, usage: Usage, overrides: dict | None = None) -> float:
-    """Dollar cost of one call; 0.0 for unknown models. See module docstring for the formula."""
+def cost_usd(model: str | None, usage: Usage, overrides: dict | None = None, style: str | None = None) -> float:
+    """Dollar cost of one call; 0.0 for unknown models. See module docstring for the formula.
+
+    `style` is the wire format the usage came from. How cached tokens are counted depends on the API,
+    not the model: Claude through an OpenAI-compatible router (OpenRouter, ...) reports cached tokens as
+    a subset of prompt_tokens. Without `style` the model name decides (Anthropic formula for claude-*).
+    """
     price = price_for(model, overrides)
     if price is None:
         return 0.0
@@ -356,7 +368,8 @@ def cost_usd(model: str | None, usage: Usage, overrides: dict | None = None) -> 
     cr = max(int(usage.cache_read_tokens or 0), 0)
     cw = max(int(usage.cache_write_tokens or 0), 0)
     name = normalize_model(model or "")
-    if _is_anthropic(name):
+    anthropic_usage = (style == "anthropic") if style else _is_anthropic(name)
+    if anthropic_usage:
         total = (inp * price["input"] + cr * price["cache_read"]
                  + cw * price["cache_write"] + out * price["output"])
     else:

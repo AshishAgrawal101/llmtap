@@ -6,6 +6,41 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Security
+
+- `--guard block` no longer stores the blocked secret: the recorded request body is redacted.
+- Gemini calls other than `generateContent` (e.g. `:embedContent?key=…`, `GET /v1beta/models?key=…`) were routed to
+  the OpenAI upstream, sending the Google API key to api.openai.com. Any Generative Language path, `x-goog-api-key`
+  header or `?key=` parameter now routes to Gemini.
+
+### Fixed
+
+- **Budgets:** concurrent requests could all pass the cap at once (spend was only added after each call finished).
+  In-flight calls now reserve a worst-case cost estimate, so parallel agents can't overshoot by more than one call.
+- **Budgets:** free cache and cassette hits were refused once the cap was reached. They are now always served; the
+  loop breaker still counts them, so a stuck agent replaying a cached request is still stopped.
+- **Cache + cassettes:** with `--cache`, record mode answered from the cache and never wrote the cassette, and auto
+  mode didn't append cache-served responses. Record mode now skips the cache; auto mode records cache hits.
+- **Cassettes:** a UTF-8 BOM (added by Notepad / PowerShell) silently dropped the first recording; parallel writers on
+  Windows could overwrite each other's lines (appends are now file-locked); lines are written with `\n` on every OS.
+- **Pricing:** Claude through OpenAI-compatible routers (OpenRouter, …) was charged twice for cached tokens: the
+  formula now follows the API's wire format, not the model name. Non-generation calls (`GET /v1/responses/<id>`, …)
+  are no longer priced or added to budgets.
+- **Gemini:** `streamGenerateContent` without `?alt=sse` (a JSON array) now records real usage, text and cost, and the
+  cache no longer answers an `?alt=sse` request with a cached JSON array.
+- Proxied responses no longer carry duplicate `Date` / `Server` headers.
+- **pytest plugin:** tests sharing a `cassette=` name no longer overwrite each other under `--llmtap-record`; nested
+  test classes get distinct cassette files; the example project no longer fails with "Plugin already registered".
+- **Dashboard:** "Copy as curl" dropped `-H` on tag/session headers; "avg TTFT" mixed in non-streamed, failed and
+  out-of-range requests (now computed by the server); the spend axis showed `$0.00000` for small totals; replies that
+  were only thinking showed as blank; the chart total was clipped on phones; personal data was labelled "secrets";
+  invalid `group_by` returned 500 instead of 400.
+- `llmtap report` printed a `file://` link that doesn't open on Windows.
+
+### Added
+
+- Dashboard: an "errors (HTTP 4xx/5xx)" source filter, and search now matches tags and session ids.
+
 ## [0.2.1] - 2026-11-16
 
 ### Fixed

@@ -223,10 +223,17 @@ def _header(headers: Any, name: str) -> str | None:
 # routes
 # --------------------------------------------------------------------------------------------
 
+class _BadRequest(ValueError):
+    """A client error in the query string; answered with 400 instead of 500."""
+
+
 def _stats(tap: "LLMTap", qs: dict[str, list[str]]) -> dict[str, Any]:
     group_by = _first(qs, "group_by")
     since = _since(qs)
-    out: dict[str, Any] = dict(tap.store.stats(since=since, group_by=group_by))
+    try:
+        out: dict[str, Any] = dict(tap.store.stats(since=since, group_by=group_by))
+    except ValueError as e:
+        raise _BadRequest(str(e)) from None
     out["since"] = since
     try:
         out["session_spent"] = float(tap.budget.session_spent())
@@ -436,6 +443,12 @@ def handle_internal(tap: "LLMTap", method: str, path: str, headers: Any, body: b
                 _json(respond, {"ok": True})
                 return True
         _error(respond, 404, f"no route for {method} {route}")
+        return True
+    except _BadRequest as e:
+        try:
+            _error(respond, 400, str(e))
+        except Exception:
+            pass
         return True
     except Exception as e:  # never let the dashboard take down the proxy thread
         try:

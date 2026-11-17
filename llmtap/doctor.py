@@ -7,7 +7,6 @@ import socket
 import sqlite3
 import subprocess
 import sys
-import tomllib
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -184,10 +183,12 @@ def check_config(path: str | None) -> Check:
     cands = [Path(path)] if path else [Path("llmtap.toml"), Path.home() / ".config" / "llmtap" / "config.toml"]
     for p in cands:
         if p.is_file():
+            from llmtap.config import Config, apply_file
             try:
-                tomllib.loads(p.read_text())
-            except (tomllib.TOMLDecodeError, OSError, UnicodeDecodeError) as e:
-                return Check(FAIL, f"Config file is invalid: {p}", str(e), "fix the TOML syntax")
+                apply_file(Config(), p)
+            except (ValueError, OSError) as e:  # bad TOML / UTF-8 / value; message names file + key
+                return Check(FAIL, f"Config file is invalid: {p}", str(e).removeprefix(f"{p}: "),
+                             "fix the TOML syntax or the value named above")
             return Check(OK, f"Config file: {p}")
     if path:
         return Check(FAIL, f"Config file not found: {path}", "", "check the --config path")

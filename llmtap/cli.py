@@ -12,11 +12,13 @@ import json
 import os
 import re
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from llmtap import __version__
@@ -64,8 +66,18 @@ def parse_since(s: str | None, now: float | None = None) -> float | None:
         return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday - 1, 0, 0, 0, 0, 0, -1))
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}([t ]\d{2}:\d{2}(:\d{2})?)?", t):
         from datetime import datetime
-        return datetime.fromisoformat(t.upper().replace(" ", "T")).timestamp()
-    return now - parse_duration(t)
+        try:
+            cutoff = datetime.fromisoformat(t.upper().replace(" ", "T")).timestamp()
+        except (OverflowError, OSError):  # outside the platform's time range
+            if int(t[:4]) <= 1970:
+                return None
+            raise ValueError(f"date out of range: {s!r}") from None
+    else:
+        dur = parse_duration(t)
+        if dur != dur:
+            raise ValueError(f"invalid duration: {s!r}")
+        cutoff = now - dur
+    return None if cutoff == float("-inf") else cutoff  # `inf` = all time
 
 
 def _since_arg(s: str) -> float | None:
@@ -312,11 +324,14 @@ def conversation(req: Any) -> list[tuple[str, str]]:
         out.append(("system", _content_text(req["system"])))
     if req.get("instructions"):
         out.append(("system", _content_text(req["instructions"])))
-    for m in req.get("messages") or []:
+    msgs = req.get("messages")
+    for m in msgs if isinstance(msgs, list) else []:
         if isinstance(m, dict):
             text = _content_text(m.get("content"))
-            if m.get("tool_calls"):
-                calls = ", ".join(str((tc.get("function") or {}).get("name", "?")) for tc in m["tool_calls"] if isinstance(tc, dict))
+            tcs = m.get("tool_calls")
+            if tcs and isinstance(tcs, list):
+                fns = [tc.get("function") for tc in tcs if isinstance(tc, dict)]
+                calls = ", ".join(str(fn.get("name", "?")) if isinstance(fn, dict) else "?" for fn in fns)
                 text = (text + "\n" if text else "") + f"[tool calls: {calls}]"
             out.append((str(m.get("role", "?")), text))
     inp = req.get("input")
@@ -348,7 +363,8 @@ def _last_user(req_body: str) -> str:
 
 
 def _one_line(s: str) -> str:
-    return " ".join(str(s or "").split())
+    from llmtap.term import clean
+    return clean(" ".join(str(s or "").split()))
 
 
 def _when(ts: float) -> str:
@@ -370,6 +386,8 @@ def cmd_version(args: argparse.Namespace) -> int:
 def cmd_env(args: argparse.Namespace) -> int:
     cfg = make_config(args)
     host = cfg.host if cfg.host not in ("0.0.0.0", "::", "") else "127.0.0.1"
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"  # IPv6 literal
     base = f"http://{host}:{cfg.port}"
     pairs = env_vars(base)
     for k, v in pairs.items():
@@ -535,7 +553,10 @@ def cmd_stats(args: argparse.Namespace) -> int:
         _out(json.dumps(st, indent=2, default=str))
         return 0
     color = _color_out()
-    label = "all time" if args.since is None else "since " + time.strftime("%Y-%m-%d %H:%M", time.localtime(args.since))
+    try:
+        label = "all time" if args.since is None else "since " + time.strftime("%Y-%m-%d %H:%M", time.localtime(args.since))
+    except (OverflowError, OSError, ValueError):  # e.g. --since 99999d: before the platform's epoch
+        label = "all time"
     totals = {k: v for k, v in st.items() if k != "groups"}
     _out(term.summary(totals, float(st.get("cost_usd", 0) or 0), color=color, title=f"llmtap stats · {label}"))
     if int(st.get("requests", 0) or 0) > 0:
@@ -606,7 +627,7 @@ def cmd_ls(args: argparse.Namespace) -> int:
             term.paint(ex.id[:8], "gray", color=color),
             _when(ex.ts),
             term.source_badge(ex.source, color=color).strip(),
-            f"{ex.provider}/{ex.model or '-'}",
+            term.clean(f"{ex.provider}/{ex.model or '-'}"),
             term.paint(st, term.status_color(ex.status), color=color),
             f"{term.fmt_tokens(tin)}→{term.fmt_tokens(u.output_tokens)}",
             term.fmt_usd(ex.cost_usd),
@@ -623,22 +644,27 @@ def cmd_show(args: argparse.Namespace) -> int:
     store = _open_store(args)
     try:
         ex = store.get(args.id)
+        matches = _count_id_prefix(store, args.id) if ex is None and len(args.id) >= 4 else 0
     finally:
         store.close()
     if ex is None:
-        _err(f"no exchange matching {args.id!r}")
+        if matches > 1:
+            _err(f"{args.id!r} is ambiguous: {matches} exchanges match; use a longer id prefix")
+        else:
+            _err(f"no exchange matching {args.id!r}")
         return 1
     if args.raw:
         _out(json.dumps(ex.to_dict(), indent=2, default=str))
         return 0
     color = _color_out()
-    p = lambda s, *st: term.paint(s, *st, color=color)  # noqa: E731
+    p = lambda s, *st: term.paint(term.clean(s), *st, color=color)  # noqa: E731
+    c = term.clean
     u = ex.usage
     meta = [
-        ("id", ex.id),
+        ("id", c(ex.id)),
         ("time", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ex.ts))),
-        ("route", f"{ex.method} {ex.path}  ({ex.provider}, {ex.style} style)"),
-        ("model", ex.model or "-"),
+        ("route", c(f"{ex.method} {ex.path}  ({ex.provider}, {ex.style} style)")),
+        ("model", c(ex.model or "-")),
         ("status", p(str(ex.status), "bold", term.status_color(ex.status))),
         ("source", term.source_badge(ex.source, color=color).strip()),
         ("tokens", f"{fmt_int(u.input_tokens)} in · {fmt_int(u.output_tokens)} out"
@@ -650,7 +676,7 @@ def cmd_show(args: argparse.Namespace) -> int:
                     + ("  ·  streamed" if ex.streamed else "")),
     ]
     if ex.tags:
-        meta.append(("tags", ", ".join(f"{k}={v}" for k, v in ex.tags.items())))
+        meta.append(("tags", c(", ".join(f"{k}={v}" for k, v in ex.tags.items()))))
     if ex.error:
         meta.append(("error", p(ex.error, "red")))
     lines = [f"{p(k.ljust(8), 'dim')} {v}" for k, v in meta]
@@ -658,7 +684,7 @@ def cmd_show(args: argparse.Namespace) -> int:
     if ex.guard_findings:
         _out(p(f"\n⚠ {len(ex.guard_findings)} guard finding(s)", "bold", "red"))
         for f in ex.guard_findings:
-            _out(f"  {p(str(f.get('kind', '?')), 'red')}  {f.get('path', '')}  {f.get('preview', '')}")
+            _out(f"  {p(str(f.get('kind', '?')), 'red')}  {c(f.get('path', ''))}  {c(f.get('preview', ''))}")
     try:
         req = json.loads(ex.request_body) if ex.request_body else None
     except ValueError:
@@ -684,40 +710,70 @@ def cmd_show(args: argparse.Namespace) -> int:
 
 
 def _clip(text: str, limit: int = 4000) -> str:
-    text = str(text or "")
-    return text if len(text) <= limit else text[:limit] + f"\n… ({len(text) - limit} more chars; use --raw)"
+    from llmtap.term import clean
+    text = str(text or "").replace("\r\n", "\n")
+    return clean(text if len(text) <= limit else text[:limit] + f"\n… ({len(text) - limit} more chars; use --raw)")
 
 
 def _indent(text: str, width: int) -> str:
     return "\n".join("  " + line for line in text.splitlines() or [""])
 
 
+def _ro_connect(store: Any) -> sqlite3.Connection | None:
+    """A read-only connection to the store's database file (None for :memory: or on error)."""
+    path = str(getattr(store, "path", "") or "")
+    if not path or path == ":memory:" or path.startswith("file:"):
+        return None
+    try:
+        return sqlite3.connect(Path(path).expanduser().resolve().as_uri() + "?mode=ro", uri=True, timeout=30.0)
+    except sqlite3.Error:
+        return None
+
+
+def _count_id_prefix(store: Any, prefix: str) -> int:
+    """How many exchange ids start with `prefix` (0 if unknown)."""
+    conn = _ro_connect(store)
+    if conn is None:
+        return 0
+    try:
+        return int(conn.execute("SELECT COUNT(*) FROM exchanges WHERE substr(id, 1, ?) = ?",
+                                (len(prefix), prefix)).fetchone()[0])
+    except sqlite3.Error:
+        return 0
+    finally:
+        conn.close()
+
+
 def cmd_tail(args: argparse.Namespace) -> int:
     from llmtap import term
     store = _open_store(args)
-    seen: set[str] = set()
+    # Follow by insertion order (rowid): `ts` is the request START time, so a slow call recorded
+    # now can carry a ts far older than rows already printed.
+    conn = _ro_connect(store)
     try:
+        last_row = conn.execute("SELECT COALESCE(MAX(rowid), 0) FROM exchanges").fetchone()[0] if conn else 0
         recent = store.list(limit=max(args.lines, 0)) if args.lines > 0 else []
+        seen = {ex.id for ex in recent}
         for ex in reversed(recent):
-            seen.add(ex.id)
             term.log_exchange(ex, stream=sys.stdout)
-        last_ts = max([ex.ts for ex in recent], default=time.time() - 1)
-        if args.once:
+        if args.once or conn is None:
             return 0
         print(term.paint("… waiting for new exchanges (Ctrl-C to stop)", "dim", color=_color_out()), flush=True)
-        # remember everything already in the window so only new rows print
-        for ex in store.list(limit=500, since=last_ts - 5):
-            seen.add(ex.id)
         while True:
             time.sleep(args.interval)
-            new = [ex for ex in store.list(limit=200, since=last_ts - 5) if ex.id not in seen]
-            for ex in sorted(new, key=lambda e: e.ts):
-                seen.add(ex.id)
-                last_ts = max(last_ts, ex.ts)
+            for rowid, ex_id in conn.execute("SELECT rowid, id FROM exchanges WHERE rowid > ? ORDER BY rowid LIMIT 200",
+                                             (last_row,)).fetchall():
+                last_row = rowid
+                ex = store.get(ex_id)
+                if ex is None or ex_id in seen:
+                    continue
+                seen.add(ex_id)
                 term.log_exchange(ex, stream=sys.stdout)
     except KeyboardInterrupt:
         return 0
     finally:
+        if conn is not None:
+            conn.close()
         store.close()
 
 
@@ -769,11 +825,22 @@ def cmd_export(args: argparse.Namespace) -> int:
     finally:
         store.close()
     items.reverse()  # chronological
+    wrapped = False
     if args.output in ("-", ""):
         fh: Any = sys.stdout
         close = False
+        if args.format == "csv" and hasattr(sys.stdout, "buffer"):
+            # csv writes its own \r\n; a text-mode stdout on Windows would turn that into \r\r\n
+            sys.stdout.flush()
+            fh = io.TextIOWrapper(sys.stdout.buffer, encoding=sys.stdout.encoding or "utf-8",
+                                  errors="replace", newline="", write_through=True)
+            wrapped = True
     else:
-        fh = open(args.output, "w", newline="", encoding="utf-8")
+        try:
+            fh = open(args.output, "w", newline="", encoding="utf-8")
+        except OSError as e:
+            _err(f"cannot write {args.output}: {e.strerror or e}")
+            return 1
         close = True
     try:
         if args.format == "csv":
@@ -788,6 +855,8 @@ def cmd_export(args: argparse.Namespace) -> int:
     finally:
         if close:
             fh.close()
+        elif wrapped:
+            fh.detach()  # leave sys.stdout's buffer open
     if close:
         print(f"exported {len(items)} exchange(s) to {args.output}", file=sys.stderr)
     return 0
@@ -837,7 +906,8 @@ def cmd_scan(args: argparse.Namespace) -> int:
     for name in files:
         try:
             if name == "-":
-                text = sys.stdin.read()
+                buf = getattr(sys.stdin, "buffer", None)  # not the locale codec: scan any bytes
+                text = buf.read().decode("utf-8", errors="replace") if buf is not None else sys.stdin.read()
                 label = "<stdin>"
             else:
                 with open(name, encoding="utf-8", errors="replace") as fh:
@@ -855,7 +925,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
             report.append(d)
             if not args.json:
                 desc = kinds.get(f.kind, "")
-                _out(f"{p(f'{label}:{ln}:{col}', 'bold')}  {p(f.kind, 'bold', 'red')}  {f.preview}"
+                _out(f"{p(f'{label}:{ln}:{col}', 'bold')}  {p(f.kind, 'bold', 'red')}  {term.clean(f.preview)}"
                      + (p(f"  — {desc}", "dim") if desc else ""))
     if args.json:
         _out(json.dumps(report, indent=2))
@@ -874,7 +944,10 @@ def cmd_clear(args: argparse.Namespace) -> int:
             if not sys.stdin.isatty():
                 _err(f"refusing to delete {n} exchange(s) without --yes")
                 return 1
-            ans = input(f"Delete all {n} recorded exchange(s)? [y/N] ").strip().lower()
+            try:
+                ans = input(f"Delete all {n} recorded exchange(s)? [y/N] ").strip().lower()
+            except EOFError:
+                ans = ""
             if ans not in ("y", "yes"):
                 _out("aborted")
                 return 1
@@ -975,8 +1048,12 @@ def cmd_report(args: argparse.Namespace) -> int:
         sys.stdout.write(text if text.endswith("\n") else text + "\n")
         sys.stdout.flush()
         return 0
-    with open(out, "w", encoding="utf-8") as f:
-        f.write(text)
+    try:
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(text)
+    except OSError as e:
+        _err(f"cannot write {out}: {e.strerror or e}")
+        return 1
     t, w = data["totals"], data["waste"]
     color = _color_out()
     path = os.path.abspath(out)
@@ -985,11 +1062,13 @@ def cmd_report(args: argparse.Namespace) -> int:
          + (term.paint(f", {term.fmt_usd(w['savings_usd'])} avoidable waste", "yellow", color=color) if w["savings_usd"] > 0 else "")
          + term.paint(")", "dim", color=color))
     if fmt == "html":
-        _out(term.paint("  file://" + path, "dim", color=color))
+        # as_uri() gives file:///C:/... on Windows and percent-encodes spaces; "file://" + path did neither.
+        uri = Path(path).resolve().as_uri()
+        _out(term.paint("  " + uri, "dim", color=color))
         if args.open:
             try:
                 import webbrowser
-                webbrowser.open("file://" + path)
+                webbrowser.open(uri)
             except Exception:
                 pass
     return 0
@@ -998,8 +1077,14 @@ def cmd_report(args: argparse.Namespace) -> int:
 def cmd_doctor(args: argparse.Namespace) -> int:
     """`llmtap doctor`: print checks with fix hints; exit 1 on a hard failure."""
     from llmtap import doctor
-    cfg = make_config(args)
+    from llmtap.config import Config
+    try:
+        cfg, problem = make_config(args), ""
+    except ValueError as e:  # a broken config file is something to report, not a crash
+        cfg, problem = Config(), str(e)
     checks = doctor.run_checks(cfg, getattr(args, "config", None), online=args.online)
+    if problem and not any(c.level == doctor.FAIL and c.title.startswith("Config file") for c in checks):
+        checks.append(doctor.Check(doctor.FAIL, "Invalid settings", problem, "fix the value named above"))
     _out(doctor.render(checks, color=_color_out()))
     return doctor.exit_code(checks)
 

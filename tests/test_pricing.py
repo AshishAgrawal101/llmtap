@@ -310,3 +310,12 @@ def test_claude_5_family_prices_match_published_list():
     for model, (i, o) in expect.items():
         p = price_for(model)
         assert (p["input"], p["output"]) == (i, o), model
+
+
+@pytest.mark.parametrize("model", [
+    "meta.llama3-1-70b-instruct-v1:0", "us.meta.llama3-2-90b-instruct-v1:0", "qwen2.5-14b-instruct",
+    "meta.llama3-70b-instruct-v1:0",
+])
+def test_paid_provider_models_not_priced_as_local(model: str) -> None:
+    p = price_for(model)
+    assert p is None or p["input"] > 0, (model, p)

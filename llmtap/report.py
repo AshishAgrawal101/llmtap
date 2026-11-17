@@ -12,6 +12,7 @@ from __future__ import annotations
 import heapq
 import html
 import json
+import re
 import time
 from datetime import date, timedelta
 from typing import Any, Iterable, Iterator
@@ -115,7 +116,8 @@ def prompt_preview(req_body: str, limit: int = _PREVIEW_CHARS) -> str:
         texts.append(("system", _content_text(req["system"])))
     if req.get("instructions"):
         texts.append(("system", _content_text(req["instructions"])))
-    for m in req.get("messages") or []:
+    msgs = req.get("messages")
+    for m in msgs if isinstance(msgs, list) else []:
         if isinstance(m, dict):
             texts.append((str(m.get("role", "")), _content_text(m.get("content"))))
     inp = req.get("input")
@@ -485,7 +487,10 @@ def _e(x: Any) -> str:
 
 
 def _fmt_day(ts: float | None) -> str:
-    return time.strftime("%b %d, %Y", time.localtime(ts)) if ts else "-"
+    try:
+        return time.strftime("%b %d, %Y", time.localtime(ts)) if ts else "-"
+    except (OverflowError, OSError, ValueError):  # outside the platform's time_t range
+        return "-"
 
 
 def _period_label(data: dict[str, Any]) -> str:
@@ -825,11 +830,21 @@ def render_html(data: dict[str, Any]) -> str:
 # markdown / json
 
 
+_MD_SPECIAL = re.compile(r"([\\`*_\[\]|~])")
+
+
 def _md(s: Any, limit: int | None = None) -> str:
+    """Untrusted text as inert Markdown: no links/images, emphasis, HTML, table breaks or @mentions."""
     s = _one_line(s)
     if limit:
         s = _clip(s, limit)
-    return s.replace("<", "&lt;").replace(">", "&gt;").replace("|", "\\|").replace("`", "'")
+    s = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return _MD_SPECIAL.sub(r"\\\1", s).replace("@", "@​")  # zero-width space breaks the mention
+
+
+def _code(s: Any) -> str:
+    """Untrusted text as an inline code span (nothing inside is rendered)."""
+    return "`" + _one_line(s).replace("`", "'").replace("|", "\\|") + "`"
 
 
 def render_markdown(data: dict[str, Any]) -> str:
@@ -860,7 +875,7 @@ def render_markdown(data: dict[str, Any]) -> str:
         for r in data["by_day"][-14:]:
             L.append(f"| {r['key']} | {_n(r['requests'])} | {_usd(r['cost_usd'])} |")
     for tname, rows in list(data["by_tag"].items())[:2]:
-        L += ["", f"### Cost by tag `{_md(tname)}`", "", "| Value | Requests | Cost |", "|---|---:|---:|"]
+        L += ["", f"### Cost by tag {_code(tname)}", "", "| Value | Requests | Cost |", "|---|---:|---:|"]
         for r in rows[:8]:
             L.append(f"| {_md(r['key'])} | {_n(r['requests'])} | {_usd(r['cost_usd'])} |")
     L += ["", f"### Waste finder — {_usd(w['savings_usd'])} avoidable"]
@@ -879,7 +894,7 @@ def render_markdown(data: dict[str, Any]) -> str:
     if g["kinds"]:
         L += ["", "| Kind | Count | Masked preview |", "|---|---:|---|"]
         for k in g["kinds"]:
-            L.append(f"| {_md(k['kind'])} | {k['count']} | {' '.join('`' + _md(p) + '`' for p in k['previews']) or '-'} |")
+            L.append(f"| {_md(k['kind'])} | {k['count']} | {' '.join(_code(p) for p in k['previews']) or '-'} |")
     else:
         L += ["", "None."]
     L += ["", f"### Runaway loops blocked: {_n(lp['blocked'])}"

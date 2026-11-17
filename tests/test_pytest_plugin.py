@@ -270,6 +270,34 @@ def test_b(llmtap):
     env.run("--llmtap-mode", "replay").assert_outcomes(passed=2)
 
 
+def test_record_flag_keeps_every_test_of_a_shared_cassette(env: Env) -> None:
+    """--llmtap-record truncates a shared cassette once per session, not once per test."""
+    src = '''
+import pytest
+from llmhelpers import ask
+
+@pytest.mark.llmtap(cassette="shared")
+def test_a(llmtap):
+    ask("a")
+
+@pytest.mark.llmtap(cassette="shared")
+def test_b(llmtap):
+    ask("b")
+
+@pytest.mark.llmtap(cassette="shared")
+def test_c(llmtap):
+    pass
+'''
+    env.run(test_mod=src).assert_outcomes(passed=3)
+    shared = env.cassettes()[0]
+    shared.write_text(shared.read_text() * 3)  # stale extra lines: record must still start afresh
+    env.run("--llmtap-record").assert_outcomes(passed=3)
+    assert [json.loads(l)["request"]["messages"][0]["content"] for l in shared.read_text().splitlines()] \
+        == ["a", "b"]
+    env.upstream_down()
+    env.run("--llmtap-mode", "replay").assert_outcomes(passed=3)
+
+
 def test_marker_mode_overrides_command_line(env: Env) -> None:
     src = '''
 import pytest
@@ -410,6 +438,23 @@ def test_plugin_import_is_cheap_and_does_not_load_the_proxy() -> None:
     assert r.returncode == 0, r.stderr
 
 
+@pytest.mark.parametrize("autoload", [True, False])
+def test_example_project_replays_whether_or_not_the_entry_point_loaded(tmp_path: Path, autoload: bool) -> None:
+    """examples/pytest_plugin's conftest must not register the plugin a second time next to the entry point."""
+    import os
+    import shutil
+    repo = Path(__file__).resolve().parent.parent
+    proj = shutil.copytree(repo / "examples" / "pytest_plugin", tmp_path / "proj")
+    env = {k: v for k, v in os.environ.items() if k not in ENV_VARS and k != "PYTEST_DISABLE_PLUGIN_AUTOLOAD"}
+    env.update(CI="1", PYTHONPATH=str(repo))
+    if not autoload:
+        env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+    r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"], cwd=str(proj), env=env,
+                       capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "4 passed" in r.stdout
+
+
 # ------------------------------------------------------------------------------------ mode defaults
 def test_default_mode_depends_on_ci_env(env: Env) -> None:
     src = '''
@@ -472,6 +517,30 @@ class TestK:
     assert any(n.startswith("test_mod__test_p__plain") for n in names)
     assert "test_mod__TestK.test_m.jsonl" in names
     assert not list(env.pt.path.glob("*evil*")) and not (env.pt.path.parent / "evil").exists()
+
+
+def test_nested_classes_get_distinct_cassettes(env: Env) -> None:
+    src = '''
+from llmhelpers import ask
+
+class TestA:
+    class TestInner:
+        def test_x(self, llmtap):
+            ask("A")
+
+class TestB:
+    class TestInner:
+        def test_x(self, llmtap):
+            ask("B")
+
+class TestTop:
+    def test_y(self, llmtap):
+        ask("top")
+'''
+    env.run(test_mod=src).assert_outcomes(passed=3)
+    assert [c.name for c in env.cassettes()] == ["test_mod__TestA.TestInner.test_x.jsonl",
+                                                  "test_mod__TestB.TestInner.test_x.jsonl",
+                                                  "test_mod__TestTop.test_y.jsonl"]
 
 
 def test_cassette_dir_option_and_ini(env: Env) -> None:

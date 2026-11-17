@@ -57,6 +57,7 @@ __all__ = ["LLMTap", "EventBus", "Responder", "summarize"]
 _RESP_HOP = frozenset({
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailers",
     "transfer-encoding", "upgrade", "content-length",
+    "date", "server",  # send_response() adds its own; relaying the upstream's duplicated them
 })
 # Headers never stored for replay (body is stored decoded, framing is recomputed).
 _STORE_DROP = _RESP_HOP | {"content-encoding", "date", "server", "x-llmtap-id", "x-llmtap-source",
@@ -559,7 +560,9 @@ class LLMTap:
             send_body, findings, blocked = apply_guard(body, mode, cfg.guard_pii)
             ex.guard_findings = [f.to_dict() if hasattr(f, "to_dict") else dict(f) for f in findings]
             if blocked:
-                ex.request_body, trunc = _decode_request(body, ctype)
+                # Never persist the secret we just refused to send: store the redacted body instead.
+                stored_body, _, _ = apply_guard(body, "redact", cfg.guard_pii)
+                ex.request_body, trunc = _decode_request(stored_body, ctype)
                 if trunc:
                     _note(ex, f"request body truncated to {MAX_STORED_CHARS} characters in llmtap storage")
                 kinds = ", ".join(sorted({str(f.get("kind", "?")) for f in ex.guard_findings}))
@@ -577,26 +580,34 @@ class LLMTap:
         cacheable = llm
         key = cache_key(route.provider, route.upstream_path, send_body) if cacheable else ""
 
-        # budget / loop breaker (generation calls only: models/files/batches/count_tokens are not chat traffic)
+        # loop breaker: counts every identical generation call, even ones the cache will answer (a stuck
+        # agent replaying a cached request would otherwise loop forever)
         if cacheable:
-            verdict = self.budget.check(key)
+            verdict = self.budget.check_loop(key)
             if not verdict.allowed:
-                ex.source = verdict.kind or "budget"
-                err_type = "llmtap_loop_detected" if ex.source == "loop" else "llmtap_budget_exceeded"
-                self._error(out, ex, route.style, 429, verdict.reason or "llmtap budget exceeded", err_type)
+                ex.source = "loop"
+                self._error(out, ex, route.style, 429, verdict.reason or "llmtap loop detected", "llmtap_loop_detected")
                 return
 
-        # cassette / cache
+        # cassette / cache next: replays are free, so spend caps never block them.
         if cacheable:
             stored: CachedResponse | None = None
+            recording = self.cassette is not None and self.cassette.mode == "record"
             if self.cassette is not None:
                 stored = self.cassette.lookup(key)
                 if stored is not None:
                     ex.source = "cassette"
-            if stored is None and self.cache is not None:
+            # record mode means "call the real API": a cache hit would leave the cassette without this request
+            if stored is None and self.cache is not None and not recording:
                 stored = self.cache.get(key)
                 if stored is not None:
                     ex.source = "cache"
+                    # auto mode: the cassette missed, so keep it complete with the cache-served response
+                    if self.cassette is not None and self.cassette.should_record():
+                        try:
+                            self.cassette.record(key, req if req is not None else ex.request_body, stored)
+                        except Exception as e:
+                            ex.error = ex.error or f"cassette write failed: {e}"
             if stored is not None:
                 self._replay(ex, route, req, stored, out, t0)
                 return
@@ -607,7 +618,40 @@ class LLMTap:
                 self._error(out, ex, route.style, 409, msg, "llmtap_cassette_miss")
                 return
 
-        self._forward(ex, route, method, hdrs, send_body, req, stream_req, key, out, t0)
+        # spend caps: only for generation calls that will actually reach the upstream
+        reservation = None
+        if cacheable:
+            verdict = self.budget.check_spend(self._estimate_cost(ex, route, req, send_body))
+            if not verdict.allowed:
+                ex.source = "budget"
+                self._error(out, ex, route.style, 429, verdict.reason or "llmtap budget exceeded",
+                            "llmtap_budget_exceeded")
+                return
+            reservation = verdict.reservation
+
+        try:
+            self._forward(ex, route, method, hdrs, send_body, req, stream_req, key, out, t0)
+        finally:
+            self.budget.release(reservation)
+
+    def _estimate_cost(self, ex: Exchange, route: Route, req: dict | None, body: bytes) -> float:
+        """Worst-case cost guess used to reserve budget for an in-flight call (0.0 when unknown)."""
+        try:
+            model = ex.model or (request_model(req) if req is not None else None)
+            if not model:
+                return 0.0
+            out_tokens = 4096
+            if isinstance(req, dict):
+                gc = req.get("generationConfig") if isinstance(req.get("generationConfig"), dict) else {}
+                for v in (req.get("max_tokens"), req.get("max_completion_tokens"), req.get("max_output_tokens"),
+                          gc.get("maxOutputTokens")):
+                    if isinstance(v, int) and v > 0:
+                        out_tokens = v
+                        break
+            usage = Usage(input_tokens=max(1, len(body) // 4), output_tokens=out_tokens)
+            return float(cost_usd(model, usage, self.cfg.pricing_overrides, style=route.style) or 0.0)
+        except Exception:
+            return 0.0
 
     # ---------------------------------------------------------------- upstream
     def _forward(self, ex: Exchange, route: Route, method: str, hdrs: dict[str, str], body: bytes,
@@ -730,7 +774,7 @@ class LLMTap:
             ex.error = _upstream_error_message(text) or f"upstream HTTP {ex.status}"
 
         in_band_err = self._account(ex, route, req, text, streaming, llm=llm, parseable=parseable)
-        ex.cost_usd = self._price(ex) if ex.usage.total() else 0.0
+        ex.cost_usd = self._price(ex) if llm and ex.usage.total() else 0.0  # GETs of stored objects etc. are free
         try:
             self.budget.add_spend(ex.cost_usd)
         except Exception:
@@ -828,6 +872,17 @@ class LLMTap:
                         out_text = extract_text(route.style, j)
                         model = response_model(route.style, j)
                         err = body_error(j)
+                    elif text.lstrip().startswith("["):
+                        # Gemini streamGenerateContent without ?alt=sse: a JSON array of chunks. Usage is
+                        # cumulative, so the last chunk that has it wins; the text is all chunks joined.
+                        chunks = [c for c in json.loads(text) if isinstance(c, dict)]
+                        for c in chunks:
+                            u = extract_usage(route.style, c)
+                            if u.total():
+                                usage = u
+                            model = response_model(route.style, c) or model
+                            err = err or body_error(c)
+                        out_text = "".join(extract_text(route.style, c) or "" for c in chunks)
             except Exception:
                 pass
         ok = 200 <= ex.status < 300
@@ -846,7 +901,7 @@ class LLMTap:
 
     def _price(self, ex: Exchange) -> float:
         try:
-            return float(cost_usd(ex.model, ex.usage, self.cfg.pricing_overrides) or 0.0)
+            return float(cost_usd(ex.model, ex.usage, self.cfg.pricing_overrides, style=ex.style) or 0.0)
         except Exception:
             return 0.0
 

@@ -199,3 +199,28 @@ def test_summary_empty() -> None:
     assert "No LLM requests" in out
     out = term.summary({"requests": 0}, 0.0, color=False)
     assert "No LLM requests" in out
+
+
+# ------------------------------------------------------------------ regression tests (tester findings)
+
+def test_box_long_title_fits_narrow_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("COLUMNS", "40")
+    out = term.box(["body"], title="a very long title that is wider than the forty column terminal", color=False)
+    widths = {term.vlen(l) for l in out.splitlines()}
+    assert len(widths) == 1 and widths.pop() <= 40
+
+
+def test_clean_escapes_control_chars() -> None:
+    evil = "a\x1b]0;PWNED\x07\x1b[2Jb\x9b31m\x00\rc\n\td"
+    out = term.clean(evil)
+    assert not any(ord(c) < 32 and c not in "\n\t" for c in out)
+    assert not any(0x7f <= ord(c) <= 0x9f for c in out)
+    assert "\n\td" in out and out.startswith("a") and "PWNED" in out
+
+
+def test_format_exchange_escapes_untrusted_text() -> None:
+    e = Exchange(provider="openai", model="gpt\x1b]0;PWNED\x07\x1b[2J", status=500, source="error",
+                 error="boom\x1b[2J\x1b]8;;http://x\x07", usage=Usage(1, 1))
+    line = term.format_exchange(e, color=True, width=200)
+    assert "\x1b]" not in line and "\x1b[2J" not in line and "\x07" not in line
+    assert "\x1b[" in line  # llmtap's own colors still work

@@ -283,3 +283,30 @@ def test_day_chart_fills_gaps_and_handles_free_models(store: Store) -> None:
     h = report.render_html(report.build_report(s2, now=NOW))
     assert "No paid spend" in h
     s2.close()
+
+
+def test_markdown_escapes_untrusted_prompts(store: Store) -> None:
+    evil = "ping @octocat ![img](http://evil/x.png) [link](http://evil) **bold** <b>x</b> a|b `tick`"
+    for i in range(2):
+        store.record(ex(evil, ts=BASE + i, cost=1.0, model="m[x](http://evil)"))
+    md = report.render_markdown(report.build_report(store, now=NOW))
+    assert "![img](" not in md and "[link](" not in md and "[x](" not in md
+    assert "@octocat" not in md and "**bold**" not in md and "<b>" not in md
+    assert "a|b" not in md
+    for line in md.splitlines():
+        if "octo" in line:
+            assert line.count("`") % 2 == 0  # code spans stay balanced
+
+
+def test_malformed_request_bodies_dont_crash(store: Store) -> None:
+    store.record(ex(raw_body='{"messages": 5}', cost=1.0))
+    store.record(ex(raw_body='{"messages": [{"role": "user", "content": "x", "tool_calls": [{"function": "x"}]}], "input": 7}'))
+    d = report.build_report(store, now=NOW)
+    assert d["totals"]["requests"] == 2
+    report.render_markdown(d)
+    report.render_html(d)
+
+
+def test_fmt_day_out_of_range_does_not_crash() -> None:
+    assert isinstance(report._fmt_day(-1e12), str)
+    assert isinstance(report._fmt_day(float("inf")), str)

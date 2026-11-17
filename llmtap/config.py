@@ -60,16 +60,23 @@ class Config:
         return str(home / "llmtap.db")
 
     def base_url(self) -> str:
-        return f"http://{self.host}:{self.port}"
+        host = f"[{self.host}]" if ":" in self.host and not self.host.startswith("[") else self.host
+        return f"http://{host}:{self.port}"
 
 
 _ENV_PREFIX = "LLMTAP_"
+_TRUE, _FALSE = ("1", "true", "yes", "on"), ("0", "false", "no", "off", "")
+_CHOICES: dict[str, tuple[str, ...]] = {
+    "mode": ("record", "replay", "auto"),
+    "guard": ("off", "warn", "redact", "block"),
+}
+_STYLES = ("anthropic", "openai", "gemini")
 
 
 def _coerce(value: str, typ: Any) -> Any:
     t = typ if isinstance(typ, type) else type(typ)
     if t is bool:
-        return value.strip().lower() in ("1", "true", "yes", "on")
+        return value.strip().lower() in _TRUE
     if t is int:
         return int(value)
     if t is float:
@@ -77,36 +84,97 @@ def _coerce(value: str, typ: Any) -> Any:
     return value
 
 
+def _check(name: str, value: Any, where: str) -> Any:
+    """Type-check / coerce one scalar field value; ValueError names `where` and the key."""
+    t = type(next(f.default for f in fields(Config) if f.name == name))
+
+    def bad(expected: str) -> ValueError:
+        return ValueError(f"{where}{name}: expected {expected}, got {value!r}")
+
+    if t is bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str) and value.strip().lower() in _TRUE + _FALSE:
+            return _coerce(value, bool)
+        raise bad("true or false")
+    if t in (int, float):
+        if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+            raise bad("a number")
+        try:
+            num = _coerce(str(value).strip(), float)
+            out = t(num) if t is float or float(num).is_integer() else None
+        except (ValueError, OverflowError):
+            out = None
+        if out is None:
+            raise bad("an integer" if t is int else "a number")
+        if name == "port" and not 0 <= out <= 65535:
+            raise bad("a port number 0-65535")
+        return out
+    if not isinstance(value, str):
+        raise bad("a string")
+    if name in _CHOICES and value not in _CHOICES[name]:
+        raise bad("one of " + ", ".join(_CHOICES[name]))
+    return value
+
+
 def load_config(path: str | None = None, overrides: dict[str, Any] | None = None) -> Config:
-    """Build a Config. `overrides` (e.g. from CLI) win; keys with value None are ignored."""
+    """Build a Config. `overrides` (e.g. from CLI) win; keys with value None are ignored.
+
+    Raises ValueError (naming the file / variable and key) for invalid TOML or values."""
     cfg = Config()
     candidates = [Path(path)] if path else [Path("llmtap.toml"), Path.home() / ".config" / "llmtap" / "config.toml"]
     for p in candidates:
         if p.is_file():
-            data = tomllib.loads(p.read_text())
-            _apply(cfg, data.get("llmtap", data))
+            apply_file(cfg, p)
             break
     for f in fields(Config):
-        env = os.environ.get(_ENV_PREFIX + f.name.upper())
+        var = _ENV_PREFIX + f.name.upper()
+        env = os.environ.get(var)
         if env is not None and f.name not in ("upstreams", "pricing_overrides"):
-            setattr(cfg, f.name, _coerce(env, getattr(cfg, f.name)))
+            setattr(cfg, f.name, _check(f.name, env, f"environment variable {var}: "))
     if overrides:
         _apply(cfg, {k: v for k, v in overrides.items() if v is not None})
     return cfg
 
 
-def _apply(cfg: Config, data: dict[str, Any]) -> None:
+def apply_file(cfg: Config, path: Path) -> None:
+    """Read a TOML config file (UTF-8) into `cfg`; ValueError names the file and offending key."""
+    try:
+        data = tomllib.loads(path.read_bytes().decode("utf-8"))
+    except UnicodeDecodeError as e:
+        raise ValueError(f"{path}: not valid UTF-8 ({e.reason})") from None
+    except tomllib.TOMLDecodeError as e:
+        raise ValueError(f"{path}: invalid TOML: {e}") from None
+    section = data.get("llmtap", data)
+    if not isinstance(section, dict):
+        raise ValueError(f"{path}: llmtap: expected a table, got {section!r}")
+    _apply(cfg, section, f"{path}: ")
+
+
+def _apply(cfg: Config, data: dict[str, Any], where: str = "") -> None:
     names = {f.name for f in fields(Config)}
     for k, v in data.items():
+        key = k
         k = k.replace("-", "_")
         if k == "pricing":
             k = "pricing_overrides"
         if k not in names:
             continue
+        if k in ("upstreams", "pricing_overrides") and not isinstance(v, dict):
+            raise ValueError(f"{where}{key}: expected a table, got {v!r}")
         if k == "upstreams":
             for name, spec in v.items():
-                cfg.upstreams[name] = {"base": spec["base"].rstrip("/"), "style": spec.get("style", "openai")}
+                if not isinstance(spec, dict) or not isinstance(spec.get("base"), str) or not spec["base"].strip():
+                    raise ValueError(f'{where}upstreams.{name}: expected a table with base = "http://..."')
+                style = spec.get("style", "openai")
+                if style not in _STYLES:
+                    raise ValueError(f"{where}upstreams.{name}: style must be one of {', '.join(_STYLES)}, got {style!r}")
+                cfg.upstreams[name] = {"base": spec["base"].strip().rstrip("/"), "style": style}
         elif k == "pricing_overrides":
+            for model, price in v.items():
+                if not isinstance(price, dict) or not all(
+                        isinstance(x, (int, float)) and not isinstance(x, bool) for x in price.values()):
+                    raise ValueError(f"{where}{key}.{model}: expected a table like {{ input = 1.0, output = 2.0 }}")
             cfg.pricing_overrides.update(v)
         else:
-            setattr(cfg, k, v)
+            setattr(cfg, k, _check(k, v, where))

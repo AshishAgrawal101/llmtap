@@ -205,16 +205,21 @@ class Store:
         if model:
             where.append("model = ?")
             args.append(model)
-        if source:
+        if source == "errors":
+            # Same definition as stats()["errors"]: HTTP errors and llmtap errors, not deliberate blocks.
+            bs = ",".join(f"'{s}'" for s in _BLOCK_SOURCES)
+            where.append(f"(status >= 400 OR source = 'error') AND source NOT IN ({bs})")
+        elif source:
             where.append("source = ?")
             args.append(source)
         if q:
             pat = "%" + _like_escape(q) + "%"
             where.append(
                 "(request_body LIKE ? ESCAPE '\\' OR output_text LIKE ? ESCAPE '\\' "
-                "OR COALESCE(model,'') LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\')"
+                "OR COALESCE(model,'') LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\' "
+                "OR COALESCE(tags,'') LIKE ? ESCAPE '\\')"
             )
-            args.extend([pat, pat, pat, pat])
+            args.extend([pat, pat, pat, pat, pat])
         sql = f"SELECT {_SELECT} FROM exchanges"
         if where:
             sql += " WHERE " + " AND ".join(where)
@@ -245,7 +250,9 @@ class Store:
             f"COALESCE(SUM(CASE WHEN source IN ({cs}) THEN 1 ELSE 0 END),0), "
             f"COALESCE(SUM(CASE WHEN source IN ({bs}) THEN 1 ELSE 0 END),0), "
             "COALESCE(SUM(CASE WHEN json_valid(guard_findings) AND json_type(guard_findings) = 'array' "
-            "THEN json_array_length(guard_findings) ELSE 0 END),0) "
+            "THEN json_array_length(guard_findings) ELSE 0 END),0), "
+            # Time to first token only means something for successful streamed upstream calls.
+            "AVG(CASE WHEN source = 'upstream' AND streamed = 1 AND status < 400 THEN ttft_ms END) "
             f"FROM exchanges{where}"
         )
         group_sql: str | None = None
@@ -288,6 +295,7 @@ class Store:
             "cache_hits": int(t[7]),
             "blocked": int(t[8]),
             "guard_findings": int(t[9]),
+            "avg_ttft_ms": None if t[10] is None else float(t[10]),
             "groups": groups,
         }
 

@@ -67,6 +67,7 @@ class _Totals:
 
 _TOTALS_KEY = pytest.StashKey[_Totals]()
 _REPORTS_KEY = pytest.StashKey[dict]()
+_RECORDED_KEY = pytest.StashKey[set]()  # cassette paths already started afresh by record mode this session
 
 
 def _totals(config: pytest.Config) -> _Totals:
@@ -164,8 +165,9 @@ def _short(text: str) -> str:
 def _test_label(item: pytest.Item) -> str:
     """``Class.test_name__param-ids``: stable, filename-safe, and distinct per parametrization."""
     name = getattr(item, "originalname", None) or item.name
-    cls = getattr(item, "cls", None)
-    base = f"{cls.__name__}.{name}" if cls is not None else name
+    # nested classes keep their whole chain (TestA.TestInner.test_x) so they can't collide
+    classes = [n.name for n in item.listchain() if isinstance(n, pytest.Class)]
+    base = ".".join([*classes, name])
     callspec = getattr(item, "callspec", None)
     label, lossy = _sanitize(base)
     if callspec is not None:
@@ -351,6 +353,12 @@ def llmtap(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> I
         cfg.guard = kw["guard"]
 
     tap = LLMTap(cfg).start_background()
+    # Record mode starts a cassette afresh (lazily, on its first write). Tests sharing a cassette name must
+    # share that fresh file in order, so only the first one to write in this session may truncate it.
+    recorded = item.config.stash.setdefault(_RECORDED_KEY, set())
+    rec_key = os.path.normcase(str(path.resolve()))
+    if mode == "record" and tap.cassette is not None and rec_key in recorded:
+        tap.cassette._truncate_pending = False  # append to what earlier tests recorded this session
     session = LLMTapSession(tap, path, mode, cfg.allow_miss)
     try:
         base = session.base_url
@@ -358,8 +366,8 @@ def llmtap(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> I
         monkeypatch.setenv("OPENAI_BASE_URL", base + "/v1")
         monkeypatch.setenv("OPENAI_API_BASE", base + "/v1")
         monkeypatch.setenv("LLMTAP_URL", base)
-        recorded = tap.cassette is not None and len(tap.cassette) > 0
-        if mode == "replay" or (mode == "auto" and recorded):  # SDK clients need *a* key to construct
+        has_entries = tap.cassette is not None and len(tap.cassette) > 0
+        if mode == "replay" or (mode == "auto" and has_entries):  # SDK clients need *a* key to construct
             for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
                 if not os.environ.get(var):
                     monkeypatch.setenv(var, _FAKE_KEY)
@@ -368,6 +376,8 @@ def llmtap(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> I
     finally:
         # runs even if _finish() raised the miss failure
         _stop(tap)
+        if mode == "record" and tap.cassette is not None and not tap.cassette._truncate_pending:
+            recorded.add(rec_key)
 
 
 def _stop(tap: Any) -> None:

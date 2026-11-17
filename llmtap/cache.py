@@ -27,8 +27,16 @@ def _canonical_body(req_body: bytes) -> bytes:
 
 
 def cache_key(provider: str, path: str, req_body: bytes) -> str:
-    """sha256 hex over provider, path (no query) and the canonicalized request body."""
-    bare_path = path.split("?", 1)[0]
+    """sha256 hex over provider, path (no query) and the canonicalized request body.
+
+    The query string is ignored (SDKs add noise like ``?beta=true``; Gemini puts the API key there),
+    except ``alt``, which changes the response format: ``?alt=sse`` is an SSE stream, without it Gemini
+    returns a JSON array.
+    """
+    bare_path, _, query = path.partition("?")
+    alt = [p for p in query.split("&") if p.split("=", 1)[0] == "alt"]
+    if alt:
+        bare_path += "?" + "&".join(sorted(alt))
     h = hashlib.sha256()
     h.update(provider.encode("utf-8"))
     h.update(b"\n")

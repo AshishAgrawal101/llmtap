@@ -151,7 +151,7 @@ def test_stats_totals(store):
 def test_stats_empty(store):
     s = store.stats()
     assert s == {"requests": 0, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0, "saved_usd": 0.0,
-                 "avg_latency_ms": 0.0, "errors": 0, "cache_hits": 0, "blocked": 0, "guard_findings": 0,
+                 "avg_latency_ms": 0.0, "errors": 0, "cache_hits": 0, "blocked": 0, "guard_findings": 0, "avg_ttft_ms": None,
                  "groups": []}
     assert store.stats(group_by="model")["groups"] == []
     assert store.stats(group_by="tag:x")["groups"] == []
@@ -350,3 +350,32 @@ def test_concurrent_memory_store():
         t.join()
     assert s.count() == 800
     s.close()
+
+
+def test_avg_ttft_only_counts_successful_streams_in_range(store):
+    now = time.time()
+    store.record(Exchange(ts=now, streamed=True, status=200, ttft_ms=400))
+    store.record(Exchange(ts=now, streamed=False, status=200, ttft_ms=900))        # not a stream
+    store.record(Exchange(ts=now, streamed=True, status=500, ttft_ms=50))          # failed stream
+    store.record(Exchange(ts=now, streamed=True, status=200, ttft_ms=1, source="cache"))
+    store.record(Exchange(ts=now - 3 * 86400, streamed=True, status=200, ttft_ms=5000))  # out of range
+    assert store.stats(since=now - 3600)["avg_ttft_ms"] == 400
+    assert store.stats()["avg_ttft_ms"] == 2700
+    assert store.stats(since=now + 60)["avg_ttft_ms"] is None
+
+
+def test_list_errors_filter_matches_stats_errors(store):
+    store.record(Exchange(status=200))
+    store.record(Exchange(status=404))
+    store.record(Exchange(status=500, source="error"))
+    store.record(Exchange(status=429, source="budget"))   # a deliberate block, not an error
+    got = sorted(e.status for e in store.list(source="errors"))
+    assert got == [404, 500]
+    assert store.stats()["errors"] == len(got)
+
+
+def test_list_search_matches_tags(store):
+    store.record(Exchange(request_body="{}", tags={"feature": "colors", "session": "s-123"}))
+    store.record(Exchange(request_body="{}"))
+    assert len(store.list(q="colors")) == 1
+    assert len(store.list(q="s-123")) == 1

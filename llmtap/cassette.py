@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import os
+import time
 import re
 import threading
 import warnings
@@ -88,7 +90,8 @@ class Cassette:
                 f.write(b"\n")
 
     def _load(self, p: Path) -> None:
-        with p.open("r", encoding="utf-8", errors="replace") as f:
+        # utf-8-sig: Notepad / PowerShell add a BOM, which used to corrupt (and drop) the first line
+        with p.open("r", encoding="utf-8-sig", errors="replace") as f:
             for lineno, line in enumerate(f, 1):
                 line = line.strip()
                 if not line:
@@ -159,14 +162,53 @@ class Cassette:
         with self._lock:
             p = Path(self.path)
             p.parent.mkdir(parents=True, exist_ok=True)
-            open_mode = "w" if self._truncate_pending else "a"
+            truncate = self._truncate_pending
             self._truncate_pending = False
-            with p.open(open_mode, encoding="utf-8") as f:
-                f.write(line + "\n")
-                f.flush()
+            _append_line(p, (line + "\n").encode("utf-8"), truncate)
             self._entries.setdefault(key, []).append(clean)
             self._count += 1
 
     def __len__(self) -> int:
         with self._lock:
             return self._count
+
+
+# A byte far past any real cassette's end: Windows byte-range locks are mandatory, so locking real
+# content would block readers. Writers only ever contend for this sentinel byte.
+_LOCK_OFFSET = 2**40
+
+
+def _append_line(p: Path, data: bytes, truncate: bool = False) -> None:
+    """Write one complete line to the end of ``p`` under an OS file lock.
+
+    Several processes may share a cassette (parallel test runs). A plain append is not atomic on
+    Windows (the C runtime seeks to the end, then writes), so concurrent writers overwrote each
+    other's lines. Binary mode also keeps "\n" line endings on every OS.
+    """
+    with p.open("wb" if truncate else "ab") as f:
+        if os.name == "nt":
+            import msvcrt
+            f.seek(_LOCK_OFFSET)
+            for attempt in range(600):  # LK_NBLCK fails at once if held; retry for up to ~30s
+                try:
+                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            else:
+                raise OSError(f"could not lock {p} for writing")
+            try:
+                f.seek(0, 2)
+                f.write(data)
+                f.flush()
+            finally:
+                f.seek(_LOCK_OFFSET)
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                f.write(data)
+                f.flush()
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)

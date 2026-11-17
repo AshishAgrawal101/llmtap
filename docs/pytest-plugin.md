@@ -99,7 +99,8 @@ def test_cost_guard(llmtap):
 
 By default a cassette lives next to the test file: `<test dir>/cassettes/<module>__<test_name>.jsonl`. Parametrized
 tests get one cassette per parameter set (`test_mod__test_p__a_b.jsonl`); characters outside `A-Za-z0-9_.-` are replaced and
-a short hash is appended when that made the name ambiguous. Methods are named `Class.method`.
+a short hash is appended when that made the name ambiguous. Methods are named `Class.method` (nested classes keep the
+whole chain: `Outer.Inner.method`).
 
 | Mode | Behavior |
 |---|---|
@@ -133,7 +134,7 @@ llmtap_cassette_dir = "tests/cassettes"
 
 | Argument | Meaning |
 |---|---|
-| `cassette` | use `<cassette dir>/name.jsonl` instead of the per-test file (tests sharing a name share the file, in order) |
+| `cassette` | use `<cassette dir>/name.jsonl` instead of the per-test file (tests sharing a name share the file, in order; in record mode the file is started afresh once per run, then each test appends) |
 | `mode` | `auto` / `record` / `replay`, overriding the command line |
 | `guard` | llmtap [guard](guard.md) mode for this test: `off`, `warn`, `redact`, `block` |
 | `allow_miss` | in replay mode, forward unrecorded requests upstream instead of failing |

@@ -63,6 +63,15 @@ def strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text)
 
 
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def clean(text: Any) -> str:
+    """Escape C0/C1 control characters (except newline and tab) in untrusted text, so recorded
+    prompts can't move the cursor, retitle the window or clear the screen. Apply before ``paint``."""
+    return _CTRL_RE.sub(lambda m: f"\\x{ord(m.group()):02x}", str(text))
+
+
 def _char_width(ch: str) -> int:
     if unicodedata.combining(ch) or ch in "​‍︎️":
         return 0
@@ -185,6 +194,8 @@ def box(lines: Iterable[str], title: str = "", width: int | None = None, color: 
     inner = min(inner, max(20, cap))
     b = lambda s: paint(s, border, color=color)  # noqa: E731
     if title:
+        if vlen(title) + 2 > inner:
+            title = truncate(title, inner - 2)
         t = f" {title} "
         top = b("╭─") + t + b("─" * max(0, inner - vlen(t)) + "─╮")
     else:
@@ -365,8 +376,8 @@ def format_exchange(ex: Any, color: bool | None = None, width: int | None = None
     ts = float(getattr(ex, "ts", 0) or time.time())
     clock = p(time.strftime("%H:%M:%S", time.localtime(ts)), "gray")
     src = str(getattr(ex, "source", "upstream") or "upstream")
-    provider = str(getattr(ex, "provider", "") or "?")
-    model = str(getattr(ex, "model", None) or "-")
+    provider = clean(getattr(ex, "provider", "") or "?")
+    model = clean(getattr(ex, "model", None) or "-")
     pm_w = max(18, min(40, width - 70))
     raw = f"{provider}/{model}"
     pm = truncate(raw, pm_w)
@@ -401,7 +412,7 @@ def format_exchange(ex: Any, color: bool | None = None, width: int | None = None
         verb = "redacted" if redacted else "detected"
         parts.append(p(f"⚠ {n} secret{'s' if n != 1 else ''} {verb}", "bold", "red"))
     if src in ("budget", "loop") or (getattr(ex, "error", None) and src != "blocked"):
-        err = str(getattr(ex, "error", "") or "")
+        err = clean(getattr(ex, "error", "") or "")
         if err:
             parts.append(p(truncate(err, 60), "red"))
     return " ".join(parts)

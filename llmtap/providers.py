@@ -108,11 +108,17 @@ def resolve_route(path: str, headers: Mapping[str, str], cfg: Config) -> Route:
         base, style = _upstream(cfg, "anthropic")
         return Route(provider="anthropic", upstream_base=base, upstream_path=path, style=style)
 
-    #Check if path is a Gemini ednpoit or Google API key header is present
-    if(
+    # Gemini: any Google Generative Language endpoint, a Google API key header, or a `?key=` query
+    # parameter. Without the broader checks, e.g. `:embedContent?key=AIza...` fell through to the OpenAI
+    # route and the Google key was forwarded to api.openai.com.
+    qkeys = {p.split("=", 1)[0].lower() for p in query.split("&") if p} if sep else set()
+    if (
         ":generateContent" in pure
         or ":streamGenerateContent" in pure
+        or re.match(r"^/v1(alpha|beta)\d*/", pure)
+        or re.search(r"/models/[^/]+:[A-Za-z]+$", pure)
         or "x-goog-api-key" in hdrs
+        or "key" in qkeys
     ):
         base, style = _upstream(cfg,"gemini")
         return Route(provider="gemini", upstream_base=base, upstream_path=path,style=style)

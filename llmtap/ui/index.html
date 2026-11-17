@@ -59,7 +59,7 @@ main{padding:18px 22px 40px;max-width:1680px;margin:0 auto}
 .seg button.on{background:var(--panel3);color:var(--text);box-shadow:0 1px 0 rgba(255,255,255,.04) inset,0 1px 2px rgba(0,0,0,.4)}
 
 .card{background:linear-gradient(180deg,rgba(255,255,255,.022),rgba(255,255,255,.008)),var(--panel);border:1px solid var(--border);border-radius:var(--r);position:relative}
-.card-h{display:flex;align-items:center;gap:10px;padding:13px 16px 0}
+.card-h{display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:13px 16px 0;min-width:0}
 .card-h h3{margin:0;font-size:13px;font-weight:600;letter-spacing:-.005em}
 .card-h .sub{color:var(--muted);font-size:12px}
 
@@ -317,7 +317,7 @@ footer .keys{display:flex;gap:14px;flex-wrap:wrap}
       <div class="search"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="7" cy="7" r="4.6"/><path d="M10.5 10.5L14 14"/></svg>
         <input id="q" type="search" placeholder="Search prompts, outputs, models…" autocomplete="off" spellcheck="false"><kbd>/</kbd></div>
       <select id="fProvider" title="Provider"><option value="">All providers</option><option value="anthropic">anthropic</option><option value="openai">openai</option></select>
-      <select id="fSource" title="Source"><option value="">All sources</option><option>upstream</option><option>cache</option><option>cassette</option><option>blocked</option><option>loop</option><option>budget</option><option>error</option></select>
+      <select id="fSource" title="Source"><option value="">All sources</option><option value="errors">errors (HTTP 4xx/5xx)</option><option>upstream</option><option>cache</option><option>cassette</option><option>blocked</option><option>loop</option><option>budget</option><option value="error">llmtap error</option></select>
       <button class="btn danger" id="clearBtn" title="Delete all recorded exchanges"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 4.5h10M6.5 4.5V3h3v1.5M4.5 4.5l.6 8.5h5.8l.6-8.5"/></svg>Clear</button>
     </div>
     <div class="tscroll" id="tscroll">
@@ -450,15 +450,14 @@ function renderStats(st){
     tv.innerHTML = esc(fmtTok(from[0]+(tin-from[0])*e)) + '<span class="sl">/</span>' + esc(fmtTok(from[1]+(tout-from[1])*e));
     if (p<1) tv._raf = requestAnimationFrame(step); })(t0);
   $('[data-f]', tokEl).innerHTML = '<b>' + fmtTok(tin+tout) + '</b> total' + (st.requests ? ' · ' + fmtTok((tin+tout)/st.requests) + '/req' : '');
-  var ttfts = S.rows.filter(function(r){ return r.ttft_ms != null && r.source === 'upstream'; }).map(function(r){ return +r.ttft_ms; });
-  var ttft = ttfts.length ? ttfts.reduce(function(a,b){return a+b;},0)/ttfts.length : null;
+  var ttft = st.avg_ttft_ms == null ? null : +st.avg_ttft_ms;  // server-side: streamed, successful, selected range
   setStat('st-lat', st.avg_latency_ms, function(v){ var s = fmtMs(v); var m = /^([\d.]+)(\D+)$/.exec(s); return m ? esc(m[1]) + '<span class="u">'+esc(m[2])+'</span>' : esc(s); },
     ttft != null ? 'avg TTFT <b>' + fmtMs(ttft) + '</b> (streams)' : 'across all requests');
   var saved = setStat('st-saved', st.saved_usd, function(v){ return esc(fmtUsd(v)); }, '<b>' + fmtInt(st.cache_hits) + '</b> hits served locally');
   saved.classList.toggle('green', (+st.saved_usd||0) > 0);
   var leaks = +st.guard_findings||0, blocked = +st.blocked||0;
   var gEl = setStat('st-guard', leaks, function(v){ return fmtInt(v) + '<span class="sl">/</span>' + fmtInt(blocked); },
-    leaks || blocked ? '<b>' + fmtInt(leaks) + '</b> secret' + (leaks===1?'':'s') + ' · <b>' + fmtInt(blocked) + '</b> blocked' : 'guard: <b>' + esc(c.guard||'off') + '</b> · nothing caught');
+    leaks || blocked ? '<b>' + fmtInt(leaks) + '</b> finding' + (leaks===1?'':'s') + ' · <b>' + fmtInt(blocked) + '</b> blocked' : 'guard: <b>' + esc(c.guard||'off') + '</b> · nothing caught');
   gEl.classList.toggle('danger', leaks + blocked > 0);
   S.total = +st.requests || 0;
   renderModels(st.groups || []);
@@ -505,7 +504,7 @@ function loadSeries(){
 }
 function niceMax(v){ if (!(v > 0)) return 1; var e = Math.pow(10, Math.floor(Math.log10(v/4))), steps = [1,2,2.5,5,10]; for (var i=0;i<steps.length;i++){ var s = steps[i]*e; if (s*4 >= v) return s*4; } return 40*e; }
 function mval(p){ return S.metric === 'cost' ? p.cum : S.metric === 'requests' ? p.requests : p.tokens; }
-function mfmt(v, step){ if (S.metric !== 'cost') return fmtTok(v); if (!v) return '$0'; var d = Math.max(0, Math.min(5, Math.ceil(-Math.log10(step || v) - 1e-9))); return '$' + v.toFixed(d); }
+function mfmt(v, step){ if (S.metric !== 'cost') return fmtTok(v); if (!v) return '$0'; var d = Math.max(0, Math.min(8, Math.ceil(-Math.log10(step || v) - 1e-9))); return '$' + v.toFixed(d); }
 function smoothPath(xy){ if (!xy.length) return ''; var d = 'M' + xy[0][0].toFixed(1) + ',' + xy[0][1].toFixed(1);
   for (var i=1;i<xy.length;i++){ var a = xy[i-1], b = xy[i], mx = (a[0]+b[0])/2; d += 'C' + mx.toFixed(1)+','+a[1].toFixed(1)+' '+mx.toFixed(1)+','+b[1].toFixed(1)+' '+b[0].toFixed(1)+','+b[1].toFixed(1); } return d; }
 function xlabel(t){ var d = new Date(t*1000); if (S.bucket >= 86400) return d.toLocaleDateString(undefined,{month:'short',day:'numeric'}); if (S.bucket >= 3600 && (S.win[1]-S.win[0]) > 86400) return d.toLocaleDateString(undefined,{weekday:'short'}) + ' ' + pad(d.getHours()) + 'h'; return pad(d.getHours()) + ':' + pad(d.getMinutes()) + (S.bucket < 60 ? ':' + pad(d.getSeconds()) : ''); }
@@ -570,7 +569,7 @@ function rowHtml(x, flash){
   var tokTitle = 'in ' + fmtInt(u.input_tokens) + ' · out ' + fmtInt(u.output_tokens) + (u.cache_read_tokens ? ' · cache read ' + fmtInt(u.cache_read_tokens) : '') + (u.cache_write_tokens ? ' · cache write ' + fmtInt(u.cache_write_tokens) : '') + (u.estimated ? ' (estimated)' : '');
   var cost = (+x.saved_usd||0) > 0 && !(+x.cost_usd) ? '<span class="saved" title="'+esc(fmtUsd(x.saved_usd))+' saved — served locally">'+(fmtUsd(x.saved_usd).charAt(0) === '<' ? '' : '−')+esc(fmtUsd(x.saved_usd))+'</span>' : '<span class="cost">'+esc(fmtUsd(x.cost_usd))+'</span>';
   var lat = +x.latency_ms || 0;
-  var prev = (findings ? '<span class="shield" title="'+findings+' secret(s) detected">'+findings+' leak'+(findings>1?'s':'')+'</span>' : '') +
+  var prev = (findings ? '<span class="shield" title="'+findings+' guard finding(s): secrets or personal data">'+findings+' leak'+(findings>1?'s':'')+'</span>' : '') +
     '<span class="p">'+esc(x.preview || (x.path||''))+'</span>' + (x.output_preview ? '<span class="o"> → '+esc(x.output_preview)+'</span>' : (x.error ? '<span class="o" style="color:var(--bad)"> → '+esc(x.error)+'</span>' : ''));
   return '<tr data-id="'+esc(x.id)+'" class="'+(flash?'flash':'')+(findings?' leak':'')+'">' +
     '<td class="t-time" title="'+esc(fullTime(x.ts))+'">'+esc(fmtTime(x.ts))+'</td>' +
@@ -607,8 +606,10 @@ function emptyHtml(){
 }
 function matches(x){
   if (S.provider && x.provider !== S.provider) return false;
-  if (S.source && x.source !== S.source) return false;
-  if (S.q){ var q = S.q.toLowerCase(), hay = [x.preview, x.output_preview, x.model, x.path].join(' ').toLowerCase(); if (hay.indexOf(q) < 0) return false; }
+  if (S.source === 'errors'){ var bad = (+x.status >= 400 || x.source === 'error') && ['blocked','budget','loop'].indexOf(x.source) < 0; if (!bad) return false; }
+  else if (S.source && x.source !== S.source) return false;
+  if (S.q){ var q = S.q.toLowerCase(), tg = x.tags || {}, tagTxt = Object.keys(tg).map(function(k){ return k + ' ' + tg[k]; }).join(' ');
+    var hay = [x.preview, x.output_preview, x.model, x.path, tagTxt].join(' ').toLowerCase(); if (hay.indexOf(q) < 0) return false; }
   return true;
 }
 function noteProvider(p){ if (!p || S.providers[p]) return; S.providers[p] = 1; var o = document.createElement('option'); o.value = p; o.textContent = p; $('#fProvider').appendChild(o); }
@@ -702,7 +703,7 @@ function renderDrawer(ex){
 }
 function findingsHtml(ex){
   var f = ex.guard_findings || []; if (!f.length) return '';
-  return '<div class="alert"><b>'+f.length+' secret'+(f.length>1?'s':'')+' detected</b> in this prompt' + (ex.source === 'blocked' ? ' — request was <b>blocked</b>.' : '.') +
+  return '<div class="alert"><b>'+f.length+' guard finding'+(f.length>1?'s':'')+'</b> (secrets or personal data) in this prompt' + (ex.source === 'blocked' ? ' — request was <b>blocked</b>.' : '.') +
     '<table>' + f.map(function(x){ return '<tr><td><b>'+esc(x.kind)+'</b></td><td>'+esc(x.path || '(body)')+'</td><td>'+esc(x.preview)+'</td></tr>'; }).join('') + '</table></div>';
 }
 
@@ -718,7 +719,7 @@ function partsOf(content){
     if (!b || typeof b !== 'object') return;
     var ty = b.type;
     if (typeof b.text === 'string' && (!ty || ty === 'text' || ty === 'input_text' || ty === 'output_text')) out.push({k:'text', t:b.text});
-    else if (ty === 'thinking') out.push({k:'think', t:b.thinking || ''});
+    else if (ty === 'thinking') out.push({k:'think', t:b.thinking || '[thinking — the API did not return its text]'});
     else if (ty === 'redacted_thinking') out.push({k:'think', t:'[redacted thinking]'});
     else if (ty === 'reasoning') out.push({k:'think', t:textOf(b.summary) || '[reasoning]'});
     else if (ty === 'tool_use' || ty === 'server_tool_use') out.push({k:'code', label:'→ tool call: ' + (b.name || ''), t:pretty(b.input)});
@@ -772,6 +773,11 @@ function responseMsgs(ex){
   }
   if (!parts.length && ex.output_text) parts = [{k:'text', t:ex.output_text}];
   if (!parts.length) parts = [{k:'note', t:'(no text output — see the Response tab)'}];
+  else if (!parts.some(function(p){ return p.k !== 'think'; })){
+    var stop = resp && (resp.stop_reason || (resp.choices && resp.choices[0] && resp.choices[0].finish_reason));
+    parts.push({k:'note', t: stop === 'max_tokens' || stop === 'length'
+      ? '(no text — the model hit max_tokens while thinking; raise max_tokens)' : '(no text output — see the Response tab)'});
+  }
   return [{role:'assistant', out:true, label: ex.source !== 'upstream' ? 'served from ' + ex.source : (ex.streamed ? 'streamed' : ''), parts:parts}];
 }
 function richText(t){
@@ -847,7 +853,7 @@ function curlFor(ex){
   if (ex.style === 'anthropic' || ex.provider === 'anthropic'){ parts.push('-H "x-api-key: $ANTHROPIC_API_KEY"'); parts.push("-H 'anthropic-version: 2023-06-01'"); }
   else if (ex.provider === 'openai') parts.push('-H "Authorization: Bearer $OPENAI_API_KEY"');
   else parts.push('-H "Authorization: Bearer $API_KEY"');
-  var tags = ex.tags || {}; for (var k in tags){ parts.push(shq(k === 'session' ? 'X-LLMTap-Session: ' + tags[k] : 'X-LLMTap-Tag-' + k + ': ' + tags[k])); }
+  var tags = ex.tags || {}; for (var k in tags){ parts.push('-H ' + shq(k === 'session' ? 'X-LLMTap-Session: ' + tags[k] : 'X-LLMTap-Tag-' + k + ': ' + tags[k])); }
   if (ex.request_body && ex.method !== 'GET'){ parts.push("-H 'content-type: application/json'"); parts.push('--data-raw ' + shq(ex.request_body)); }
   return parts.filter(Boolean).join(' \\\n  ');
 }
@@ -866,7 +872,7 @@ $('#closeBtn').addEventListener('click', closeDrawer);
 $('#curlBtn').addEventListener('click', function(){ var ex = S.open && S.detail[S.open]; if (ex) copy(curlFor(ex), 'Copied curl command'); });
 $('#dBody').addEventListener('click', function(e){ var b = e.target.closest('[data-copy-raw]'); if (!b) return; var ex = S.detail[S.open]; if (!ex) return; copy(S.tab === 'req' ? pretty(ex.request_body) : (ex.streamed ? ex.response_body : pretty(ex.response_body))); });
 $('#empty').addEventListener('click', function(e){ var b = e.target.closest('[data-copy]'); if (b) copy(b.getAttribute('data-copy')); });
-$('#clearBtn').addEventListener('click', function(){ if (!confirm('Delete all recorded exchanges? This cannot be undone.')) return;
+$('#clearBtn').addEventListener('click', function(){ if (!confirm('Delete all recorded exchanges? This cannot be undone. The response cache is kept.')) return;
   api('/api/clear', {method:'POST', headers:{'content-type':'application/json'}, body:'{}'}).then(function(){ S.detail = {}; S.rows = []; S.ids = new Set(); closeDrawer(); renderTable(); refreshStats(); toast('History cleared'); }).catch(function(e){ toast('Clear failed: ' + e.message); }); });
 $('#urlchip').textContent = ORIGIN.replace(/^https?:\/\//, '');
 $('#urlchip').addEventListener('click', function(){ copy(ORIGIN, 'Copied ' + ORIGIN); });

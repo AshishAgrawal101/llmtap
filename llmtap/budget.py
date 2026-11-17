@@ -28,6 +28,7 @@ class Verdict:
     allowed: bool
     reason: str = ""
     kind: str = ""
+    reservation: int | None = None   # pass to Budget.release() once the request has finished
 
 
 def _usd(x: float) -> str:
@@ -69,6 +70,22 @@ class Budget:
         self._seen: OrderedDict[str, deque[float]] = OrderedDict()
         # cached daily spend: (midnight it was computed for, fetched_at, value)
         self._daily_cache: tuple[float, float, float] | None = None
+        # In-flight upstream calls: their cost is only known when they finish, so concurrent requests
+        # would otherwise all pass the cap check at once. Each admitted call reserves an estimate.
+        self._admit = threading.Lock()
+        self._reserved: dict[int, float] = {}
+        self._next_reservation = 0
+
+    def release(self, reservation: int | None) -> None:
+        """Drop an in-flight reservation (call after add_spend, success or failure)."""
+        if reservation is None:
+            return
+        with self._lock:
+            self._reserved.pop(reservation, None)
+
+    def in_flight_usd(self) -> float:
+        with self._lock:
+            return sum(self._reserved.values())
 
     # ------------------------------------------------------------------ spend
     def add_spend(self, usd: float) -> None:
@@ -104,27 +121,31 @@ class Budget:
         return value
 
     # ------------------------------------------------------------------ check
-    def check(self, key: str) -> Verdict:
-        """Decide whether a request (identified by its cache ``key``) may go upstream."""
+    def check(self, key: str, estimate_usd: float = 0.0) -> Verdict:
+        """Decide whether a request (identified by its cache ``key``) may go upstream.
+
+        ``estimate_usd`` is a worst-case cost guess for this request. When a cap is set and the request is
+        allowed, it is reserved until :meth:`release`, so requests admitted concurrently count each other's
+        pending cost. A request's own estimate never blocks it: a lone request is judged on real spend only.
+        """
         cfg = self.cfg
         count = self._record_attempt(key)
+        verdict = self.check_spend(estimate_usd)
+        if not verdict.allowed:
+            return verdict
+        loop = self._loop_verdict(count)
+        if not loop.allowed:
+            self.release(verdict.reservation)
+            return loop
+        return verdict
 
-        daily_cap = float(cfg.budget_daily_usd or 0)
-        if daily_cap > 0:
-            spent = self.daily_spent()
-            if spent >= daily_cap:
-                return Verdict(False, (
-                    f"llmtap: daily budget of {_usd(daily_cap)} reached ({_usd(spent)} spent today). "
-                    "Raise it with --budget-daily or wait until midnight."), "budget")
+    def check_loop(self, key: str) -> Verdict:
+        """Loop breaker only. Counts every attempt, including ones later served from cache: a stuck
+        agent replaying the same cached request would otherwise loop forever."""
+        return self._loop_verdict(self._record_attempt(key))
 
-        session_cap = float(cfg.budget_session_usd or 0)
-        if session_cap > 0:
-            spent = self.session_spent()
-            if spent >= session_cap:
-                return Verdict(False, (
-                    f"llmtap: session budget of {_usd(session_cap)} reached ({_usd(spent)} spent this session). "
-                    "Raise it with --budget-session or restart llmtap to start a new session."), "budget")
-
+    def _loop_verdict(self, count: int) -> Verdict:
+        cfg = self.cfg
         threshold = int(cfg.loop_threshold or 0)
         if threshold > 0 and count > threshold:
             return Verdict(False, (
@@ -132,6 +153,38 @@ class Budget:
                 f"{_fmt_window(cfg.loop_window_s)}. Your agent may be stuck. "
                 "(Disable with --loop-threshold 0)"), "loop")
         return Verdict(True)
+
+    def check_spend(self, estimate_usd: float = 0.0) -> Verdict:
+        """Spend caps only (see :meth:`check` for ``estimate_usd``). Free cache/cassette hits skip this."""
+        cfg = self.cfg
+        daily_cap = float(cfg.budget_daily_usd or 0)
+        session_cap = float(cfg.budget_session_usd or 0)
+
+        with self._admit:  # check + reserve atomically
+            pending = self.in_flight_usd()
+            if daily_cap > 0:
+                spent = self.daily_spent()
+                if spent + pending >= daily_cap:
+                    return Verdict(False, (
+                        f"llmtap: daily budget of {_usd(daily_cap)} reached ({_usd(spent)} spent today"
+                        + (f", {_usd(pending)} in flight" if pending else "") + "). "
+                        "Raise it with --budget-daily or wait until midnight."), "budget")
+
+            if session_cap > 0:
+                spent = self.session_spent()
+                if spent + pending >= session_cap:
+                    return Verdict(False, (
+                        f"llmtap: session budget of {_usd(session_cap)} reached ({_usd(spent)} spent this session"
+                        + (f", {_usd(pending)} in flight" if pending else "") + "). "
+                        "Raise it with --budget-session or restart llmtap to start a new session."), "budget")
+
+            reservation = None
+            if daily_cap > 0 or session_cap > 0:
+                with self._lock:
+                    self._next_reservation += 1
+                    reservation = self._next_reservation
+                    self._reserved[reservation] = max(0.0, float(estimate_usd or 0.0))
+            return Verdict(True, reservation=reservation)
 
     def _record_attempt(self, key: str) -> int:
         """Record an attempt for ``key``; return attempts within the window including this one."""
