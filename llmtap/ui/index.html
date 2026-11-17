@@ -652,19 +652,36 @@ function setLive(state){
   S.live = state; var el = $('#live'); el.className = 'live ' + state;
   $('#liveTxt').textContent = state === 'on' ? 'Live' : state === 'poll' ? 'Polling' : state === 'off' ? 'Offline' : 'Connecting';
 }
-function startPolling(){ if (S.poll) return; S.poll = setInterval(function(){ loadList(true); refreshStats(); }, 3000); }
-function stopPolling(){ if (S.poll){ clearInterval(S.poll); S.poll = null; } }
+/* Polling (fallback while the live feed is down) backs off to 30s while llmtap is unreachable and skips
+   hidden tabs, so a dashboard left open on a stopped llmtap doesn't send a request every second. */
+function startPolling(){
+  if (S.poll) return;
+  var gen = S.pollGen = (S.pollGen || 0) + 1; S.pollDelay = 3000;
+  function tick(){
+    if (S.pollGen !== gen) return;
+    S.poll = setTimeout(function(){
+      if (S.pollGen !== gen) return;
+      if (document.hidden){ tick(); return; }
+      Promise.all([loadList(true), refreshStats()]).then(function(){
+        S.pollDelay = S.live === 'off' ? Math.min(30000, S.pollDelay * 2) : 3000; tick(); });
+    }, S.pollDelay);
+  }
+  tick();
+}
+function stopPolling(){ S.pollGen = (S.pollGen || 0) + 1; if (S.poll){ clearTimeout(S.poll); S.poll = null; } }
 function connect(){
   if (!window.EventSource){ setLive('poll'); startPolling(); return; }
-  var es, hadErr = false;
+  var es;
   try { es = new EventSource(BASE + '/api/events'); } catch(e){ setLive('poll'); startPolling(); return; }
   S.es = es;
-  es.onopen = function(){ setLive('on'); stopPolling(); if (hadErr){ loadList(true); refreshStats(); } };
+  es.onopen = function(){ setLive('on'); stopPolling(); if (S.esDelay){ loadList(true); refreshStats(); } S.esDelay = 0; };
   es.onmessage = function(e){ var ev; try { ev = JSON.parse(e.data); } catch(_){ return; }
     if (ev && ev.type === 'exchange' && ev.exchange){ addRow(ev.exchange); }
     scheduleStats(); };
-  es.onerror = function(){ hadErr = true; setLive('poll'); startPolling();
-    if (es.readyState === 2){ S.es = null; setTimeout(connect, 5000); } };
+  // Reconnect ourselves with backoff (2s .. 30s) instead of the browser's fixed retry interval.
+  es.onerror = function(){ if (S.es !== es) return;
+    es.close(); S.es = null; if (S.live !== 'off') setLive('poll'); startPolling();
+    S.esDelay = Math.min(30000, (S.esDelay || 1000) * 2); setTimeout(connect, S.esDelay); };
 }
 
 /* ---------- drawer ---------- */
