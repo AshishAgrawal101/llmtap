@@ -368,6 +368,18 @@ def _upstream_target(route: Route) -> tuple[str, str, int | None, str]:
     return scheme, u.hostname or "localhost", u.port, base_path + up
 
 
+class _FinalResponse(http.client.HTTPResponse):
+    """http.client only skips ``100 Continue``; also skip other interim responses (102, 103 Early Hints...)
+    so they are never relayed as if they were the final answer."""
+
+    def _read_status(self) -> tuple[str, int, str]:
+        while True:
+            version, status, reason = super()._read_status()  # type: ignore[misc]
+            if not (101 < status < 200):
+                return version, status, reason
+            http.client.parse_headers(self.fp)  # type: ignore[arg-type]
+
+
 def _is_streaming_response(ctype: str, req_stream: bool, has_length: bool) -> bool:
     c = ctype.lower()
     if "text/event-stream" in c or "ndjson" in c or "jsonl" in c:
@@ -666,6 +678,7 @@ class LLMTap:
             conn = http.client.HTTPSConnection(host, port, timeout=timeout, context=ssl.create_default_context())
         else:
             conn = http.client.HTTPConnection(host, port, timeout=timeout)
+        conn.response_class = _FinalResponse
         fwd = forward_headers(hdrs)
         try:
             try:
@@ -1127,6 +1140,9 @@ class _BadRequest(Exception):
     pass
 
 
+_HEX = re.compile(rb"[0-9A-Fa-f]{1,16}")   # chunk size: no sign, 0x prefix or underscores (int() would take them)
+
+
 class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "llmtap/" + __version__
@@ -1137,42 +1153,49 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - silence default logging
         pass
 
+    def _read_exactly(self, n: int, what: str) -> bytes:
+        # In pieces: rfile.read(n) allocates n bytes up front, so a lying Content-Length would cost memory.
+        buf = bytearray()
+        while len(buf) < n:
+            data = self.rfile.read(min(n - len(buf), 1 << 20))
+            if not data:
+                raise _BadRequest(what)
+            buf += data
+        return bytes(buf)
+
     def _read_body(self) -> bytes:
-        te = (self.headers.get("Transfer-Encoding") or "").lower()
-        if "chunked" in te:
+        tes = self.headers.get_all("Transfer-Encoding") or []
+        cls = {v.strip() for v in (self.headers.get_all("Content-Length") or [])}
+        if tes:
+            if [t.strip().lower() for t in ",".join(tes).split(",")] != ["chunked"]:
+                raise _BadRequest("unsupported Transfer-Encoding")
+            if cls:
+                self.close_connection = True   # both framings: chunked wins, but never reuse the connection
             buf = bytearray()
             while True:
                 line = self.rfile.readline(65537)
                 if not line:
                     raise _BadRequest("truncated chunked body")
                 size_s = line.split(b";", 1)[0].strip()
-                try:
-                    size = int(size_s, 16)
-                except ValueError:
-                    raise _BadRequest("bad chunk size") from None
+                if not _HEX.fullmatch(size_s):
+                    raise _BadRequest("bad chunk size")
+                size = int(size_s, 16)
                 if size == 0:
                     while True:  # trailers
                         t = self.rfile.readline(65537)
                         if t in (b"\r\n", b"\n", b""):
                             break
                     return bytes(buf)
-                data = self.rfile.read(size)
-                if len(data) < size:
-                    raise _BadRequest("truncated chunk")
-                buf += data
-                self.rfile.readline(3)  # CRLF after chunk
-        cl = self.headers.get("Content-Length")
-        if cl:
-            try:
-                n = int(cl)
-            except ValueError:
-                raise _BadRequest("bad Content-Length") from None
-            if n < 0:
+                buf += self._read_exactly(size, "truncated chunk")
+                if self.rfile.readline(3) not in (b"\r\n", b"\n"):
+                    raise _BadRequest("bad chunk framing")
+        if cls:
+            if len(cls) > 1:
+                raise _BadRequest("conflicting Content-Length headers")
+            cl = cls.pop()
+            if not cl.isascii() or not cl.isdigit():
                 raise _BadRequest("bad Content-Length")
-            data = self.rfile.read(n)
-            if len(data) < n:
-                raise _BadRequest("truncated body")
-            return data
+            return self._read_exactly(int(cl), "truncated body")
         return b""
 
     def _dispatch(self) -> None:
