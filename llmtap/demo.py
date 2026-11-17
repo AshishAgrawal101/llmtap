@@ -205,13 +205,16 @@ def _script() -> tuple[list[Call], list[Call]]:
     return first, pool
 
 
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # the proxy is local: ignore HTTP_PROXY
+
+
 def send(base_url: str, call: Call, timeout: float = 30.0) -> tuple[int, bytes]:
     """Send one call through the proxy. Never raises; returns (status, body) — status 0 on connection error."""
     data = json.dumps(call.body()).encode("utf-8")
     req = urllib.request.Request(base_url.rstrip("/") + call.path(), data=data, method="POST",
                                  headers=call.headers())
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _OPENER.open(req, timeout=timeout) as resp:
             return resp.status, resp.read()
     except urllib.error.HTTPError as e:
         try:

@@ -995,6 +995,8 @@ def cmd_demo(args: argparse.Namespace) -> int:
         "host": args.host, "port": args.port, "quiet": args.quiet,
         "db_path": os.path.join(tmp, "demo.db"),
         "cache": True, "guard": "redact", "loop_threshold": 4, "loop_window_s": 60,
+        # a project's llmtap.toml / LLMTAP_* must not record fake traffic into its cassette or cap the demo
+        "cassette": "", "budget_daily_usd": 0.0, "budget_session_usd": 0.0,
         "upstreams": {"anthropic": {"base": mock.base_url, "style": "anthropic"},
                       "openai": {"base": mock.base_url, "style": "openai"}},
     })
