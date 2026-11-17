@@ -227,3 +227,16 @@ def test_env_brackets_ipv6(capsys: pytest.CaptureFixture[str]) -> None:
     assert cli.main(["env", "--host", "::1", "--port", "4141"]) == 0
     out = capsys.readouterr().out
     assert "http://[::1]:4141" in out and "http://::1:" not in out
+
+
+@pytest.mark.parametrize("encoding", ["utf-16", "utf-16-be", "utf-8-sig"])
+def test_scan_file_with_bom(tmp_path: Path, encoding: str, capsys: pytest.CaptureFixture[str]) -> None:
+    # Windows PowerShell 5.1 writes UTF-16LE (with BOM) for `echo ... > file`
+    f = tmp_path / "out.txt"
+    data = "first line\nkey AKIAIOSFODNN7EXAMPLE\n".encode(encoding)
+    if encoding == "utf-16-be":
+        data = b"\xfe\xff" + data
+    f.write_bytes(data)
+    assert cli.main(["scan", "--json", str(f)]) == 1
+    found = json.loads(capsys.readouterr().out)
+    assert [(d["kind"], d["line"], d["col"]) for d in found] == [("aws_access_key", 2, 5)]

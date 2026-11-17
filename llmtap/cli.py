@@ -930,8 +930,12 @@ def cmd_scan(args: argparse.Namespace) -> int:
                 text = buf.read().decode("utf-8", errors="replace") if buf is not None else sys.stdin.read()
                 label = "<stdin>"
             else:
-                with open(name, encoding="utf-8", errors="replace") as fh:
-                    text = fh.read()
+                with open(name, "rb") as fh:
+                    raw = fh.read()
+                # UTF-16 with a BOM (Windows PowerShell's `>`) would otherwise hide every secret behind NULs
+                utf16 = raw.startswith((b"\xff\xfe", b"\xfe\xff"))
+                text = raw.decode("utf-16" if utf16 else "utf-8-sig", errors="replace")
+                text = text.replace("\r\n", "\n").replace("\r", "\n")  # universal newlines, as before
                 label = name
         except OSError as e:
             _err(f"{name}: {e.strerror or e}")
