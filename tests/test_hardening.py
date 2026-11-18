@@ -24,6 +24,12 @@ ANTH_H = {"x-api-key": "sk-ant-test-0000", "anthropic-version": "2023-06-01"}
 # ------------------------------------------------------------------------------------------------
 # programmable fake upstream
 # ------------------------------------------------------------------------------------------------
+class _BurstServer(ThreadingHTTPServer):
+    # A class attribute: the socket listens inside __init__, so setting it afterwards has no effect.
+    request_queue_size = 128   # the default of 5 overflows under the 120-connection burst tests
+    daemon_threads = True
+
+
 class Up:
     """Local HTTP/1.1 server; ``fn(handler, rec)`` writes the response (default: JSON 200 echo)."""
 
@@ -70,9 +76,7 @@ class Up:
 
             do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = _go
 
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), H)
-        self.server.daemon_threads = True
-        self.server.request_queue_size = 128
+        self.server = _BurstServer(("127.0.0.1", 0), H)
         self.port = self.server.server_address[1]
         self.base_url = f"http://127.0.0.1:{self.port}"
         threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
