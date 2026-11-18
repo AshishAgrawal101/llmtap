@@ -13,7 +13,7 @@ def llmtap_home() -> Path:
 
 
 DEFAULT_UPSTREAMS: dict[str, dict[str, str]] = {
-    # name -> {"base": url, "style": "anthropic"|"openai"}
+    # name -> {"base": url, "style": "anthropic"|"openai"|"bedrock"}
     "anthropic": {"base": "https://api.anthropic.com", "style": "anthropic"},
     "openai": {"base": "https://api.openai.com", "style": "openai"},
     "openrouter": {"base": "https://openrouter.ai/api", "style": "openai"},
@@ -22,7 +22,14 @@ DEFAULT_UPSTREAMS: dict[str, dict[str, str]] = {
     "mistral": {"base": "https://api.mistral.ai", "style": "openai"},
     "deepseek": {"base": "https://api.deepseek.com", "style": "openai"},
     "ollama": {"base": "http://localhost:11434", "style": "openai"},
-    "gemini": {"base":"https://generativelanguage.googleapis.com","style":"gemini"}
+    "gemini": {
+        "base": "https://generativelanguage.googleapis.com",
+        "style": "gemini",
+    },
+    "bedrock": {
+        "base": "https://bedrock-runtime.{region}.amazonaws.com",
+        "style": "bedrock",
+    },
 }
 
 

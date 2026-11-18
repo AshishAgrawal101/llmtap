@@ -397,8 +397,15 @@ class _FinalResponse(http.client.HTTPResponse):
 
 def _is_streaming_response(ctype: str, req_stream: bool, has_length: bool) -> bool:
     c = ctype.lower()
-    if "text/event-stream" in c or "ndjson" in c or "jsonl" in c:
+
+    if (
+        "text/event-stream" in c
+        or "application/vnd.amazon.eventstream" in c
+        or "ndjson" in c
+        or "jsonl" in c
+    ):
         return True
+
     return req_stream and not has_length and "json" not in c
 
 
@@ -698,7 +705,10 @@ class LLMTap:
         else:
             conn = http.client.HTTPConnection(host, port, timeout=timeout)
         conn.response_class = _FinalResponse
-        fwd = forward_headers(hdrs)
+        fwd = forward_headers(
+            hdrs,
+            preserve_signed=route.style == "bedrock",
+        )
         try:
             try:
                 conn.request(method, full_path, body=body if (body or method in ("POST", "PUT", "PATCH")) else None,

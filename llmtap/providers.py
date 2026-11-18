@@ -39,6 +39,29 @@ __all__ = [
     "tags_from_headers",
 ]
 
+_SIGNED_HEADERS_RE = re.compile(
+    r"(?:^|,\s*)SignedHeaders=([^,\s]+)",
+    re.IGNORECASE,
+)
+
+# Amazon Bedrock host and credential regexes, for routing and model extraction.
+_BEDROCK_HOST_RE = re.compile(
+    r"^bedrock-runtime(?:-fips)?"
+    r"\.([a-z0-9-]+)"
+    r"\.(amazonaws\.com(?:\.cn)?|api\.aws)"
+    r"(?::\d+)?$",
+    re.IGNORECASE,
+)
+
+_BEDROCK_CREDENTIAL_RE = re.compile(
+    r"Credential=[^/\s,]+"
+    r"/\d{8}"
+    r"/([a-z0-9-]+)"
+    r"/bedrock"
+    r"/aws4_request",
+    re.IGNORECASE,
+)
+
 _VERSION_SEG = re.compile(r"^/v\d+(?:[a-z0-9]*)?(?:[/?#]|$)")
 _BASE_ENDS_WITH_VERSION = re.compile(r"/v\d+[a-z0-9]*$")
 
@@ -57,6 +80,29 @@ def _header_names(headers: Mapping[str, str] | None) -> set[str]:
     except Exception:
         return set()
 
+def _header_value(headers: Mapping[str, str] | None, name: str) -> str:
+    """Return a header value without assuming a particular name casing."""
+    wanted = name.lower()
+    try:
+        for key, value in (headers or {}).items():
+            if str(key).lower() == wanted:
+                return str(value).strip()
+    except Exception:
+        pass
+    return ""
+
+def _aws_signed_headers(headers: Mapping[str, str]) -> set[str]:
+    authorization = _header_value(headers, "authorization")
+    match = _SIGNED_HEADERS_RE.search(authorization)
+
+    if match is None:
+        return set()
+
+    return {
+        name.strip().lower()
+        for name in match.group(1).split(";")
+        if name.strip()
+    }
 
 def _upstream(cfg: Config, name: str) -> tuple[str, str]:
     """(base, style) for a named upstream, with sensible fallbacks."""
@@ -75,6 +121,67 @@ def _normalize_openai_path(path: str, base: str) -> str:
         return path
     return "/v1" + path
 
+def _resolve_bedrock_route(
+    path: str,
+    headers: Mapping[str, str],
+    cfg: Config,
+) -> Route | None:
+    """Resolve a native AWS Bedrock Runtime request.
+
+    Bedrock requests use SigV4, so the original path and query string must
+    be forwarded unchanged.
+    """
+    host = _header_value(headers, "host")
+    authorization = _header_value(headers, "authorization")
+
+    host_match = _BEDROCK_HOST_RE.fullmatch(host)
+    credential_match = _BEDROCK_CREDENTIAL_RE.search(authorization)
+
+    # A Bedrock host is definitive. When the request is sent to a local
+    # proxy, identify it using both the Bedrock credential scope and its
+    # native runtime path.
+    pure_path = path.partition("?")[0]
+    signed_runtime_request = (
+        credential_match is not None
+        and pure_path.startswith("/model/")
+    )
+
+    if host_match is None and not signed_runtime_request:
+        return None
+
+    region = ""
+
+    if host_match is not None:
+        region = host_match.group(1).lower()
+    elif credential_match is not None:
+        region = credential_match.group(1).lower()
+
+    if not region:
+        return None
+
+    upstreams = getattr(cfg, "upstreams", None) or {}
+    spec = upstreams.get("bedrock") or {}
+
+    default_template = "https://bedrock-runtime.{region}.amazonaws.com"
+    base_template = str(spec.get("base") or default_template).rstrip("/")
+
+    # Keep the exact AWS endpoint variant because Host participates in SigV4.
+    if host_match is not None and base_template == default_template:
+        base = f"https://{host.lower()}"
+    else:
+        try:
+            base = base_template.format(region=region)
+        except (KeyError, ValueError):
+            base = base_template
+
+    style = str(spec.get("style") or "bedrock")
+
+    return Route(
+        provider="bedrock",
+        upstream_base=base,
+        upstream_path=path,  # Preserve the signed path and query exactly.
+        style=style,
+    )
 
 def upstream_path_for(provider: str, path: str, cfg: Config | None = None) -> str:
     """The upstream path the proxy sent for a request it recorded as (``provider``, client ``path``): strips a
@@ -105,6 +212,10 @@ def resolve_route(path: str, headers: Mapping[str, str], cfg: Config) -> Route:
         path = "/" + path
     pure, sep, query = path.partition("?")
 
+    # Native AWS Bedrock Runtime request
+    bedrock = _resolve_bedrock_route(path, headers, cfg)
+    if bedrock is not None:
+        return bedrock
     # 1. explicit prefix: /<name>/rest
     parts = pure.split("/", 2)  # ["", name, rest]
     name = parts[1] if len(parts) > 1 else ""
@@ -149,7 +260,6 @@ def resolve_route(path: str, headers: Mapping[str, str], cfg: Config) -> Route:
     base, style = _upstream(cfg, "openai")
     up_path = _normalize_openai_path(path, base) if style == "openai" else path
     return Route(provider="openai", upstream_base=base, upstream_path=up_path, style=style)
-
 
 # --------------------------------------------------------------------------------------------
 # request helpers
@@ -649,23 +759,57 @@ def _items(headers: Mapping[str, str] | None) -> list[tuple[str, str]]:
         return []
 
 
-def forward_headers(headers: Mapping[str, str]) -> dict[str, str]:
+def forward_headers(
+    headers: Mapping[str, str],
+    preserve_signed: bool = False,
+) -> dict[str, str]:
     """Headers to send upstream: drop hop-by-hop (+ those named in Connection) and x-llmtap-*."""
     items = _items(headers)
     extra: set[str] = set()
-    for k, v in items:
-        if k.lower() == "connection":
-            extra |= {t.strip().lower() for t in v.split(",") if t.strip()}
-    out: dict[str, str] = {}
-    for k, v in items:
-        lk = k.lower()
-        # `expect` is answered by llmtap itself (100-continue); the body is re-sent with a Content-Length
-        if lk in HOP_BY_HOP or lk in extra or lk == "expect" or lk.startswith("x-llmtap-"):
-            continue
-        out[k] = v
-    out["accept-encoding"] = "identity"
-    return out
+    for key, value in items:
+        if key.lower() == "connection":
+            extra |= {
+                token.strip().lower()
+                for token in value.split(",")
+                if token.strip()
+            }
 
+    signed = _aws_signed_headers(headers) if preserve_signed else set()
+    signed_transport_headers = {
+        "host",
+        "content-length",
+        "accept-encoding",
+    }
+
+    out: dict[str, str] = {}
+
+    for key, value in items:
+        lower_key = key.lower()
+
+        # `expect` is answered by llmtap itself (100-continue); the body is
+        # re-sent with a Content-Length.
+        if (
+            lower_key in extra
+            or lower_key == "expect"
+            or lower_key.startswith("x-llmtap-")
+        ):
+            continue
+
+        if lower_key in HOP_BY_HOP:
+            keep_signed = (
+                preserve_signed
+                and lower_key in signed
+                and lower_key in signed_transport_headers
+            )
+            if not keep_signed:
+                continue
+
+        out[key] = value
+
+    if not any(key.lower() == "accept-encoding" for key in out):
+        out["accept-encoding"] = "identity"
+
+    return out
 
 def tags_from_headers(headers: Mapping[str, str]) -> dict[str, str]:
     """``X-LLMTap-Tag-Foo: bar`` -> {"foo": "bar"}; ``X-LLMTap-Session: s`` -> {"session": "s"}."""
