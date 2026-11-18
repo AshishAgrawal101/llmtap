@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]   # 77+: SPDX `license` string and `license-files` (PEP 639)
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,11 +8,11 @@ version = "0.2.2"
 description = "The flight recorder & firewall for LLM apps. See, cache, replay, budget and secure every LLM call — zero code changes, zero dependencies."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 keywords = ["llm", "openai", "anthropic", "claude", "proxy", "observability", "cache", "testing", "vcr", "agents", "cost"]
 classifiers = [
   "Programming Language :: Python :: 3",
-  "License :: OSI Approved :: MIT License",
   "Topic :: Software Development :: Testing",
   "Topic :: Software Development :: Debuggers",
 ]
@@ -32,7 +32,7 @@ llmtap = "llmtap.cli:main"
 llmtap = "llmtap.pytest_plugin"
 
 [tool.setuptools]
-packages = ["llmtap"]
+packages = ["llmtap", "llmtap.ui"]
 
 [tool.setuptools.package-data]
 llmtap = ["ui/*"]

@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- Packaging: the license is declared as an SPDX expression (`license = "MIT"`, PEP 639) and the dashboard files as
+  a package, so builds no longer warn and keep working with setuptools releases after February 2027. Building from
+  source needs setuptools 77 or newer; installed files are unchanged.
+
 ## [0.2.2] - 2026-11-18
 
 ### Security
