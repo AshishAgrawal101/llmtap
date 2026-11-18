@@ -64,7 +64,7 @@ llmtap doctor --online   # also HEAD/GET each upstream host (5s timeout)
 ```
 
 ```text
-llmtap doctor · v0.2.1
+llmtap doctor · v0.2.2
 
  ✓ Python 3.13.1
  ✓ Port 4141 is free
