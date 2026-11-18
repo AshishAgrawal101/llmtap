@@ -149,12 +149,14 @@ def _resolve_bedrock_route(
     host_match = _BEDROCK_HOST_RE.fullmatch(host)
     credential_match = _BEDROCK_CREDENTIAL_RE.search(authorization)
 
-    # A Bedrock host is definitive. When the request is sent to a local proxy, a Bedrock SigV4 credential
-    # scope plus a Bedrock path identifies it, and so does a Bedrock Runtime generation path on its own
-    # (Bedrock API keys are plain `Authorization: Bearer` tokens that would otherwise go to OpenAI).
+    # A Bedrock host is definitive (the client addressed AWS). When the request is sent to llmtap itself, a
+    # Bedrock SigV4 credential scope on a Bedrock path identifies it, and so does a Bedrock API key (a Bearer
+    # token that would otherwise go to OpenAI) on a Bedrock Runtime path. Any other credential on a
+    # /model/... path keeps its usual route, so no other provider's key is ever sent to AWS.
     pure_path = path.partition("?")[0]
     signed_runtime_request = credential_match is not None and pure_path.startswith(_BEDROCK_PATH_PREFIXES)
-    if host_match is None and not signed_runtime_request and not _BEDROCK_RUNTIME_PATH.match(pure_path):
+    api_key_request = _is_bedrock_api_key(authorization) and bool(_BEDROCK_RUNTIME_PATH.match(pure_path))
+    if host_match is None and not signed_runtime_request and not api_key_request:
         return None
 
     region = host_match.group(1).lower() if host_match is not None else bedrock_region(headers)
@@ -169,6 +171,14 @@ def _resolve_bedrock_route(
         upstream_path=path,  # Preserve the signed path and query exactly.
         style=str(_bedrock_spec(cfg).get("style") or "bedrock"),
     )
+
+
+def _is_bedrock_api_key(authorization: str) -> bool:
+    """``Authorization: Bearer`` with a Bedrock API key: long-term keys start with ``ABSK``, short-term ones
+    with ``bedrock-api-key-``."""
+    scheme, _, token = (authorization or "").partition(" ")
+    token = token.strip()
+    return scheme.lower() == "bearer" and (token.startswith("ABSK") or token.startswith("bedrock-api-key-"))
 
 
 def _bedrock_spec(cfg: Config | None) -> dict:
@@ -269,14 +279,15 @@ def resolve_route(path: str, headers: Mapping[str, str], cfg: Config) -> Route:
         path = "/" + path
     pure, sep, query = path.partition("?")
 
-    # Native AWS Bedrock Runtime request
-    bedrock = _resolve_bedrock_route(path, headers, cfg)
-    if bedrock is not None:
-        return bedrock
     # 1. explicit prefix: /<name>/rest
     parts = pure.split("/", 2)  # ["", name, rest]
     name = parts[1] if len(parts) > 1 else ""
     upstreams = getattr(cfg, "upstreams", None) or {}
+    # 1b. native AWS Bedrock Runtime request (unless an explicit prefix names an upstream)
+    if not (name and name in upstreams):
+        bedrock = _resolve_bedrock_route(path, headers, cfg)
+        if bedrock is not None:
+            return bedrock
     if name and name in upstreams:
         base, style = _upstream(cfg, name)
         if "{region}" in base:              # e.g. the built-in bedrock upstream
@@ -879,12 +890,24 @@ def decode_eventstream(raw: bytes) -> tuple[list[tuple[dict[str, Any], bytes]], 
     return frames, i
 
 
-def encode_eventstream(headers: Mapping[str, str], payload: bytes) -> bytes:
-    """One EventStream message with string-valued headers (used to replay recorded Bedrock streams)."""
+def encode_eventstream(headers: Mapping[str, Any], payload: bytes) -> bytes:
+    """One EventStream message (used to replay recorded Bedrock streams). Header values may be str, bool or
+    int; raises ValueError for a header name over 255 bytes or a value over 65535 bytes."""
     hb = bytearray()
     for k, v in headers.items():
-        kb, vb = str(k).encode("utf-8"), str(v).encode("utf-8")
-        hb += bytes([len(kb)]) + kb + b"\x07" + struct.pack(">H", len(vb)) + vb
+        kb = str(k).encode("utf-8")
+        if not 0 < len(kb) < 256:
+            raise ValueError(f"EventStream header name too long: {len(kb)} bytes")
+        hb += bytes([len(kb)]) + kb
+        if isinstance(v, bool):
+            hb += b"\x00" if v else b"\x01"
+        elif isinstance(v, int) and -2 ** 63 <= v < 2 ** 63:
+            hb += b"\x05" + struct.pack(">q", v)
+        else:
+            vb = str(v).encode("utf-8")
+            if len(vb) > 0xFFFF:
+                raise ValueError(f"EventStream header value too long: {len(vb)} bytes")
+            hb += b"\x07" + struct.pack(">H", len(vb)) + vb
     prelude = struct.pack(">II", 16 + len(hb) + len(payload), len(hb))
     head = prelude + struct.pack(">I", zlib.crc32(prelude)) + bytes(hb) + payload
     return head + struct.pack(">I", zlib.crc32(head))
@@ -897,21 +920,20 @@ def eventstream_to_text(raw: bytes) -> str:
     frames, used = decode_eventstream(raw)
     lines = []
     for headers, payload in frames:
-        obj: dict[str, Any] = {"headers": {k: v for k, v in headers.items() if isinstance(v, (str, int))}}
+        hdrs = {k: v for k, v in headers.items() if isinstance(v, (str, int))}      # bool is an int too
         try:
+            obj: dict[str, Any] = {"headers": hdrs}
             p = json.loads(payload.decode("utf-8")) if payload else None
-        except (UnicodeDecodeError, ValueError):
-            obj["payload_b64"] = base64.b64encode(payload).decode("ascii")
+            if isinstance(p, dict) and isinstance(p.get("bytes"), str):
+                try:
+                    obj["chunk"] = json.loads(base64.b64decode(p["bytes"], validate=True).decode("utf-8"))
+                    p = {k: v for k, v in p.items() if k != "bytes"}
+                except (binascii.Error, ValueError, RecursionError):
+                    pass
+            obj["payload"] = p
             lines.append(json.dumps(obj, ensure_ascii=False))
-            continue
-        if isinstance(p, dict) and isinstance(p.get("bytes"), str):
-            try:
-                obj["chunk"] = json.loads(base64.b64decode(p["bytes"], validate=True).decode("utf-8"))
-                p = {k: v for k, v in p.items() if k != "bytes"}
-            except (binascii.Error, UnicodeDecodeError, ValueError):
-                pass
-        obj["payload"] = p
-        lines.append(json.dumps(obj, ensure_ascii=False))
+        except (ValueError, RecursionError):    # not JSON, or nested too deeply to parse: keep the raw bytes
+            lines.append(json.dumps({"headers": hdrs, "payload_b64": base64.b64encode(payload).decode("ascii")}))
     if used < len(raw):
         lines.append(json.dumps({"llmtap": f"undecodable or incomplete EventStream data: {len(raw) - used} bytes"}))
     return "\n".join(lines)
@@ -921,21 +943,22 @@ def text_to_eventstream(text: str) -> list[bytes]:
     """EventStream messages rebuilt from :func:`eventstream_to_text` output (one bytes object per message)."""
     out: list[bytes] = []
     for line in (text or "").splitlines():
-        try:
+        try:   # a line a person edited badly (cassettes are plain files) is skipped, never a crash
             obj = json.loads(line)
-        except ValueError:
+            if not isinstance(obj, dict) or not isinstance(obj.get("headers"), dict):
+                continue
+            if isinstance(obj.get("payload_b64"), str):
+                payload = base64.b64decode(obj["payload_b64"], validate=True)
+            else:
+                p = obj.get("payload")
+                if "chunk" in obj:
+                    inner = json.dumps(obj["chunk"], ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                    p = {**_dict(p), "bytes": base64.b64encode(inner).decode("ascii")}
+                payload = (b"" if p is None
+                           else json.dumps(p, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            out.append(encode_eventstream(obj["headers"], payload))
+        except (ValueError, TypeError, RecursionError, binascii.Error):
             continue
-        if not isinstance(obj, dict) or not isinstance(obj.get("headers"), dict):
-            continue
-        if isinstance(obj.get("payload_b64"), str):
-            payload = base64.b64decode(obj["payload_b64"])
-        else:
-            p = obj.get("payload")
-            if "chunk" in obj:
-                inner = json.dumps(obj["chunk"], ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-                p = {**_dict(p), "bytes": base64.b64encode(inner).decode("ascii")}
-            payload = b"" if p is None else json.dumps(p, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        out.append(encode_eventstream({str(k): str(v) for k, v in obj["headers"].items()}, payload))
     return out
 
 
@@ -950,7 +973,10 @@ def parse_bedrock_stream(text: str) -> tuple[Usage, str, str | None, str | None]
     for line in (text or "").splitlines():
         try:
             obj = json.loads(line)
-        except ValueError:
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(obj, dict) and isinstance(obj.get("llmtap"), str) and err is None:
+            err = "incomplete or corrupt AWS EventStream response"     # see eventstream_to_text
             continue
         if not isinstance(obj, dict) or not isinstance(obj.get("headers"), dict):
             continue

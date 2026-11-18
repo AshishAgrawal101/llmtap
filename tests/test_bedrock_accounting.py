@@ -439,3 +439,96 @@ def test_botocore_sees_llmtap_refusals(btap, client_for):
     err = info.value.response["Error"]
     assert err["Code"] == "llmtap_guard_blocked" and "SigV4" in err["Message"]
     assert not up.requests
+
+
+# ------------------------------------------------------------------------------------------------
+# regressions from review
+# ------------------------------------------------------------------------------------------------
+@pytest.mark.parametrize(("path", "headers", "query", "provider"), [
+    ("/model/foo/invoke", {"x-api-key": "sk-ant-api03-xyz"}, "", "anthropic"),
+    ("/model/foo/invoke", {"x-goog-api-key": "AIzaSyExample"}, "", "gemini"),
+    ("/model/foo/invoke", {}, "?key=AIzaSyExample", "gemini"),
+    ("/model/foo/converse", {"Authorization": "Bearer sk-proj-gateway-key"}, "", "openai"),
+    ("/model/foo/converse", {}, "", "openai"),
+    ("/model/foo/converse", {"Authorization": "Bearer ABSKQmVkcm9jaw"}, "", "bedrock"),
+])
+def test_only_bedrock_credentials_route_a_bare_model_path_to_aws(monkeypatch, path, headers, query, provider):
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    route = resolve_route(path + query, {"Host": "127.0.0.1:4141", **headers}, Config())
+    assert route.provider == provider
+    assert ("amazonaws" in route.upstream_base) == (provider == "bedrock")
+
+
+def test_explicit_prefix_beats_bedrock_detection():
+    cfg = Config()
+    cfg.upstreams["model"] = {"base": "http://my-gateway.internal", "style": "openai"}
+    route = resolve_route("/model/foo/converse", {"Authorization": SIGV4}, cfg)
+    assert (route.provider, route.upstream_base) == ("model", "http://my-gateway.internal")
+
+
+def test_deeply_nested_frame_neither_crashes_nor_cuts_the_stream(btap):
+    deep = encode_eventstream({":event-type": "x", ":message-type": "event"}, b"[" * 100000 + b"]" * 100000)
+    deep_chunk = frame("chunk", {"bytes": base64.b64encode(b"[" * 100000 + b"]" * 100000).decode()})
+    upstream = b"".join(CONVERSE_STREAM) + deep + deep_chunk
+    tap, _ = btap(bedrock_up(lambda h, rec: send(h, 200, {"Content-Type": ES}, upstream)))
+    status, _, body = call(tap, "POST", f"/model/{CLAUDE}/converse-stream", {"messages": MSGS}, sigv4_headers())
+    assert status == 200 and body == upstream
+    ex = last(tap)
+    assert ex.error is None and ex.cost_usd == pytest.approx(EXPECTED) and ex.output_text == "Hello"
+
+
+@pytest.mark.parametrize("bad", [0, 2])
+def test_corrupt_stream_is_an_error_and_never_cached(btap, bad):
+    frames = list(CONVERSE_STREAM)
+    broken = bytearray(frames[bad])
+    broken[-1] ^= 0xFF                               # bad message CRC
+    frames[bad] = bytes(broken)
+    upstream = b"".join(frames)
+    tap, up = btap(bedrock_up(lambda h, rec: send(h, 200, {"Content-Type": ES}, upstream)), cache=True)
+    for _ in range(2):
+        _, h, body = call(tap, "POST", f"/model/{CLAUDE}/converse-stream", {"messages": MSGS}, sigv4_headers())
+        assert body == upstream and h["x-llmtap-source"] == "upstream"
+    assert len(up.requests) == 2
+    assert last(tap, 2).error == "incomplete or corrupt AWS EventStream response"
+
+
+@pytest.mark.parametrize("model", ["us-gov.anthropic.claude-3-5-sonnet-20240620-v1:0",
+                                   "anthropic.claude-3-sonnet-20240229-v1:0:200k"])
+def test_govcloud_and_context_window_ids_are_priced(model):
+    usage = extract_usage("bedrock", {"usage": {"inputTokens": 1_000_000}})
+    assert cost_usd(model, usage, style="bedrock") == pytest.approx(3.0)
+
+
+def test_signed_content_length_cannot_smuggle_a_second_request(btap):
+    import socket
+    import time
+
+    tap, up = btap()
+    smuggled = (b"POST /model/hidden/converse HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                b"Content-Length: 2\r\n\r\n{}")
+    first = b'{"a":1}'
+    body = first + smuggled
+    auth = ("AWS4-HMAC-SHA256 Credential=AKIAEXAMPLE/20261117/us-east-1/bedrock/aws4_request, "
+            "SignedHeaders=content-length;host, Signature=" + "0" * 64)
+    req = (f"POST /model/x/converse HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: {auth}\r\n"
+           f"Content-Type: application/json\r\nContent-Length: {len(first)}\r\nTransfer-Encoding: chunked\r\n\r\n"
+           f"{len(body):x}\r\n").encode() + body + b"\r\n0\r\n\r\n"
+    with socket.create_connection(("127.0.0.1", tap.port), timeout=10) as s:
+        s.sendall(req)
+        s.recv(200)
+    time.sleep(0.5)
+    assert [r["path"] for r in up.requests] in ([], ["/model/x/converse"])
+    assert all(int(r["headers"]["content-length"]) == len(r["raw"]) for r in up.requests)
+
+
+def test_hand_edited_cassette_lines_are_skipped_and_bools_survive():
+    good = eventstream_to_text(encode_eventstream({":event-type": "x", "flag": True, "n": 7}, b"{}"))
+    lines = [good,
+             json.dumps({"headers": {":event-type": "x"}, "payload_b64": "not base64!"}),
+             json.dumps({"headers": {"h" * 300: "x"}, "payload": {}}),
+             json.dumps({"headers": {"big": "v" * 70000}, "payload": {}}),
+             "not json at all"]
+    frames = text_to_eventstream("\n".join(lines))
+    assert len(frames) == 1
+    (h, payload), = decode_eventstream(frames[0])[0]
+    assert h == {":event-type": "x", "flag": True, "n": 7} and payload == b"{}"

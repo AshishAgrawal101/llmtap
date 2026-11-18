@@ -115,8 +115,7 @@ class TestBedrockRoute:
         ],
     )
     def test_similar_hosts_do_not_match(self, cfg, host):
-        # (a Bedrock Runtime path is enough on its own, so use a path that isn't one)
-        route = resolve_route("/v1/chat/completions", {"Host": host}, cfg)
+        route = resolve_route(INVOKE_PATH, {"Host": host}, cfg)
         assert route.provider == "openai"
 
 

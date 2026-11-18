@@ -299,8 +299,10 @@ LONG_CONTEXT: dict[str, tuple[int, dict[str, float]]] = {
 }
 
 _BEDROCK_PREFIX = re.compile(
-    r"^(?:(?:us|eu|apac|au|ca|jp|global)\.)?(?:anthropic|meta|mistral|amazon|cohere|ai21|deepseek|openai|qwen)\."
+    r"^(?:(?:us|us-gov|eu|apac|au|ca|jp|global)\.)?(?:anthropic|meta|mistral|amazon|cohere|ai21|deepseek|openai|qwen)\."
 )
+# Bedrock version / context-window suffixes: "-v1:0", "-v1:0:200k"
+_BEDROCK_VERSION = re.compile(r"(-v\d+):\d+(?::\d+k)?$")
 _CLAUDE_DOT = re.compile(r"(\d)\.(\d)")
 
 
@@ -312,7 +314,10 @@ def _normalize(model: str) -> tuple[str, bool]:
     had_slash = "/" in name
     if had_slash:
         name = name.rstrip("/").rsplit("/", 1)[-1]
-    name = _BEDROCK_PREFIX.sub("", name)
+    if _BEDROCK_PREFIX.match(name):
+        name = _BEDROCK_PREFIX.sub("", name)
+        if name.startswith("claude"):         # Bedrock Claude IDs cost what Anthropic lists
+            name = _BEDROCK_VERSION.sub(lambda m: m.group(1), name)
     if "@" in name:
         name = name.split("@", 1)[0]
     if ":" in name:

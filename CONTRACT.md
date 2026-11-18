@@ -20,13 +20,14 @@ Default port **4141**. Internal routes live under `/_llmtap/` (dashboard + JSON 
 def resolve_route(path: str, headers: Mapping[str, str], cfg: Config) -> Route
 ```
 Routing rules (first match wins):
-0. AWS Bedrock: a bedrock-runtime `Host`, a SigV4 credential scoped to `bedrock` on a `/model/`, `/async-invoke` or
-   `/guardrail/` path, or a `/model/<id>/(invoke|invoke-with-response-stream|converse|converse-stream)` path →
-   provider "bedrock", style "bedrock", path and query unchanged. `{region}` in the base is filled from the Host,
-   the SigV4 scope, a short-term Bedrock API key or AWS_REGION / AWS_DEFAULT_REGION.
 1. Explicit prefix: `/<name>/rest` where `<name>` is a key in `cfg.upstreams` → Route(provider=name,
    upstream_base=cfg.upstreams[name]["base"], upstream_path="/rest" (keep query string), style=that upstream's style).
    e.g. `/openrouter/v1/chat/completions` → base `https://openrouter.ai/api`, path `/v1/chat/completions`.
+1b. AWS Bedrock (no prefix matched): a bedrock-runtime `Host`, a SigV4 credential scoped to `bedrock` on a `/model/`,
+   `/async-invoke` or `/guardrail/` path, or a Bedrock API key (`Bearer ABSK…` / `bedrock-api-key-…`) on a
+   `/model/<id>/(invoke|invoke-with-response-stream|converse|converse-stream)` path → provider "bedrock", style
+   "bedrock", path and query unchanged. `{region}` in the base is filled from the Host, the SigV4 scope, a
+   short-term Bedrock API key or AWS_REGION / AWS_DEFAULT_REGION.
 2. Path starts with `/v1/messages` or `/v1/complete` → anthropic.
 3. Headers contain `x-api-key` or any `anthropic-*` header (case-insensitive) → anthropic.
 4. Google Generative Language shapes (`:generateContent` / `:streamGenerateContent` / `models/<m>:<method>` paths,

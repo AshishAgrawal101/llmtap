@@ -735,6 +735,11 @@ class LLMTap:
             hdrs,
             preserve_signed=route.style == "bedrock",
         )
+        # A signed Content-Length is kept, but it must describe the body actually sent: the client's claim may
+        # not match how its body was framed (chunked) and would let the upstream read a second, unaccounted
+        # request out of it, or wait for bytes that never come.
+        for k in [k for k in fwd if k.lower() == "content-length"]:
+            fwd[k] = str(len(body))
         try:
             try:
                 conn.request(method, full_path, body=body if (body or method in ("POST", "PUT", "PATCH")) else None,
@@ -834,7 +839,10 @@ class LLMTap:
         byte reaches the client (when possible) so a client that immediately sends its next request already
         sees the updated budget / cache."""
         raw = bytes(raw)
-        text, parseable = _decode_response(bytes(raw), encoding, ctype)
+        try:
+            text, parseable = _decode_response(raw, encoding, ctype)
+        except Exception as e:   # never let storage decoding cut off a response that was already relayed
+            text, parseable = f"[response body not stored: {type(e).__name__}, {len(raw)} bytes]", False
         ex.response_body = text
         if client_gone:
             ex.error = "client disconnected"
@@ -942,7 +950,8 @@ class LLMTap:
         usage, out_text, model, err = Usage(), "", None, None
         if parseable:
             try:
-                if streamed and route.style == "bedrock" and text.startswith('{"headers"'):
+                ctype = next((str(v) for k, v in (headers or {}).items() if str(k).lower() == "content-type"), "")
+                if streamed and ctype.split(";")[0].strip().lower() == EVENTSTREAM_CTYPE:
                     usage, out_text, model, err = parse_bedrock_stream(text)
                 elif streamed:
                     usage, out_text, model = parse_sse(route.style, text)

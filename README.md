@@ -254,8 +254,8 @@ style = "openai"          # or "anthropic"
 
 …then use `http://127.0.0.1:4141/vllm/v1`. Without a prefix, requests are routed by shape: `/v1/messages` or an
 `x-api-key` / `anthropic-*` header goes to Anthropic, Gemini-style requests (`:generateContent`, `x-goog-api-key`,
-`?key=`) go to Gemini, Bedrock Runtime calls (`/model/<id>/converse`, ...) go to AWS Bedrock, and everything else
-goes to OpenAI.
+`?key=`) go to Gemini, Bedrock Runtime calls (SigV4-signed, or with a Bedrock API key) go to AWS Bedrock, and
+everything else goes to OpenAI.
 
 ### AWS Bedrock
 
@@ -274,8 +274,9 @@ client.converse(modelId="us.anthropic.claude-sonnet-4-5-20250929-v1:0",
 - **Bedrock API keys** (`AWS_BEARER_TOKEN_BEDROCK`) work too. With a long-term key, start llmtap with `AWS_REGION` set.
 - **`--guard redact`** can't change a signed body without breaking its signature, so a SigV4 request with a secret in it
   is blocked instead. Requests made with an API key are redacted as usual.
-- **Prices:** Claude models cost what Anthropic lists. Other Bedrock models (Nova, Llama, Titan, ...) are recorded with
-  their token counts at $0 unless you add them under `[pricing_overrides]`.
+- **Prices:** Claude models (including inference profiles, ARNs and GovCloud IDs) cost what Anthropic lists. Other
+  Bedrock models get the closest match in `llmtap prices` if there is one (Llama, Mistral), which may differ from
+  Bedrock's rates, or $0 (Nova, Titan). Set the right price under `[pricing_overrides]`.
 - Not yet tried against the real AWS endpoint. With SigV4, llmtap forwards the `Host` value the SDK signed
   (`127.0.0.1:4141`); if AWS rejects that, use a Bedrock API key and let us know in an issue.
 
