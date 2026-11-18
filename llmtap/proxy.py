@@ -34,8 +34,16 @@ from .guard import apply_guard
 from .models import CachedResponse, Exchange, Route, Usage
 from .pricing import cost_usd
 from .providers import (
+    EVENTSTREAM_CTYPE,
+    bedrock_header_usage,
+    bedrock_route_problem,
     body_error,
     error_body,
+    eventstream_to_text,
+    is_bedrock_call,
+    is_sigv4,
+    parse_bedrock_stream,
+    text_to_eventstream,
     estimate_usage,
     extract_text,
     extract_usage,
@@ -244,6 +252,8 @@ def _decode_response(raw: bytes, encoding: str, ctype: str) -> tuple[str, bool]:
                     f"{len(raw)} bytes]"), False
         data = dec
     main = (ctype or "").split(";")[0].strip().lower()
+    if main == EVENTSTREAM_CTYPE:                 # Bedrock streams: binary frames around JSON payloads
+        return eventstream_to_text(data), True
     if main.startswith(_BINARY_PREFIXES) or main in _BINARY_TYPES:
         return f"[binary response body not stored: {main}, {len(data)} bytes]", False
     try:
@@ -276,7 +286,7 @@ _SENSITIVE_QS = frozenset({"key", "api_key", "apikey", "api-key", "token", "acce
 _SENSITIVE_QS_RE = re.compile(r"([?&](?:" + "|".join(sorted(re.escape(k) for k in _SENSITIVE_QS)) + r")=)[^&#]*",
                               re.IGNORECASE)
 _CRED_HEADERS = ("authorization", "proxy-authorization", "x-api-key", "api-key", "x-goog-api-key", "cookie",
-                 "x-auth-token", "openai-api-key", "anthropic-auth-token")
+                 "x-auth-token", "openai-api-key", "anthropic-auth-token", "x-amz-security-token")
 REDACTED = "[REDACTED]"
 
 
@@ -350,7 +360,7 @@ def _is_llm_call(method: str, upstream_path: str) -> bool:
     never cached, budget-checked, loop-checked or priced."""
     if method != "POST":
         return False
-    return bool(_LLM_TAIL.search(upstream_path.split("?", 1)[0].rstrip("/")))
+    return bool(_LLM_TAIL.search(upstream_path.split("?", 1)[0].rstrip("/"))) or is_bedrock_call(upstream_path)
 
 
 def _is_json_doc(body: bytes) -> bool:
@@ -562,7 +572,12 @@ class LLMTap:
             route = resolve_route(path, hdrs, self.cfg)
             style = route.style
             ex.provider, ex.style = route.provider, route.style
-            self._pipeline(ex, route, method, hdrs, body, out, t0)
+            problem = bedrock_route_problem(route, path, hdrs)
+            if problem:
+                ex.source = "error"
+                self._error(out, ex, route.style, 400, problem, "llmtap_bedrock_route")
+            else:
+                self._pipeline(ex, route, method, hdrs, body, out, t0)
         except ClientGone:
             ex.error = ex.error or "client disconnected"
         except Exception as e:  # never let a bug kill the connection silently
@@ -582,7 +597,9 @@ class LLMTap:
                   out: _Tracked, t0: float) -> None:
         cfg = self.cfg
         req = parse_json(body)
-        ex.model = request_model(req) or model_from_path(route.upstream_path)
+        path_model = model_from_path(route.upstream_path)
+        # Bedrock names the model in the URL; its request bodies are model-native and rarely carry one
+        ex.model = (path_model if is_bedrock_call(route.upstream_path) else None) or request_model(req) or path_model
         stream_req = is_stream_request(req)
         ex.tags = tags_from_headers(hdrs)
 
@@ -598,7 +615,10 @@ class LLMTap:
                 mode = "warn"
             send_body, findings, blocked = apply_guard(body, mode, cfg.guard_pii)
             ex.guard_findings = [f.to_dict() if hasattr(f, "to_dict") else dict(f) for f in findings]
-            if blocked:
+            # A SigV4 signature covers the body (and often its length): a redacted body would be rejected by
+            # AWS, or hang waiting for the bytes a signed Content-Length promised. Refuse it instead.
+            signed_rewrite = send_body is not body and is_sigv4(hdrs)
+            if blocked or signed_rewrite:
                 # Never persist the secret we just refused to send: store the redacted body instead.
                 stored_body, _, _ = apply_guard(body, "redact", cfg.guard_pii)
                 ex.request_body, trunc = _decode_request(stored_body, ctype)
@@ -608,6 +628,10 @@ class LLMTap:
                 ex.source = "blocked"
                 msg = (f"llmtap guard blocked this request: detected {kinds} in the prompt. "
                        "Remove the secret, or run llmtap with --guard redact / warn.")
+                if signed_rewrite and not blocked:
+                    msg = (f"llmtap guard blocked this request: detected {kinds} in the prompt. It is signed with "
+                           "AWS SigV4, so redacting it would break the signature. Remove the secret, use a Bedrock "
+                           "API key (Bearer) instead of SigV4, or run llmtap with --guard warn.")
                 self._error(out, ex, route.style, 400, msg, "llmtap_guard_blocked")
                 return
             if send_body is not body:
@@ -683,8 +707,10 @@ class LLMTap:
             out_tokens = 4096
             if isinstance(req, dict):
                 gc = req.get("generationConfig") if isinstance(req.get("generationConfig"), dict) else {}
+                ic = req.get("inferenceConfig") if isinstance(req.get("inferenceConfig"), dict) else {}
                 for v in (req.get("max_tokens"), req.get("max_completion_tokens"), req.get("max_output_tokens"),
-                          gc.get("maxOutputTokens")):
+                          gc.get("maxOutputTokens"), ic.get("maxTokens"), ic.get("max_new_tokens"),
+                          req.get("max_gen_len")):
                     if isinstance(v, int) and v > 0:
                         out_tokens = v
                         break
@@ -817,7 +843,8 @@ class LLMTap:
         if ex.status >= 400 and not ex.error:
             ex.error = _upstream_error_message(text) or f"upstream HTTP {ex.status}"
 
-        in_band_err = self._account(ex, route, req, text, streaming, llm=llm, parseable=parseable)
+        in_band_err = self._account(ex, route, req, text, streaming, llm=llm, parseable=parseable,
+                                    headers=dict((k.lower(), v) for k, v in up_headers))
         ex.cost_usd = self._price(ex) if llm and ex.usage.total() else 0.0  # GETs of stored objects etc. are free
         try:
             self.budget.add_spend(ex.cost_usd)
@@ -868,7 +895,16 @@ class LLMTap:
         h["x-llmtap-source"] = ex.source
         data = stored.body.encode("utf-8")
         try:
-            if ex.streamed:
+            if ex.streamed and h.get("content-type", "").split(";")[0].strip().lower() == EVENTSTREAM_CTYPE:
+                # a recorded Bedrock stream: rebuild the binary EventStream frames from the stored JSON lines
+                h["Transfer-Encoding"] = "chunked"
+                out.start(ex.status, h)
+                for i, frame in enumerate(text_to_eventstream(stored.body)):
+                    out.write(frame)
+                    if i == 0:
+                        ex.ttft_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+                out.end()
+            elif ex.streamed:
                 h["content-type"] = h.get("content-type") or "text/event-stream"
                 if "event-stream" not in h["content-type"] and "ndjson" not in h["content-type"]:
                     h["content-type"] = "text/event-stream"
@@ -893,11 +929,11 @@ class LLMTap:
         except ClientGone:
             ex.error = "client disconnected"
             out.abort()
-        self._account(ex, route, req, stored.body, ex.streamed)
+        self._account(ex, route, req, stored.body, ex.streamed, headers=h)
 
     # ---------------------------------------------------------------- accounting
     def _account(self, ex: Exchange, route: Route, req: dict | None, text: str, streamed: bool,
-                 llm: bool = True, parseable: bool = True) -> str | None:
+                 llm: bool = True, parseable: bool = True, headers: Mapping[str, str] | None = None) -> str | None:
         """Fill usage / output_text / model from a response body (never raises).
 
         Returns an in-band error message (stream ``error`` event, or HTTP 200 with an ``error`` body) if any.
@@ -906,7 +942,9 @@ class LLMTap:
         usage, out_text, model, err = Usage(), "", None, None
         if parseable:
             try:
-                if streamed:
+                if streamed and route.style == "bedrock" and text.startswith('{"headers"'):
+                    usage, out_text, model, err = parse_bedrock_stream(text)
+                elif streamed:
                     usage, out_text, model = parse_sse(route.style, text)
                     err = sse_error(text)
                 else:
@@ -929,6 +967,8 @@ class LLMTap:
                         out_text = "".join(extract_text(route.style, c) or "" for c in chunks)
             except Exception:
                 pass
+        if route.style == "bedrock" and not usage.total():
+            usage = bedrock_header_usage(headers)        # InvokeModel reports token counts in headers
         ok = 200 <= ex.status < 300
         if err and ok:
             ex.error = ex.error or err

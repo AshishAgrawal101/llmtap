@@ -104,14 +104,21 @@ Built in. Any of these can be overridden in the config file, and new ones added:
 | `deepseek` | `https://api.deepseek.com` | `openai` |
 | `ollama` | `http://localhost:11434` | `openai` |
 | `gemini` | `https://generativelanguage.googleapis.com` | `gemini` |
+| `bedrock` | `https://bedrock-runtime.{region}.amazonaws.com` | `bedrock` |
 
-`style` (`openai`, `anthropic` or `gemini`) tells llmtap which wire format to expect, for usage parsing and for the shape
+`style` (`openai`, `anthropic`, `gemini` or `bedrock`) tells llmtap which wire format to expect, for usage parsing and for the shape
 of its own error responses. Use `openai` for any OpenAI-compatible server (vLLM, LM Studio, llama.cpp server, TGI, LiteLLM proxy…).
 
 ### Routing rules
 
 For each request, the first matching rule wins:
 
+0. **AWS Bedrock** → `bedrock`: a `Host` of `bedrock-runtime.<region>.amazonaws.com` (or its FIPS, dual-stack or
+   China variants), a SigV4 `Authorization` scoped to the `bedrock` service on a `/model/…`, `/async-invoke` or
+   `/guardrail/…` path, or a Bedrock Runtime generation path (`/model/<id>/invoke`, `invoke-with-response-stream`,
+   `converse`, `converse-stream`) whatever the credentials. The path and query are forwarded unchanged, and so are
+   the headers a SigV4 signature covers. `{region}` in the base comes from the `Host`, the signature, a short-term
+   Bedrock API key, or `AWS_REGION` / `AWS_DEFAULT_REGION`; without one llmtap answers 400.
 1. **Explicit prefix.** `/<name>/rest` where `<name>` is a configured upstream → `<base>/rest` (query string kept).
    `/openrouter/v1/chat/completions` → `https://openrouter.ai/api/v1/chat/completions`.
 2. Path starts with `/v1/messages` or `/v1/complete` → `anthropic`.

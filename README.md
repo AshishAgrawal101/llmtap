@@ -76,7 +76,7 @@ Every request and response, streaming included, in a local web UI. Search prompt
 <td width="33%" valign="top">
 
 **💸 Exact cost tracking**<br>
-Per-call USD cost from reported token usage (including prompt-cache reads and writes) for Claude, GPT, o-series, Gemini-via-OpenRouter, Llama, DeepSeek and more.
+Per-call USD cost from reported token usage (including prompt-cache reads and writes) for Claude (direct or on AWS Bedrock), GPT, o-series, Gemini, Llama, DeepSeek and more.
 
 </td>
 <td width="33%" valign="top">
@@ -254,11 +254,34 @@ style = "openai"          # or "anthropic"
 
 …then use `http://127.0.0.1:4141/vllm/v1`. Without a prefix, requests are routed by shape: `/v1/messages` or an
 `x-api-key` / `anthropic-*` header goes to Anthropic, Gemini-style requests (`:generateContent`, `x-goog-api-key`,
-`?key=`) go to Gemini, and everything else goes to OpenAI.
+`?key=`) go to Gemini, Bedrock Runtime calls (`/model/<id>/converse`, ...) go to AWS Bedrock, and everything else
+goes to OpenAI.
+
+### AWS Bedrock
+
+Point the AWS SDK's `endpoint_url` at llmtap's root URL. `InvokeModel`, `Converse` and their streaming versions are
+recorded, priced, budget- and loop-checked, cached and written to cassettes like any other LLM call.
+
+```python
+import boto3
+client = boto3.client("bedrock-runtime", region_name="us-east-1", endpoint_url="http://127.0.0.1:4141")
+client.converse(modelId="us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+                messages=[{"role": "user", "content": [{"text": "hi"}]}])
+```
+
+- **SigV4-signed requests** are forwarded byte-for-byte, and llmtap reads the region from the signature. Use the root
+  URL, not `/bedrock/`: the signature covers the path.
+- **Bedrock API keys** (`AWS_BEARER_TOKEN_BEDROCK`) work too. With a long-term key, start llmtap with `AWS_REGION` set.
+- **`--guard redact`** can't change a signed body without breaking its signature, so a SigV4 request with a secret in it
+  is blocked instead. Requests made with an API key are redacted as usual.
+- **Prices:** Claude models cost what Anthropic lists. Other Bedrock models (Nova, Llama, Titan, ...) are recorded with
+  their token counts at $0 unless you add them under `[pricing_overrides]`.
+- Not yet tried against the real AWS endpoint. With SigV4, llmtap forwards the `Host` value the SDK signed
+  (`127.0.0.1:4141`); if AWS rejects that, use a Bedrock API key and let us know in an issue.
 
 ### Tagging requests
 
-Group traffic by run, user or feature with headers. llmtap strips every `X-LLMTap-*` header before forwarding, so the provider never sees them.
+Group traffic by run, user or feature with headers. llmtap strips every `X-LLMTap-*` header before forwarding, so the provider never sees them (except one an AWS SigV4 signature covers, which has to reach AWS unchanged).
 
 | Header | Becomes tag |
 |---|---|
@@ -542,8 +565,8 @@ by base URL, and llmtap makes a normal, verified HTTPS request upstream. Tools t
 <details>
 <summary><b>Which models are priced?</b></summary>
 
-Claude (3.x, 4.x, 4.5, 5 families), GPT-4o / 4.1 / 5 families, o1 / o3 / o4-mini, OpenAI embeddings, Gemini via OpenRouter, and
-common Llama / Mixtral / DeepSeek names. Local models (Ollama) are $0. Run `llmtap prices` to see the table, and
+Claude (3.x, 4.x, 4.5, 5 families, also as AWS Bedrock model IDs and inference profiles), GPT-4o / 4.1 / 5 families, o1 / o3 / o4-mini,
+OpenAI embeddings, Gemini, and common Llama / Mixtral / DeepSeek names. Local models (Ollama) are $0. Run `llmtap prices` to see the table, and
 add or override prices under `[pricing_overrides]` in `llmtap.toml`. Unknown models are recorded with cost $0.
 
 Costs follow what the response reports: long-prompt rate cards (Claude Haiku 5.5 above 100K tokens, Gemini Pro above

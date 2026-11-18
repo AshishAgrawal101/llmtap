@@ -11,7 +11,7 @@ client ──HTTP──▶ ThreadingHTTPServer ──▶ LLMTap.handle(method, p
              path starts with /_llmtap/ ─────┼──▶ dashboard.handle_internal()  (UI + JSON API + SSE)
              GET / (no route) ───────────────┼──▶ 302 → /_llmtap/
                                              ▼
-   1. providers.resolve_route()     which upstream? (/<name>/ prefix, /v1/messages or anthropic headers, Gemini, else openai)
+   1. providers.resolve_route()     which upstream? (Bedrock, /<name>/ prefix, /v1/messages or anthropic headers, Gemini, else openai)
    2. providers.parse_json()        model, stream flag
    3. providers.tags_from_headers() X-LLMTap-Session / X-LLMTap-Tag-*  (stripped before forwarding)
    4. guard.apply_guard()           off | warn | redact | block ──▶ 400 provider-shaped error, source="blocked"

@@ -12,10 +12,16 @@ rewritten.
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import json
+import os
 import re
+import struct
+import zlib
 from collections.abc import Mapping
 from typing import Any
+from urllib.parse import unquote
 
 from .config import Config
 from .models import Route, Usage
@@ -45,22 +51,28 @@ _SIGNED_HEADERS_RE = re.compile(
 )
 
 # Amazon Bedrock host and credential regexes, for routing and model extraction.
+_AWS_REGION = r"[a-z]{2}(?:-[a-z]+){1,2}-\d{1,2}"       # us-east-1, us-gov-west-1, ap-southeast-2, cn-north-1
 _BEDROCK_HOST_RE = re.compile(
     r"^bedrock-runtime(?:-fips)?"
-    r"\.([a-z0-9-]+)"
-    r"\.(amazonaws\.com(?:\.cn)?|api\.aws)"
-    r"(?::\d+)?$",
+    rf"\.({_AWS_REGION})"
+    r"\.(amazonaws\.com(?:\.cn)?|api\.aws)$",
     re.IGNORECASE,
 )
 
 _BEDROCK_CREDENTIAL_RE = re.compile(
     r"Credential=[^/\s,]+"
     r"/\d{8}"
-    r"/([a-z0-9-]+)"
+    rf"/({_AWS_REGION})"
     r"/bedrock"
     r"/aws4_request",
     re.IGNORECASE,
 )
+
+# The Bedrock Runtime generation calls: InvokeModel, InvokeModelWithResponseStream, Converse, ConverseStream.
+_BEDROCK_RUNTIME_PATH = re.compile(
+    r"^/model/([^/?#]+)/(invoke|invoke-with-response-stream|converse|converse-stream)$")
+_BEDROCK_PATH_PREFIXES = ("/model/", "/async-invoke", "/guardrail/")
+BEDROCK_DEFAULT_BASE = "https://bedrock-runtime.{region}.amazonaws.com"
 
 _VERSION_SEG = re.compile(r"^/v\d+(?:[a-z0-9]*)?(?:[/?#]|$)")
 _BASE_ENDS_WITH_VERSION = re.compile(r"/v\d+[a-z0-9]*$")
@@ -137,51 +149,96 @@ def _resolve_bedrock_route(
     host_match = _BEDROCK_HOST_RE.fullmatch(host)
     credential_match = _BEDROCK_CREDENTIAL_RE.search(authorization)
 
-    # A Bedrock host is definitive. When the request is sent to a local
-    # proxy, identify it using both the Bedrock credential scope and its
-    # native runtime path.
+    # A Bedrock host is definitive. When the request is sent to a local proxy, a Bedrock SigV4 credential
+    # scope plus a Bedrock path identifies it, and so does a Bedrock Runtime generation path on its own
+    # (Bedrock API keys are plain `Authorization: Bearer` tokens that would otherwise go to OpenAI).
     pure_path = path.partition("?")[0]
-    signed_runtime_request = (
-        credential_match is not None
-        and pure_path.startswith("/model/")
-    )
-
-    if host_match is None and not signed_runtime_request:
+    signed_runtime_request = credential_match is not None and pure_path.startswith(_BEDROCK_PATH_PREFIXES)
+    if host_match is None and not signed_runtime_request and not _BEDROCK_RUNTIME_PATH.match(pure_path):
         return None
 
-    region = ""
-
-    if host_match is not None:
-        region = host_match.group(1).lower()
-    elif credential_match is not None:
-        region = credential_match.group(1).lower()
-
-    if not region:
-        return None
-
-    upstreams = getattr(cfg, "upstreams", None) or {}
-    spec = upstreams.get("bedrock") or {}
-
-    default_template = "https://bedrock-runtime.{region}.amazonaws.com"
-    base_template = str(spec.get("base") or default_template).rstrip("/")
-
-    # Keep the exact AWS endpoint variant because Host participates in SigV4.
-    if host_match is not None and base_template == default_template:
+    region = host_match.group(1).lower() if host_match is not None else bedrock_region(headers)
+    base = bedrock_base(cfg, region)
+    # Keep the exact AWS endpoint variant (FIPS, dual-stack, China) because Host participates in SigV4.
+    if host_match is not None and _bedrock_spec(cfg).get("base") in (None, "", BEDROCK_DEFAULT_BASE):
         base = f"https://{host.lower()}"
-    else:
-        try:
-            base = base_template.format(region=region)
-        except (KeyError, ValueError):
-            base = base_template
-
-    style = str(spec.get("style") or "bedrock")
 
     return Route(
         provider="bedrock",
         upstream_base=base,
         upstream_path=path,  # Preserve the signed path and query exactly.
-        style=style,
+        style=str(_bedrock_spec(cfg).get("style") or "bedrock"),
     )
+
+
+def _bedrock_spec(cfg: Config | None) -> dict:
+    try:
+        return dict((getattr(cfg, "upstreams", None) or {}).get("bedrock") or {})
+    except Exception:
+        return {}
+
+
+def bedrock_base(cfg: Config | None, region: str) -> str:
+    """The Bedrock upstream base for ``region``. Without a region the ``{region}`` placeholder stays in the
+    result, and the proxy answers with an error that says how to set one."""
+    return _with_region(str(_bedrock_spec(cfg).get("base") or BEDROCK_DEFAULT_BASE).rstrip("/"), region)
+
+
+def _with_region(template: str, region: str) -> str:
+    if not region or "{region}" not in template:
+        return template
+    if template == BEDROCK_DEFAULT_BASE and region.startswith("cn-"):
+        template += ".cn"                                  # China regions live under amazonaws.com.cn
+    try:
+        return template.format(region=region)
+    except (KeyError, IndexError, ValueError):
+        return template
+
+
+def bedrock_region(headers: Mapping[str, str] | None) -> str:
+    """The AWS region of a Bedrock request sent to llmtap itself: the SigV4 credential scope, else the region
+    inside a short-term Bedrock API key, else ``AWS_REGION`` / ``AWS_DEFAULT_REGION``; "" when unknown."""
+    authorization = _header_value(headers, "authorization")
+    m = _BEDROCK_CREDENTIAL_RE.search(authorization)
+    if m:
+        return m.group(1).lower()
+    scheme, _, token = authorization.partition(" ")
+    token = token.strip()
+    if scheme.lower() == "bearer" and token.startswith("bedrock-api-key-"):
+        # Short-term keys are a base64-encoded presigned URL that carries X-Amz-Credential=<id>/<date>/<region>/...
+        try:
+            raw = token[len("bedrock-api-key-"):]
+            url = unquote(base64.b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8", "replace"))
+            m = re.search(rf"X-Amz-Credential=[^/&\s]+/\d{{8}}/({_AWS_REGION})/bedrock/", url, re.IGNORECASE)
+            if m:
+                return m.group(1).lower()
+        except (binascii.Error, ValueError):
+            pass
+    for var in ("AWS_REGION", "AWS_DEFAULT_REGION"):
+        v = (os.environ.get(var) or "").strip().lower()
+        if re.fullmatch(_AWS_REGION, v):
+            return v
+    return ""
+
+
+def is_sigv4(headers: Mapping[str, str] | None) -> bool:
+    """True when the request is signed with AWS Signature Version 4 (the body and signed headers are frozen)."""
+    return _header_value(headers, "authorization").upper().startswith("AWS4-HMAC-SHA256")
+
+
+def bedrock_route_problem(route: Route, client_path: str, headers: Mapping[str, str] | None) -> str | None:
+    """Why a Bedrock request can't be forwarded as routed (an error message), or None when it can."""
+    if route.provider != "bedrock" and route.style != "bedrock":
+        return None
+    if "{region}" in route.upstream_base:
+        return ("llmtap can't tell which AWS region this Bedrock call is for. Start llmtap with AWS_REGION set "
+                "(e.g. AWS_REGION=us-east-1), or set [upstreams.bedrock] base in llmtap.toml.")
+    pure = (client_path or "").partition("?")[0]
+    if is_sigv4(headers) and pure != route.upstream_path.partition("?")[0]:
+        return ("This request is signed with AWS SigV4, which covers the URL path, so llmtap can't remove the "
+                "/bedrock/ prefix without breaking the signature. Point the AWS SDK at llmtap's root URL "
+                "(endpoint_url=http://127.0.0.1:4141) instead.")
+    return None
 
 def upstream_path_for(provider: str, path: str, cfg: Config | None = None) -> str:
     """The upstream path the proxy sent for a request it recorded as (``provider``, client ``path``): strips a
@@ -222,6 +279,8 @@ def resolve_route(path: str, headers: Mapping[str, str], cfg: Config) -> Route:
     upstreams = getattr(cfg, "upstreams", None) or {}
     if name and name in upstreams:
         base, style = _upstream(cfg, name)
+        if "{region}" in base:              # e.g. the built-in bedrock upstream
+            base = _with_region(base, bedrock_region(headers))
         rest = "/" + (parts[2] if len(parts) > 2 else "")
         up_path = rest + (sep + query if sep else "")
         if style == "openai":
@@ -295,8 +354,17 @@ def model_from_path(path: str | None) -> str | None:
     Gemini carries the model in the URL rather than the request body."""
     if not isinstance(path, str):
         return None
-    m = _PATH_MODEL_RE.search(path.split("?", 1)[0])
+    pure = path.split("?", 1)[0]
+    b = _BEDROCK_RUNTIME_PATH.match(pure)
+    if b:   # Bedrock: /model/<id or URL-encoded ARN>/converse
+        return unquote(b.group(1)) or None
+    m = _PATH_MODEL_RE.search(pure)
     return m.group(1) if m else None
+
+
+def is_bedrock_call(path: str | None) -> bool:
+    """True for the four Bedrock Runtime generation calls (invoke / converse, streaming or not)."""
+    return isinstance(path, str) and bool(_BEDROCK_RUNTIME_PATH.match(path.split("?", 1)[0]))
 
 
 
@@ -330,13 +398,17 @@ def _dict(v: Any) -> dict:
 def _usage_from_dict(u: Any) -> Usage:
     """Map any provider's usage object onto Usage (anthropic, openai chat, responses, embeddings)."""
     u = _dict(u)
-    inp = u.get("input_tokens")
-    if inp is None:
-        inp = u.get("prompt_tokens")
-    out = u.get("output_tokens")
-    if out is None:
-        out = u.get("completion_tokens")
-    cache_read = u.get("cache_read_input_tokens")
+
+    def first(*names: str) -> Any:
+        for n in names:
+            if u.get(n) is not None:
+                return u[n]
+        return None
+
+    # snake_case: Anthropic / OpenAI; camelCase: Bedrock Converse (and Nova's InvokeModel *Count variants)
+    inp = first("input_tokens", "prompt_tokens", "inputTokens")
+    out = first("output_tokens", "completion_tokens", "outputTokens")
+    cache_read = first("cache_read_input_tokens", "cacheReadInputTokens", "cacheReadInputTokenCount")
     if cache_read is None:
         cache_read = _dict(u.get("prompt_tokens_details")).get("cached_tokens")
     if cache_read is None:
@@ -346,7 +418,8 @@ def _usage_from_dict(u: Any) -> Usage:
         input_tokens=_int(inp),
         output_tokens=_int(out),
         cache_read_tokens=_int(cache_read),
-        cache_write_tokens=_int(u.get("cache_creation_input_tokens")),
+        cache_write_tokens=_int(first("cache_creation_input_tokens", "cacheWriteInputTokens",
+                                      "cacheWriteInputTokenCount")),
         cache_write_1h_tokens=_int(_dict(u.get("cache_creation")).get("ephemeral_1h_input_tokens")),
         speed=speed if isinstance(speed, str) else "",
         web_search_requests=_int(_dict(u.get("server_tool_use")).get("web_search_requests")),
@@ -368,7 +441,11 @@ def extract_usage(style: str, resp: dict) -> Usage:
     """Token usage from a non-streaming response JSON. Missing fields -> 0."""
     if not isinstance(resp, dict):
         return Usage()
-    if "usageMetadata" in resp or style=="gemini": 
+    if style == "bedrock":
+        b = _bedrock_usage(resp)
+        if b.total():
+            return b
+    if "usageMetadata" in resp or style=="gemini":
         meta = resp.get("usageMetadata")
         if isinstance(meta,dict):
             return _gemini_usage(meta)
@@ -380,6 +457,51 @@ def extract_usage(style: str, resp: dict) -> Usage:
     if isinstance(tier, str):
         u.service_tier = tier
     return u
+
+
+def _bedrock_usage(resp: dict) -> Usage:
+    """Usage from a Bedrock response body: Converse / Claude / Nova ``usage``, else the per-model InvokeModel
+    fields (Llama, Titan), else ``amazon-bedrock-invocationMetrics`` (the last chunk of a stream)."""
+    if isinstance(resp.get("usage"), dict):
+        u = _usage_from_dict(resp["usage"])
+        if u.total():
+            return u
+    if "prompt_token_count" in resp or "generation_token_count" in resp:            # Meta Llama
+        return Usage(input_tokens=_int(resp.get("prompt_token_count")),
+                     output_tokens=_int(resp.get("generation_token_count")))
+    if "inputTextTokenCount" in resp:                                                # Amazon Titan Text
+        results = resp.get("results") if isinstance(resp.get("results"), list) else []
+        return Usage(input_tokens=_int(resp.get("inputTextTokenCount")),
+                     output_tokens=sum(_int(_dict(r).get("tokenCount")) for r in results))
+    m = _dict(resp.get("amazon-bedrock-invocationMetrics"))
+    return Usage(input_tokens=_int(m.get("inputTokenCount")), output_tokens=_int(m.get("outputTokenCount")),
+                 cache_read_tokens=_int(m.get("cacheReadInputTokenCount")),
+                 cache_write_tokens=_int(m.get("cacheWriteInputTokenCount")))
+
+
+def bedrock_header_usage(headers: Mapping[str, str] | None) -> Usage:
+    """Usage from the ``X-Amzn-Bedrock-*-Token-Count`` headers InvokeModel returns for every model."""
+    def h(name: str) -> int:
+        return _int(_header_value(headers, f"x-amzn-bedrock-{name}"))
+    return Usage(input_tokens=h("input-token-count"), output_tokens=h("output-token-count"),
+                 cache_read_tokens=h("cache-read-input-token-count"),
+                 cache_write_tokens=h("cache-write-input-token-count"))
+
+
+def _bedrock_text(resp: dict) -> str:
+    """Assistant text of a Bedrock response: Converse / Nova ``output.message``, or a model-native body."""
+    msg = _dict(_dict(resp.get("output")).get("message"))
+    if isinstance(msg.get("content"), list):
+        return "".join(b["text"] for b in msg["content"] if isinstance(b, dict) and isinstance(b.get("text"), str))
+    if isinstance(resp.get("generation"), str):                                      # Meta Llama
+        return resp["generation"]
+    for key, field in (("results", "outputText"), ("outputs", "text"), ("generations", "text")):
+        items = resp.get(key)                                                        # Titan / Mistral / Cohere
+        if isinstance(items, list) and items and isinstance(_dict(items[0]).get(field), str):
+            return "".join(_dict(i).get(field) or "" for i in items[:1])
+    if isinstance(resp.get("completion"), str):                                      # Claude text completions
+        return resp["completion"]
+    return ""
 
 
 def _anthropic_text(content: Any) -> str:
@@ -458,6 +580,10 @@ def extract_text(style: str, resp: dict) -> str:
     if not isinstance(resp, dict):
         return ""
     try:
+        if style == "bedrock":
+            t = _bedrock_text(resp)
+            if t:
+                return t
         if "choices" in resp:
             return _openai_chat_text(resp)
         if "output" in resp or "output_text" in resp:
@@ -692,6 +818,189 @@ def sse_error(raw: str) -> str | None:
 
 
 # --------------------------------------------------------------------------------------------
+# AWS EventStream (Bedrock's streaming responses)
+# --------------------------------------------------------------------------------------------
+EVENTSTREAM_CTYPE = "application/vnd.amazon.eventstream"
+_ES_MAX_MESSAGE = 16 * 1024 * 1024
+_ES_FIXED = {2: 1, 3: 2, 4: 4, 5: 8, 8: 8, 9: 16}    # value widths of the fixed-size header types
+
+
+def _es_headers(buf: bytes) -> dict[str, Any] | None:
+    out: dict[str, Any] = {}
+    i = 0
+    try:
+        while i < len(buf):
+            nlen = buf[i]
+            name = buf[i + 1:i + 1 + nlen].decode("utf-8")
+            i += 1 + nlen
+            t = buf[i]
+            i += 1
+            val: Any
+            if t in (0, 1):                       # bool true / false
+                val = t == 0
+            elif t in (6, 7):                     # bytes / string, 2-byte length
+                (vlen,) = struct.unpack_from(">H", buf, i)
+                raw = buf[i + 2:i + 2 + vlen]
+                i += 2 + vlen
+                val = raw.decode("utf-8", "replace") if t == 7 else raw
+            elif t in _ES_FIXED:
+                raw = buf[i:i + _ES_FIXED[t]]
+                i += _ES_FIXED[t]
+                val = raw.hex() if t == 9 else int.from_bytes(raw, "big", signed=True)
+            else:
+                return None
+            if i > len(buf):
+                return None
+            out[name] = val
+    except (IndexError, struct.error, UnicodeDecodeError):
+        return None
+    return out
+
+
+def decode_eventstream(raw: bytes) -> tuple[list[tuple[dict[str, Any], bytes]], int]:
+    """Split AWS EventStream bytes into (headers, payload) messages, checking both CRC32s. Returns the messages
+    and the number of bytes used: decoding stops at a partial trailing message or the first corrupt one."""
+    frames: list[tuple[dict[str, Any], bytes]] = []
+    i, n = 0, len(raw)
+    while n - i >= 16:
+        total, hlen, prelude_crc = struct.unpack_from(">III", raw, i)
+        if zlib.crc32(raw[i:i + 8]) != prelude_crc or total < 16 + hlen or total > _ES_MAX_MESSAGE:
+            break
+        if i + total > n:
+            break
+        (msg_crc,) = struct.unpack_from(">I", raw, i + total - 4)
+        if zlib.crc32(raw[i:i + total - 4]) != msg_crc:
+            break
+        headers = _es_headers(raw[i + 12:i + 12 + hlen])
+        if headers is None:
+            break
+        frames.append((headers, raw[i + 12 + hlen:i + total - 4]))
+        i += total
+    return frames, i
+
+
+def encode_eventstream(headers: Mapping[str, str], payload: bytes) -> bytes:
+    """One EventStream message with string-valued headers (used to replay recorded Bedrock streams)."""
+    hb = bytearray()
+    for k, v in headers.items():
+        kb, vb = str(k).encode("utf-8"), str(v).encode("utf-8")
+        hb += bytes([len(kb)]) + kb + b"\x07" + struct.pack(">H", len(vb)) + vb
+    prelude = struct.pack(">II", 16 + len(hb) + len(payload), len(hb))
+    head = prelude + struct.pack(">I", zlib.crc32(prelude)) + bytes(hb) + payload
+    return head + struct.pack(">I", zlib.crc32(head))
+
+
+def eventstream_to_text(raw: bytes) -> str:
+    """Readable JSON-lines form of a Bedrock event stream, one ``{"headers": ..., "payload": ...}`` per message.
+    The base64 ``bytes`` of an InvokeModelWithResponseStream ``chunk`` is decoded into ``"chunk"``.
+    :func:`text_to_eventstream` turns it back into EventStream bytes for replay."""
+    frames, used = decode_eventstream(raw)
+    lines = []
+    for headers, payload in frames:
+        obj: dict[str, Any] = {"headers": {k: v for k, v in headers.items() if isinstance(v, (str, int))}}
+        try:
+            p = json.loads(payload.decode("utf-8")) if payload else None
+        except (UnicodeDecodeError, ValueError):
+            obj["payload_b64"] = base64.b64encode(payload).decode("ascii")
+            lines.append(json.dumps(obj, ensure_ascii=False))
+            continue
+        if isinstance(p, dict) and isinstance(p.get("bytes"), str):
+            try:
+                obj["chunk"] = json.loads(base64.b64decode(p["bytes"], validate=True).decode("utf-8"))
+                p = {k: v for k, v in p.items() if k != "bytes"}
+            except (binascii.Error, UnicodeDecodeError, ValueError):
+                pass
+        obj["payload"] = p
+        lines.append(json.dumps(obj, ensure_ascii=False))
+    if used < len(raw):
+        lines.append(json.dumps({"llmtap": f"undecodable or incomplete EventStream data: {len(raw) - used} bytes"}))
+    return "\n".join(lines)
+
+
+def text_to_eventstream(text: str) -> list[bytes]:
+    """EventStream messages rebuilt from :func:`eventstream_to_text` output (one bytes object per message)."""
+    out: list[bytes] = []
+    for line in (text or "").splitlines():
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict) or not isinstance(obj.get("headers"), dict):
+            continue
+        if isinstance(obj.get("payload_b64"), str):
+            payload = base64.b64decode(obj["payload_b64"])
+        else:
+            p = obj.get("payload")
+            if "chunk" in obj:
+                inner = json.dumps(obj["chunk"], ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                p = {**_dict(p), "bytes": base64.b64encode(inner).decode("ascii")}
+            payload = b"" if p is None else json.dumps(p, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        out.append(encode_eventstream({str(k): str(v) for k, v in obj["headers"].items()}, payload))
+    return out
+
+
+def parse_bedrock_stream(text: str) -> tuple[Usage, str, str | None, str | None]:
+    """(usage, text, model, error) from :func:`eventstream_to_text` output. Handles ConverseStream events and
+    InvokeModelWithResponseStream chunks: Claude's Messages events, Nova, Llama, Titan and Mistral chunks, and
+    the ``amazon-bedrock-invocationMetrics`` of the last chunk."""
+    usage, metrics = Usage(), Usage()
+    parts: list[str] = []
+    claude: list[dict] = []
+    err: str | None = None
+    for line in (text or "").splitlines():
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict) or not isinstance(obj.get("headers"), dict):
+            continue
+        h, p = obj["headers"], _dict(obj.get("payload"))
+        if h.get(":message-type", "event") != "event":          # "exception" / "error" messages
+            if err is None:
+                kind = h.get(":exception-type") or h.get(":error-code") or "error"
+                msg = p.get("message") or p.get("Message") or h.get(":error-message") or "stream error"
+                err = f"{kind}: {msg}"
+            continue
+        etype = h.get(":event-type")
+        if etype == "contentBlockDelta":                         # ConverseStream
+            delta = _dict(p.get("delta"))
+            if isinstance(delta.get("text"), str):
+                parts.append(delta["text"])
+        elif etype == "metadata":
+            _merge_usage(usage, _dict(p.get("usage")))
+        elif etype == "chunk":                                   # InvokeModelWithResponseStream
+            c = _dict(obj.get("chunk"))
+            m = _dict(c.get("amazon-bedrock-invocationMetrics"))
+            if m:
+                metrics = _bedrock_usage({"amazon-bedrock-invocationMetrics": m})
+            if isinstance(c.get("type"), str):                   # Claude: Anthropic Messages stream events
+                claude.append(c)
+                continue
+            delta = _dict(_dict(c.get("contentBlockDelta")).get("delta"))   # Nova
+            if isinstance(delta.get("text"), str):
+                parts.append(delta["text"])
+            if isinstance(_dict(c.get("metadata")).get("usage"), dict):
+                _merge_usage(usage, c["metadata"]["usage"])
+            for field in ("generation", "outputText", "completion"):       # Llama / Titan / Claude 2
+                if isinstance(c.get(field), str):
+                    parts.append(c[field])
+            outputs = c.get("outputs")                                       # Mistral
+            if isinstance(outputs, list) and outputs and isinstance(_dict(outputs[0]).get("text"), str):
+                parts.append(outputs[0]["text"])
+    model = None
+    if claude:
+        sse = "".join(f"data: {json.dumps(e)}\n\n" for e in claude)
+        u, t, model = parse_sse("anthropic", sse)
+        parts.append(t)
+        if u.total():
+            usage = u
+        err = err or sse_error(sse)
+    if not usage.total():
+        usage = metrics
+    return usage, "".join(parts), model, err
+
+
+# --------------------------------------------------------------------------------------------
 # estimation
 # --------------------------------------------------------------------------------------------
 def estimate_tokens(text: str) -> int:
@@ -741,6 +1050,8 @@ def error_body(style: str, status: int, message: str, err_type: str = "llmtap_er
         obj: dict[str, Any] = {"type": "error", "error": {"type": err_type, "message": message}}
     elif style == "gemini":
         obj = {"error": {"code": status, "message": message, "status": err_type.upper()}}
+    elif style == "bedrock":                       # AWS JSON protocol: botocore reads __type and message
+        obj = {"__type": err_type, "message": message}
     else:
         obj = {"error": {"message": message, "type": err_type, "code": err_type}}
     return json.dumps(obj).encode("utf-8")
@@ -788,11 +1099,11 @@ def forward_headers(
 
         # `expect` is answered by llmtap itself (100-continue); the body is
         # re-sent with a Content-Length.
-        if (
-            lower_key in extra
-            or lower_key == "expect"
-            or lower_key.startswith("x-llmtap-")
-        ):
+        if lower_key in extra or lower_key == "expect":
+            continue
+        # x-llmtap-* tags are llmtap's own, except when a SigV4 signature covers them: dropping a signed
+        # header would make AWS reject the request.
+        if lower_key.startswith("x-llmtap-") and lower_key not in signed:
             continue
 
         if lower_key in HOP_BY_HOP:

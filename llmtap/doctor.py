@@ -16,6 +16,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from llmtap import __version__
+from llmtap.providers import bedrock_region
 
 OK, FAIL, WARN, INFO = "ok", "fail", "warn", "info"
 _GLYPH = {OK: "✓", FAIL: "✗", WARN: "!", INFO: "·"}
@@ -225,8 +226,15 @@ def check_online(cfg: Any, timeout: float = 5.0) -> list[Check]:
 
     def one(kv: tuple[str, dict[str, str]]) -> Check:
         name, spec = kv
-        host = urlsplit(spec["base"]).hostname or spec["base"]
-        ok, detail = probe_host(spec["base"], timeout)
+        base = spec["base"]
+        if "{region}" in base:   # bedrock: the endpoint depends on the AWS region
+            region = bedrock_region({})
+            if not region:
+                return Check(INFO, f"{name} not checked (its endpoint depends on the AWS region)", "",
+                             "set AWS_REGION to check it")
+            base = base.replace("{region}", region)
+        host = urlsplit(base).hostname or base
+        ok, detail = probe_host(base, timeout)
         if ok:
             return Check(OK, f"{name} reachable ({host})", detail)
         local = host in LOCAL_HOSTS

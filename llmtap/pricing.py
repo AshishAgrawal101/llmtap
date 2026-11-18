@@ -401,7 +401,8 @@ def cost_usd(model: str | None, usage: Usage, overrides: dict | None = None, sty
     cr = max(int(usage.cache_read_tokens or 0), 0)
     cw = max(int(usage.cache_write_tokens or 0), 0)
     name = normalize_model(model or "")
-    anthropic_usage = (style == "anthropic") if style else _is_anthropic(name)
+    # Anthropic and Bedrock report input, cache reads and cache writes as separate counts
+    anthropic_usage = (style in ("anthropic", "bedrock")) if style else _is_anthropic(name)
     long = LONG_CONTEXT.get(key) if key else None
     if long is not None:
         prompt = inp + cr + cw if anthropic_usage else (inp if cr <= inp else inp + cr)

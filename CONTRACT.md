@@ -20,6 +20,10 @@ Default port **4141**. Internal routes live under `/_llmtap/` (dashboard + JSON 
 def resolve_route(path: str, headers: Mapping[str, str], cfg: Config) -> Route
 ```
 Routing rules (first match wins):
+0. AWS Bedrock: a bedrock-runtime `Host`, a SigV4 credential scoped to `bedrock` on a `/model/`, `/async-invoke` or
+   `/guardrail/` path, or a `/model/<id>/(invoke|invoke-with-response-stream|converse|converse-stream)` path →
+   provider "bedrock", style "bedrock", path and query unchanged. `{region}` in the base is filled from the Host,
+   the SigV4 scope, a short-term Bedrock API key or AWS_REGION / AWS_DEFAULT_REGION.
 1. Explicit prefix: `/<name>/rest` where `<name>` is a key in `cfg.upstreams` → Route(provider=name,
    upstream_base=cfg.upstreams[name]["base"], upstream_path="/rest" (keep query string), style=that upstream's style).
    e.g. `/openrouter/v1/chat/completions` → base `https://openrouter.ai/api`, path `/v1/chat/completions`.
@@ -72,7 +76,9 @@ def format_usd(x: float) -> str        # "$0.0042", "$1.23", "$0.00" (4 decimals
 ```
 Cover Claude (opus/sonnet/haiku 3.x, 4.x, 4.5, 5 families), GPT-4o/4o-mini/4.1/4.1-mini/nano, o1/o3/o4-mini, gpt-5/5-mini/5-nano,
 text-embedding-3-*, Gemini 2.x via openrouter names, llama/mixtral/deepseek common names. If cache_read missing default to 10% of input
-(anthropic) / 50% (openai); cache_write default 125% of input. Local models (ollama: llama3, qwen, etc.) cost 0.
+(anthropic) / 50% (openai); cache_write default 125% of input. Bedrock usage (Converse camelCase, InvokeModel
+bodies, `X-Amzn-Bedrock-*-Token-Count` headers, EventStream `metadata` / `amazon-bedrock-invocationMetrics`) is
+priced with the Anthropic formula: input, cache reads and cache writes are separate counts. Local models (ollama: llama3, qwen, etc.) cost 0.
 
 ## llmtap/store.py — SQLite persistence
 ```python

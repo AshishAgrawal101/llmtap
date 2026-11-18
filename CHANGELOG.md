@@ -67,6 +67,13 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- **AWS Bedrock Runtime** (`InvokeModel`, `InvokeModelWithResponseStream`, `Converse`, `ConverseStream`). Thanks to
+  @KEYUR141 for the routing and the signature-preserving proxying (#7). Point the AWS SDK's `endpoint_url` at
+  llmtap: calls are priced (Claude model IDs, inference profiles and ARNs), budget- and loop-checked, cached and
+  recorded to cassettes, and EventStream responses are decoded for usage and text and replayed as EventStream.
+  SigV4-signed requests are forwarded unchanged, including signed `X-LLMTap-*` headers, and Bedrock API keys
+  (Bearer) are routed to Bedrock instead of OpenAI. `--guard redact` blocks a SigV4 request it would have to
+  rewrite, since that would break the signature.
 - Dashboard: an "errors (HTTP 4xx/5xx)" source filter, and search now matches tags and session ids.
 - **Pricing follows more of the bill:** long-prompt rate cards (Claude Haiku 5.5 costs $0.50/$2.50 instead of
   $0.10/$0.50 once a prompt is over 100K tokens; Gemini 2.5/3 Pro and Claude Sonnet 4/4.5 above 200K), Anthropic fast
