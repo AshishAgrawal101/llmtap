@@ -25,7 +25,8 @@ def test_node_wrapper_version(node_executable: str) -> None:
     proc = subprocess.run(
         [node_executable, str(WRAPPER_SCRIPT), "version"],
         capture_output=True,
-        text=True,
+        encoding="utf-8",
+        errors="replace",
         cwd=REPO_ROOT,
     )
     assert proc.returncode == 0
@@ -37,10 +38,12 @@ def test_node_wrapper_argument_forwarding(node_executable: str) -> None:
     proc = subprocess.run(
         [node_executable, str(WRAPPER_SCRIPT), "prices", "claude"],
         capture_output=True,
-        text=True,
+        encoding="utf-8",
+        errors="replace",
         cwd=REPO_ROOT,
     )
     assert proc.returncode == 0
+    assert proc.stdout is not None
     assert "claude" in proc.stdout.lower()
 
 
@@ -49,7 +52,8 @@ def test_node_wrapper_help(node_executable: str) -> None:
     proc = subprocess.run(
         [node_executable, str(WRAPPER_SCRIPT), "--help"],
         capture_output=True,
-        text=True,
+        encoding="utf-8",
+        errors="replace",
         cwd=REPO_ROOT,
     )
     assert proc.returncode == 0

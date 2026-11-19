@@ -20,6 +20,8 @@ if (process.platform === 'win32') {
   candidates.push(['python']);
 }
 
+env.PYTHONIOENCODING = 'utf-8';
+
 function findPython() {
   for (const [cmd, ...args] of candidates) {
     try {
