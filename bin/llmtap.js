@@ -20,7 +20,6 @@ if (process.platform === 'win32') {
   candidates.push(['python']);
 }
 
-env.PYTHONIOENCODING = 'utf-8';
 
 function findPython() {
   for (const [cmd, ...args] of candidates) {
@@ -52,6 +51,7 @@ const pythonArgs = [...baseArgs, '-m', 'llmtap', ...userArgs];
 
 // Ensure PYTHONPATH includes the package root so python -m llmtap is always discoverable
 const env = { ...process.env };
+env.PYTHONIOENCODING = 'utf-8';
 const sep = process.platform === 'win32' ? ';' : ':';
 env.PYTHONPATH = env.PYTHONPATH ? `${repoRoot}${sep}${env.PYTHONPATH}` : repoRoot;
 
