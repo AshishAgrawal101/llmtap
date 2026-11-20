@@ -495,8 +495,12 @@ class Vault:
             if hit and hit[0] == info.uid:
                 return hit[1]
         value = self.backend.get(name)
-        if value:
-            with self._lock:
+        with self._lock:
+            self._load()
+            now = self._keys.get(name)
+            if now is None or now.uid != info.uid:
+                return None     # removed / re-added meanwhile: never pair a new secret with old metadata
+            if value:
                 self._secrets[name] = (info.uid, value)
         return value
 
@@ -699,6 +703,51 @@ def base_allows(info: KeyInfo, upstream_base: str) -> bool:
         pattern = re.escape(want).replace(re.escape("{region}"), r"[a-z]{2}(?:-[a-z]+){1,2}-\d{1,2}")
         return re.fullmatch(pattern, got) is not None
     return want == got
+
+
+_DOT_SEGMENT_RE = re.compile(r"(?:^|/)(?:\.|%2e){1,2}(?:/|$)", re.IGNORECASE)
+_METHOD_OVERRIDES = ("x-http-method-override", "x-http-method", "x-method-override")
+
+
+def request_shape_refusal(method: str, path: str, headers: Mapping[str, str], body: bytes) -> Refusal | None:
+    """Requests whose meaning an upstream could read differently from llmtap's checks: refused for stored keys.
+
+    Dot segments, ``//``, backslashes and ``#`` (an upstream may normalise them into another model or endpoint),
+    method-override headers and GET/HEAD bodies (a "read" that is really a POST)."""
+    raw_path = path.split("?", 1)[0]
+    if "#" in path or "\\" in raw_path or "//" in raw_path or _DOT_SEGMENT_RE.search(raw_path):
+        return Refusal(400, "llmtap: stored keys can't be used with URLs containing '.', '..', '//', '\\' or '#' "
+                            "path segments.", "llmtap_bad_request")
+    if any(h in headers for h in _METHOD_OVERRIDES):
+        return Refusal(400, "llmtap: stored keys can't be used with method-override headers.", "llmtap_bad_request")
+    if method.upper() in ("GET", "HEAD") and body:
+        return Refusal(400, f"llmtap: stored keys can't be used with a {method.upper()} request that has a body.",
+                       "llmtap_bad_request")
+    return None
+
+
+def body_models(body: bytes) -> tuple[list[str], bool]:
+    """Every string ``"model"`` value anywhere in a JSON body (e.g. ``tools[].model``), and whether any object
+    repeats the ``model`` key (parsers disagree on which copy wins). ([], False) for non-JSON bodies."""
+    found: list[str] = []
+    dup = False
+
+    def hook(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        nonlocal dup
+        seen = 0
+        for k, v in pairs:
+            if k == "model":
+                seen += 1
+                if isinstance(v, str):
+                    found.append(v)
+        dup = dup or seen > 1
+        return dict(pairs)
+
+    try:
+        json.loads(body.decode("utf-8"), object_pairs_hook=hook)
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return [], False
+    return found, dup
 
 
 def caller_refusal(headers: Mapping[str, str], client: str | None, host_ok: bool) -> Refusal | None:

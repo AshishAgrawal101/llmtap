@@ -33,8 +33,8 @@ from .config import Config
 from .guard import apply_guard
 from .models import CachedResponse, Exchange, Route, Usage
 from .pricing import cost_usd
-from .vault import (TAG as VAULT_TAG, Refusal, base_allows, caller_refusal, endpoint_refusal, find_placeholder,
-                    substitute, _local_midnight)
+from .vault import (TAG as VAULT_TAG, Refusal, base_allows, body_models, caller_refusal, endpoint_refusal,
+                    find_placeholder, request_shape_refusal, substitute, _local_midnight)
 from .providers import (
     EVENTSTREAM_CTYPE,
     bedrock_header_usage,
@@ -647,6 +647,8 @@ class LLMTap:
                 vault_refusal = Refusal(400, "llmtap: the request URL contains spaces or control characters.",
                                         "llmtap_bad_request")
             if vault_refusal is None:
+                vault_refusal = request_shape_refusal(method, path, hdrs, body)
+            if vault_refusal is None:
                 vault_info, secret, problem = self._vault_lookup(found.name)
                 if problem:
                     vault_refusal = Refusal(401, problem, "llmtap_key_not_found")
@@ -819,8 +821,15 @@ class LLMTap:
                 info = self.vault.get(vault_info.name) or vault_info      # pick up limit changes made meanwhile
                 refusal = endpoint_refusal(info, method, route.upstream_path, cacheable)
                 if refusal is None:
-                    named = [ex.model, request_model(req), path_model]  # every model the request names
-                    refusal = self.vault.admit(info, named, estimate, cacheable, spent)
+                    named = [ex.model, request_model(req), path_model]  # every model the request names...
+                    if info.models:
+                        more, dup = body_models(send_body)          # ...including tools[].model and friends
+                        named += more
+                        if dup:
+                            refusal = Refusal(400, "llmtap: the request names \"model\" twice in one object; "
+                                                   "stored keys with a model list refuse that.", "llmtap_bad_request")
+                    if refusal is None:
+                        refusal = self.vault.admit(info, named, estimate, cacheable, spent)
             except Exception as e:      # fail closed: limits that can't be checked must not be skipped
                 refusal = Refusal(503, f"llmtap: could not check the limits of the stored key "
                                        f"{vault_info.name!r}: {type(e).__name__}: {e}", "llmtap_key_check_failed")
@@ -856,6 +865,9 @@ class LLMTap:
                     if isinstance(v, int) and v > 0:
                         out_tokens = v
                         break
+                n = req.get("n", gc.get("candidateCount"))           # several completions bill several outputs
+                if isinstance(n, int) and not isinstance(n, bool) and 1 < n <= 128:
+                    out_tokens *= n
             usage = Usage(input_tokens=max(1, len(body) // 4), output_tokens=out_tokens)
             return float(cost_usd(model, usage, self.cfg.pricing_overrides, style=route.style) or 0.0)
         except Exception:
@@ -922,6 +934,12 @@ class LLMTap:
             client_gone = False
             finalized = False
             upstream_err: str | None = None
+            compressed = encoding.strip().lower() not in ("", "identity")
+            if vsec and compressed and streaming:
+                # the upstream ignored `Accept-Encoding: identity`: a compressed reply has to be decoded (in full)
+                # before an echoed key can be scrubbed from it
+                streaming = False
+                ex.streamed = False
 
             if streaming:
                 client_h["Transfer-Encoding"] = "chunked"
@@ -971,6 +989,18 @@ class LLMTap:
                     status = 504 if isinstance(e, (socket.timeout, TimeoutError)) else 502
                     self._error(out, ex, route.style, status, msg, "llmtap_upstream_error")
                     return
+                if vsec and compressed and data:
+                    plain = _try_decode(data, encoding.strip().lower())
+                    if plain is None:
+                        ex.source = "error"
+                        self._error(out, ex, route.style, 502,
+                                    f"llmtap: the upstream sent a {encoding}-compressed response that llmtap can't "
+                                    "decode, so it can't make sure the stored key isn't echoed in it.",
+                                    "llmtap_upstream_error")
+                        return
+                    data, encoding = plain, ""
+                    for k in [k for k in client_h if k.lower() == "content-encoding"]:
+                        del client_h[k]
                 if vsec:
                     data = _scrub_bytes(data, vsec)
                 raw += data
