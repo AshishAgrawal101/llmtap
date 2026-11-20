@@ -6,6 +6,16 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **OpenTelemetry spend export** (thanks @KEYUR141, #8): set `otel_endpoint` (or `LLMTAP_OTEL_ENDPOINT`) to an
+  OTLP/HTTP collector and every priced call is exported as the `llmtap.cost` counter in USD, with the provider and
+  model as GenAI semantic-convention attributes. Off by default, sent in the background, never includes prompts,
+  responses or keys.
+- **Node wrapper** (thanks @KEYUR141, #9): `bin/llmtap.js` and a `package.json` for the npm package `llmtap-proxy`,
+  so Node projects can run `npx llmtap-proxy wrap -- npm run dev` (Python 3.11+ must be installed). Not yet
+  published to npm.
+
 ### Changed
 
 - Dashboard: the header logo, browser-tab icon and wordmark now match the project logo (the tap with a waveform).

@@ -434,6 +434,10 @@ class LLMTap:
         self.cassette: Cassette | None = Cassette(cfg.cassette, cfg.mode) if cfg.cassette else None
         self.budget: Budget = Budget(cfg, self.store.spent_since)
         self.bus: EventBus = EventBus()
+        self.otel: Any = None
+        if cfg.otel_endpoint:
+            from .otel import OtelExporter
+            self.otel = OtelExporter(cfg.otel_endpoint)
         self.port: int = cfg.port
         self.started_at: float = time.time()
         self._server: _Server | None = None
@@ -515,6 +519,11 @@ class LLMTap:
             pass
         if self._thread is not None:
             self._thread.join(timeout=5)
+        if self.otel is not None:
+            try:
+                self.otel.close()
+            except Exception:
+                pass
         for obj in (self.cache, self.store):
             close = getattr(obj, "close", None)
             if close is not None:
@@ -1059,14 +1068,6 @@ class LLMTap:
     # ---------------------------------------------------------------- finish
     def _finish(self, ex: Exchange) -> None:
         """Persist, publish and log; each step isolated so none can break the request."""
-
-        if getattr(self.cfg, "otel_endpoint","") and ex.cost_usd>0:
-            try:
-                from .otel import export_spend
-                export_spend(self.cfg.otel_endpoint, ex)
-            except Exception:
-                pass
-        
         try:
             _seal(ex)
         except Exception:
@@ -1079,6 +1080,11 @@ class LLMTap:
             self.bus.publish({"type": "exchange", "exchange": summarize(ex)})
         except Exception:
             pass
+        if self.otel is not None and ex.cost_usd > 0:
+            try:
+                self.otel.submit(ex)    # background thread: never waits on the collector
+            except Exception:
+                pass
         if not self.cfg.quiet:
             try:
                 from .term import log_exchange

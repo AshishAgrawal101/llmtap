@@ -1,7 +1,6 @@
 """Tests for the npx / Node.js llmtap CLI wrapper."""
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -10,6 +9,24 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WRAPPER_SCRIPT = REPO_ROOT / "bin" / "llmtap.js"
+
+
+def test_package_json_matches_the_python_package() -> None:
+    """npm metadata must not drift from PyPI: same version, and a name this project owns.
+
+    `llmtap` on npm (like on PyPI) belongs to someone else, so `npx llmtap` would run their code."""
+    import json
+    import re
+
+    pkg = json.loads((REPO_ROOT / "package.json").read_text(encoding="utf-8"))
+    pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    py_version = re.search(r'^version = "([^"]+)"', pyproject, re.M).group(1)
+    from llmtap import __version__
+
+    assert pkg["name"] == "llmtap-proxy"
+    assert pkg["version"] == py_version == __version__
+    assert pkg["bin"] == {"llmtap": "./bin/llmtap.js"}
+    assert pkg["license"] == "MIT"
 
 
 @pytest.fixture(scope="module")

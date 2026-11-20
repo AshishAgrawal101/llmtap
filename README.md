@@ -39,11 +39,6 @@ every cent.
 pip install llmtap-proxy      # stdlib only, nothing else gets installed; the command is `llmtap` (pipx works too)
 llmtap demo                    # fake LLM traffic + the live dashboard in your browser. No API key needed.
 llmtap wrap -- python app.py   # now do it for real with your own app
-# Node / npx (requires Python 3.11+ installed):
-npx llmtap wrap -- npm run dev
-
-# Or install with pipx:
-pipx install llmtap
 ```
 
 <div align="center">
@@ -604,7 +599,6 @@ Ideas we'd love help with. None of these exist yet:
 - [ ] Configurable cassette matching (ignore fields, fuzzy match on model)
 - [ ] `llmtap diff` between two cassettes or two runs
 - [ ] Per-tag budgets (e.g. cap a single feature or session)
-- [ ] OpenTelemetry / OTLP export
 - [ ] Homebrew formula and a single-file zipapp release
 
 Have a better idea? [Open an issue](https://github.com/AshishAgrawal101/llmtap/issues/new/choose).

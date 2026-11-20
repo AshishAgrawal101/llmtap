@@ -72,6 +72,7 @@ A fully commented example is in [`llmtap.example.toml`](../llmtap.example.toml).
 | `upstreams` | see below | – | `--upstream NAME=URL[,STYLE]` (repeatable) | Named upstreams (`base`, `style`). |
 | `pricing_overrides` | `{}` | – | – | Per-model prices in USD per 1M tokens (`input`, `output`, `cache_read`, `cache_write`). File only, as `[pricing_overrides."<model>"]` tables. |
 | `upstream_timeout_s` | `600.0` | `LLMTAP_UPSTREAM_TIMEOUT_S` | `--timeout` | Timeout for upstream requests, in seconds. |
+| `otel_endpoint` | `""` | `LLMTAP_OTEL_ENDPOINT` | – | OpenTelemetry OTLP/HTTP collector URL (e.g. `http://localhost:4318/v1/metrics`; a bare `host:port` posts to `/v1/metrics`). Empty = off. Each priced upstream call is sent as one point of the `llmtap.cost` counter (USD) with `gen_ai.provider.name`, `gen_ai.request.model` and, when set, `llmtap.session`. Only those and the cost are sent, never prompts, responses or keys, from a background thread so a slow collector can't delay requests. The generic `OTEL_EXPORTER_OTLP_*` variables are deliberately not read. |
 
 Other environment variables:
 
