@@ -1059,6 +1059,14 @@ class LLMTap:
     # ---------------------------------------------------------------- finish
     def _finish(self, ex: Exchange) -> None:
         """Persist, publish and log; each step isolated so none can break the request."""
+
+        if getattr(self.cfg, "otel_endpoint","") and ex.cost_usd>0:
+            try:
+                from .otel import export_spend
+                export_spend(self.cfg.otel_endpoint, ex)
+            except Exception:
+                pass
+        
         try:
             _seal(ex)
         except Exception:

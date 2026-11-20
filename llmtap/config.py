@@ -59,6 +59,9 @@ class Config:
     pricing_overrides: dict[str, dict[str, float]] = field(default_factory=dict)  # model -> {"input":..,"output":..,"cache_read":..,"cache_write":..} USD per 1M tokens
     upstream_timeout_s: float = 600.0
 
+    # OpenTelemetry OTLP/HTTP metrics endpoint, e.g. "http://localhost:4318/v1/metrics"
+    otel_endpoint: str = ""
+
     def resolved_db_path(self) -> str:
         if self.db_path:
             return self.db_path
@@ -130,6 +133,13 @@ def load_config(path: str | None = None, overrides: dict[str, Any] | None = None
     Raises ValueError (naming the file / variable and key) for invalid TOML or values."""
     cfg = Config()
     candidates = [Path(path)] if path else [Path("llmtap.toml"), Path.home() / ".config" / "llmtap" / "config.toml"]
+    # Check standard OTel env vars if not explicitly set
+    if not cfg.otel_endpoint:
+        otel_env = os.environ.get("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT") or os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
+        if otel_env:
+            if not otel_env.endswith("/v1/metrics") and not otel_env.endswith(":4318"):
+                otel_env = otel_env.rstrip("/") + "/v1/metrics"
+            cfg.otel_endpoint = otel_env
     for p in candidates:
         if p.is_file():
             apply_file(cfg, p)
