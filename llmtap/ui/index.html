@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark">
 <title>llmtap</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%238b8dff'/%3E%3Cstop offset='1' stop-color='%2322d3ee'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='8' fill='url(%23g)'/%3E%3Cpath d='M5 17h5l3-7 4 13 3-6h7' fill='none' stroke='white' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='4 4 104 104'%3E%3Cdefs%3E%3ClinearGradient id='f' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%238B5CF6'/%3E%3Cstop offset='.55' stop-color='%236366F1'/%3E%3Cstop offset='1' stop-color='%2306B6D4'/%3E%3C/linearGradient%3E%3ClinearGradient id='t' x1='0' y1='0' x2='0' y2='1'%3E%3Cstop offset='0' stop-color='%23151B33'/%3E%3Cstop offset='1' stop-color='%230B1020'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect x='4' y='4' width='104' height='104' rx='26' fill='url(%23t)'/%3E%3Crect x='50' y='20' width='30' height='7' rx='3.5' fill='url(%23f)'/%3E%3Crect x='61.5' y='26' width='7' height='9' rx='1.5' fill='url(%23f)'/%3E%3Cpath d='M18 35H70a18 18 0 0 1 18 18V64H74V53a4 4 0 0 0-4-4H18Z' fill='url(%23f)'/%3E%3Cpath d='M22 42H34L38 37.5L43 46.5L47 39.5L50 42H66' fill='none' stroke='%230B1020' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M81 72C81 72 89 81.5 89 86.5A8 8 0 0 1 73 86.5C73 81.5 81 72 81 72Z' fill='%2322D3EE'/%3E%3C/svg%3E">
 <style>
 :root{
   --bg:#08090c; --bg2:#0c0e13; --panel:#101219; --panel2:#151821; --panel3:#1b1f2a;
@@ -30,7 +30,7 @@ a{color:var(--accent)}
 header{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:14px;padding:11px 22px;border-bottom:1px solid var(--border);
   background:rgba(8,9,12,.78);backdrop-filter:saturate(160%) blur(12px);-webkit-backdrop-filter:saturate(160%) blur(12px)}
 .brand{display:flex;align-items:center;gap:9px;font-weight:650;font-size:16px;letter-spacing:-.02em}
-.brand .tap{background:linear-gradient(90deg,var(--accent),var(--accent2));-webkit-background-clip:text;background-clip:text;color:transparent}
+.brand .word{background:linear-gradient(90deg,#7C5CFF,#0EA5E9);-webkit-background-clip:text;background-clip:text;color:transparent;font-weight:800}
 .brand small{font-weight:500;font-size:11px;color:var(--dim);letter-spacing:0;margin-left:2px}
 .live{display:inline-flex;align-items:center;gap:7px;height:24px;padding:0 10px;border-radius:999px;border:1px solid var(--border);background:var(--panel);font-size:11.5px;color:var(--muted);font-weight:550}
 .live .dot{width:7px;height:7px;border-radius:50%;background:var(--dim);position:relative}
@@ -263,13 +263,18 @@ footer .keys{display:flex;gap:14px;flex-wrap:wrap}
 <body>
 <header>
   <div class="brand" aria-label="llmtap">
-    <svg width="26" height="26" viewBox="0 0 32 32" aria-hidden="true">
-      <defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#9b9dff"/><stop offset="1" stop-color="#22d3ee"/></linearGradient>
-      <linearGradient id="lg2" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff" stop-opacity=".28"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient></defs>
-      <rect width="32" height="32" rx="8.5" fill="url(#lg)"/><rect x=".5" y=".5" width="31" height="15" rx="8" fill="url(#lg2)"/>
-      <path d="M5 17h5l3-7 4 13 3-6h7" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+    <!-- same mark as assets/logo.svg: a tap with a signal waveform flowing through it -->
+    <svg width="28" height="28" viewBox="4 4 104 104" aria-hidden="true">
+      <defs><linearGradient id="lt-flow" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#8B5CF6"/><stop offset=".55" stop-color="#6366F1"/><stop offset="1" stop-color="#06B6D4"/></linearGradient>
+      <linearGradient id="lt-tile" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#151B33"/><stop offset="1" stop-color="#0B1020"/></linearGradient></defs>
+      <rect x="4" y="4" width="104" height="104" rx="26" fill="url(#lt-tile)"/>
+      <rect x="4.75" y="4.75" width="102.5" height="102.5" rx="25.25" fill="none" stroke="#fff" stroke-opacity=".12" stroke-width="2"/>
+      <rect x="50" y="20" width="30" height="7" rx="3.5" fill="url(#lt-flow)"/><rect x="61.5" y="26" width="7" height="9" rx="1.5" fill="url(#lt-flow)"/>
+      <path d="M18 35H70a18 18 0 0 1 18 18V64H74V53a4 4 0 0 0-4-4H18Z" fill="url(#lt-flow)"/>
+      <path d="M22 42H34L38 37.5L43 46.5L47 39.5L50 42H66" fill="none" stroke="#0B1020" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M81 72C81 72 89 81.5 89 86.5A8 8 0 0 1 73 86.5C73 81.5 81 72 81 72Z" fill="#22D3EE"/>
     </svg>
-    <span>llm<span class="tap">tap</span></span><small id="ver"></small>
+    <span class="word">llmtap</span><small id="ver"></small>
   </div>
   <div class="live" id="live" title="Live event stream"><span class="dot"></span><span id="liveTxt">Connecting</span></div>
   <button class="urlchip" id="urlchip" title="Copy proxy base URL"></button>
