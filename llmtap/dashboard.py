@@ -431,8 +431,13 @@ def _keys_write(tap: "LLMTap", sub: str, headers: Any, body: bytes) -> tuple[int
     v = tap.vault
     try:
         if sub == "/api/keys":
-            info = v.add(str(data.get("name") or ""), str(data.get("provider") or ""), str(data.get("secret") or ""),
-                         **limits)
+            from .config import DEFAULT_UPSTREAMS
+            provider = str(data.get("provider") or "").strip().lower()
+            base = data.get("base") or None
+            if not base and provider not in DEFAULT_UPSTREAMS:      # a custom upstream of this proxy
+                base = ((getattr(tap.cfg, "upstreams", {}) or {}).get(provider) or {}).get("base")
+            info = v.add(str(data.get("name") or ""), provider, str(data.get("secret") or ""),
+                         base=str(base) if base else None, **limits)
             return 200, {"ok": True, "key": info.to_dict()}
         name = sub[len("/api/keys/"):]
         if name.endswith("/delete"):

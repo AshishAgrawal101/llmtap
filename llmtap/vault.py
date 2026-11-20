@@ -21,20 +21,23 @@ readable only by you (like ``~/.aws/credentials``; not encrypted). ``memory`` ke
 from __future__ import annotations
 
 import fnmatch
+import ipaddress
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol
 from urllib.parse import parse_qsl, quote, urlsplit
 
-from .config import llmtap_home
+from .config import DEFAULT_UPSTREAMS, llmtap_home
 
 SERVICE = "llmtap"
 PLACEHOLDER_PREFIX = "llmtap-key-"
@@ -61,6 +64,27 @@ PROVIDER_ENV: dict[str, tuple[str, ...]] = {
 
 class VaultError(ValueError):
     """Invalid vault input or a failing secret backend; the message is safe to show (never contains a secret)."""
+
+
+def _atomic_write(path: Path, text: str, private: bool = False) -> None:
+    """Write via a fresh, exclusively created temp file in the same directory, then rename over ``path``."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix="." + path.name + ".")   # mode 0600, O_EXCL
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        if not private:
+            try:
+                os.chmod(tmp, 0o644)
+            except OSError:
+                pass
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 # ----------------------------------------------------------------------------------------------------- backends
@@ -112,16 +136,7 @@ class FileBackend:
         return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
 
     def _write(self, data: dict[str, str]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_name(self.path.name + ".tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-        try:
-            os.chmod(tmp, 0o600)
-        except OSError:
-            pass
-        os.replace(tmp, self.path)
+        _atomic_write(self.path, json.dumps(data), private=True)
 
     def get(self, key: str) -> str | None:
         with self._lock:
@@ -320,8 +335,10 @@ class KeyInfo:
     name: str
     provider: str
     preview: str = ""
+    base: str = ""                     # the only upstream (scheme://host) this key may be sent to
     created: float = field(default_factory=time.time)
-    rev: int = 1                       # bumped whenever the secret changes (other processes drop their cache)
+    rev: int = 1                       # bumped whenever the secret changes
+    uid: str = field(default_factory=lambda: uuid.uuid4().hex)   # new on every add: other processes drop caches
     daily_usd: float = 0.0             # 0 = no daily cap
     total_usd: float = 0.0             # 0 = no lifetime cap (counted from `created`)
     models: list[str] = field(default_factory=list)   # allowed model patterns (fnmatch, case-insensitive); [] = any
@@ -359,8 +376,8 @@ def _validate_secret(secret: str) -> str:
         raise VaultError("the key is empty")
     if len(s) > MAX_SECRET_LEN:
         raise VaultError(f"the key is longer than {MAX_SECRET_LEN} characters")
-    if any(c.isspace() or c in "\"'\\" or ord(c) < 32 for c in s):
-        raise VaultError("the key contains spaces, quotes or control characters; paste only the key itself")
+    if any(not (33 <= ord(c) <= 126) or c in "\"'\\" for c in s):
+        raise VaultError("the key contains spaces, quotes, non-ASCII or control characters; paste only the key itself")
     if s.startswith(PLACEHOLDER_PREFIX):
         raise VaultError("that is a llmtap placeholder, not a real API key")
     return s
@@ -448,11 +465,8 @@ class Vault:
         self._keys, self._mtime = keys, mtime
 
     def _save(self) -> None:
-        self.home.mkdir(parents=True, exist_ok=True)
-        tmp = self.meta_path.with_name(self.meta_path.name + ".tmp")
         body = {"version": 1, "keys": [asdict(k) for k in sorted(self._keys.values(), key=lambda k: k.name)]}
-        tmp.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")
-        os.replace(tmp, self.meta_path)
+        _atomic_write(self.meta_path, json.dumps(body, indent=2) + "\n")
         try:
             self._mtime = self.meta_path.stat().st_mtime
         except OSError:
@@ -470,40 +484,46 @@ class Vault:
             return self._keys.get((name or "").lower())
 
     def secret(self, name: str) -> str | None:
-        """The real key, for the proxy's outgoing request only. Cached per revision."""
+        """The real key, for the proxy's outgoing request only. Cached per add (``uid``), so a key removed and
+        re-added by another process (CLI vs. running proxy) is never served from a stale cache."""
         with self._lock:
             self._load()
             info = self._keys.get(name)
             if info is None:
                 return None
             hit = self._secrets.get(name)
-            if hit and hit[0] == info.rev:
+            if hit and hit[0] == info.uid:
                 return hit[1]
         value = self.backend.get(name)
         if value:
             with self._lock:
-                self._secrets[name] = (info.rev, value)
+                self._secrets[name] = (info.uid, value)
         return value
 
     # -- writing ------------------------------------------------------------------------------------------
-    def add(self, name: str, provider: str, secret: str, **limits: Any) -> KeyInfo:
+    def add(self, name: str, provider: str, secret: str, base: str | None = None, **limits: Any) -> KeyInfo:
+        """Store or replace a key. ``base`` is the upstream it may be sent to; for built-in providers it defaults
+        to the official API (a project's llmtap.toml can't redirect a stored key), for others it is required."""
         n = _validate_name(name)
         p = (provider or "").strip().lower()
         if not NAME_RE.match(p):
             raise VaultError("provider: expected an upstream name such as openai, anthropic or gemini")
         s = _validate_secret(secret)
+        b = normalize_base(base if base else DEFAULT_UPSTREAMS.get(p, {}).get("base", ""))
+        if not b:
+            raise VaultError(f"{p!r} is not a built-in provider: give the upstream URL this key may be sent to")
         lim = _validate_limits(limits)
         with self._lock:
             self._load()
             old = self._keys.get(n)
             self.backend.set(n, s)
-            info = KeyInfo(name=n, provider=p, preview=mask(s), rev=(old.rev + 1) if old else 1,
+            info = KeyInfo(name=n, provider=p, preview=mask(s), base=b, rev=(old.rev + 1) if old else 1,
                            created=old.created if old and old.provider == p else time.time())
-            for k, v in lim.items():
-                setattr(info, k, v)
-            if old and not lim:        # replacing the secret keeps the limits you set
+            if old:                    # replacing the secret keeps the limits you set, unless you change them
                 for k in ("daily_usd", "total_usd", "models", "expires", "paused"):
                     setattr(info, k, getattr(old, k))
+            for k, v in lim.items():
+                setattr(info, k, v)
             self._keys[n] = info
             self._secrets.pop(n, None)
             self._save()
@@ -554,13 +574,17 @@ class Vault:
         return out
 
     # -- spend reservations (per-key caps) ---------------------------------------------------------------
-    def admit(self, info: KeyInfo, model: str | None, spent_today: float, spent_total: float,
-              estimate: float, priced: bool) -> Refusal | None:
+    def admit(self, info: KeyInfo, models: list[str | None], estimate: float, priced: bool,
+              spent: Callable[[KeyInfo], tuple[float, float]]) -> Refusal | None:
         """Check ``info``'s limits and, if allowed and priced, reserve ``estimate`` atomically.
 
-        Call :meth:`release` with the same estimate when the request has finished."""
+        ``spent(info)`` returns (spent today, spent in total); it runs under the lock, so a call finishing in
+        between (row written, then reservation released) is counted at least once. Call :meth:`release` with the
+        same estimate once the finished call is stored."""
         with self._lock:
-            refusal = check_limits(info, model, spent_today, spent_total, self._inflight.get(info.name, 0.0), priced)
+            today, total = spent(info) if priced and (info.daily_usd or info.total_usd) else (0.0, 0.0)
+            refusal = check_limits(info, models, today, total, self._inflight.get(info.name, 0.0), priced,
+                                   estimate=estimate)
             if refusal is None and priced:
                 self._inflight[info.name] = self._inflight.get(info.name, 0.0) + max(0.0, estimate)
             return refusal
@@ -634,6 +658,74 @@ def _local_midnight(now: float | None = None) -> float:
     return time.mktime((t.tm_year, t.tm_mon, t.tm_mday, 0, 0, 0, 0, 0, -1))
 
 
+_COUNT_TOKENS_RE = re.compile(r"(?:/v1/messages/count_tokens|:countTokens)$")
+
+
+def has_limits(info: KeyInfo) -> bool:
+    return bool(info.models or info.daily_usd or info.total_usd)
+
+
+def endpoint_refusal(info: KeyInfo, method: str, upstream_path: str, generation: bool) -> Refusal | None:
+    """A key with model or spend limits may only reach endpoints llmtap can check: generation calls (priced and
+    model-checked), reads, and token counting. Anything else (batches, images, audio, fine-tuning, long-running
+    jobs...) could spend money or use other models without being counted, so it is refused."""
+    if generation or not has_limits(info) or method.upper() in ("GET", "HEAD", "OPTIONS"):
+        return None
+    if _COUNT_TOKENS_RE.search(upstream_path.split("?", 1)[0]):
+        return None
+    return Refusal(403, f"llmtap: the stored key {info.name!r} has model or spend limits, and llmtap can't check "
+                        f"them for {method.upper()} {upstream_path.split('?', 1)[0]}. Use a key without limits for "
+                        "this endpoint.", "llmtap_key_endpoint_not_allowed")
+
+
+def normalize_base(base: str) -> str:
+    """``scheme://host[:port]`` of an upstream base URL, lowercase ("" if it isn't an http(s) URL)."""
+    try:
+        u = urlsplit((base or "").strip())
+    except ValueError:
+        return ""
+    if u.scheme.lower() not in ("http", "https") or not u.netloc:
+        return ""
+    return f"{u.scheme.lower()}://{u.netloc.lower()}"
+
+
+def base_allows(info: KeyInfo, upstream_base: str) -> bool:
+    """Is ``upstream_base`` the upstream ``info`` was stored for? (``{region}`` matches any AWS region.)"""
+    want = info.base or normalize_base(DEFAULT_UPSTREAMS.get(info.provider, {}).get("base", ""))
+    got = normalize_base(upstream_base)
+    if not want or not got:
+        return False
+    if "{region}" in want:
+        pattern = re.escape(want).replace(re.escape("{region}"), r"[a-z]{2}(?:-[a-z]+){1,2}-\d{1,2}")
+        return re.fullmatch(pattern, got) is not None
+    return want == got
+
+
+def caller_refusal(headers: Mapping[str, str], client: str | None, host_ok: bool) -> Refusal | None:
+    """Stored keys are for programs on this machine. Refuse browsers on other sites (they could otherwise spend
+    the key, since ``llmtap-key-openai`` is easy to guess), DNS-rebinding hosts, and remote clients."""
+    origin = (headers.get("origin") or "").strip()
+    site = (headers.get("sec-fetch-site") or "").strip().lower()
+    host = (headers.get("host") or "").strip().lower()
+    cross = (site not in ("", "none", "same-origin")) or (
+        origin and (origin == "null" or urlsplit(origin).netloc.lower() != host))
+    if cross:
+        return Refusal(403, "llmtap: stored keys can't be used from a web page on another site.",
+                       "llmtap_key_cross_origin")
+    if not host_ok:
+        return Refusal(403, "llmtap: stored keys are only used for requests to localhost / 127.0.0.1 "
+                            "(possible DNS-rebinding attack).", "llmtap_key_bad_host")
+    if client:
+        try:
+            local = ipaddress.ip_address(client.split("%", 1)[0]).is_loopback
+        except ValueError:
+            local = False
+        if not local:
+            return Refusal(403, "llmtap: stored keys are only used for programs on this computer, not for "
+                                f"requests from {client}.", "llmtap_key_remote_client")
+    return None
+
+
 def model_allowed(info: KeyInfo, model: str | None) -> bool:
     if not info.models:
         return True
@@ -641,23 +733,33 @@ def model_allowed(info: KeyInfo, model: str | None) -> bool:
     return bool(m) and any(fnmatch.fnmatchcase(m, p.lower()) for p in info.models)
 
 
-def check_limits(info: KeyInfo, model: str | None, spent_today: float, spent_total: float,
-                 pending: float, priced: bool, now: float | None = None) -> Refusal | None:
+def check_limits(info: KeyInfo, models: list[str | None] | str | None, spent_today: float, spent_total: float,
+                 pending: float, priced: bool, now: float | None = None,
+                 estimate: float | None = None) -> Refusal | None:
     """Why a call through stored key ``info`` must be refused, or None.
 
-    Spend caps apply to priced (generation) calls and work like the global budgets: refused once what was spent
-    plus what is in flight (``pending``) reaches the cap."""
+    ``models``: every model the request names (path and body); all must be allowed. Spend caps apply to priced
+    (generation) calls and work like the global budgets: refused once what was spent plus what is in flight
+    (``pending``) reaches the cap. A capped key refuses models llmtap can't price (``estimate`` 0), since a cap
+    that can't count is no cap."""
     now = time.time() if now is None else now
+    names = [models] if models is None or isinstance(models, str) else list(models)
+    named = [m for m in names if m] or [None]
     if info.paused:
         return Refusal(403, f"llmtap: the stored key {info.name!r} is paused. Resume it in the llmtap dashboard "
                             f"(Keys) or with `llmtap keys limit {info.name} --resume`.", "llmtap_key_paused")
     if info.expires and now >= info.expires:
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(info.expires))
         return Refusal(403, f"llmtap: the stored key {info.name!r} expired on {when}.", "llmtap_key_expired")
-    if priced and not model_allowed(info, model):
+    bad = [m for m in named if not model_allowed(info, m)] if priced else []
+    if bad:
         allowed = ", ".join(info.models)
         return Refusal(403, f"llmtap: the stored key {info.name!r} may only be used with: {allowed} "
-                            f"(this request asked for {model or 'no model'}).", "llmtap_key_model_not_allowed")
+                            f"(this request asked for {bad[0] or 'no model'}).", "llmtap_key_model_not_allowed")
+    if priced and (info.daily_usd or info.total_usd) and estimate is not None and estimate <= 0:
+        return Refusal(403, f"llmtap: the stored key {info.name!r} has a spend limit, but llmtap has no price for "
+                            f"{named[0] or 'this request'}, so it can't count what the call costs. Add a price "
+                            "under [pricing_overrides] or remove the key's spend limit.", "llmtap_key_unpriced_model")
     if priced:
         if info.daily_usd and spent_today + pending >= info.daily_usd:
             return Refusal(429, f"llmtap: daily limit of ${info.daily_usd:.2f} for the stored key {info.name!r} "

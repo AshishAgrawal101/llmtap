@@ -254,6 +254,8 @@ def build_parser() -> argparse.ArgumentParser:
     k = ks.add_parser("add", help="store a key (asks for it; or pipe it on stdin)")
     k.add_argument("name", help="a name such as openai, anthropic or work-openai")
     k.add_argument("--provider", default=None, help="upstream it is for (default: the name, if it is a provider)")
+    k.add_argument("--base", default=None, metavar="URL",
+                   help="the only upstream URL the key may be sent to (default: the provider's official API)")
     k = ks.add_parser("remove", help="delete a stored key")
     k.add_argument("name")
     k = ks.add_parser("limit", help="set limits for a stored key")
@@ -1213,13 +1215,21 @@ def cmd_keys(args: argparse.Namespace) -> int:
             if not provider:
                 _err(f"which provider is {name!r} for? pass --provider (e.g. --provider openai)")
                 return 2
+            from llmtap.config import DEFAULT_UPSTREAMS, load_config
+            base = args.base
+            if not base and provider not in DEFAULT_UPSTREAMS:
+                base = (load_config().upstreams.get(provider) or {}).get("base")
+                if not base:
+                    _err(f"{provider!r} is not a built-in provider: pass --base with its upstream URL")
+                    return 2
             if sys.stdin.isatty():
                 import getpass
                 secret = getpass.getpass(f"Paste the {provider} API key for {name!r} (input hidden): ")
             else:
                 secret = sys.stdin.readline()
-            info = v.add(name, provider, secret)
-            _out(f"stored {info.name} ({info.provider}, {info.preview}) in {v.backend.name}.")
+            info = v.add(name, provider, secret, base=base)
+            _out(f"stored {info.name} ({info.provider}, {info.preview}) in {v.backend.name}; "
+                 f"it will only be sent to {info.base}.")
             _out(f"Use {info.placeholder} wherever the key goes; `llmtap wrap` sets it for you.")
             return 0
         if action == "remove":

@@ -23,7 +23,7 @@ import zlib
 from collections.abc import Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Protocol
-from urllib.parse import parse_qsl, urlsplit
+from urllib.parse import parse_qsl, quote, urlsplit
 
 from . import __version__
 from .budget import Budget
@@ -33,7 +33,8 @@ from .config import Config
 from .guard import apply_guard
 from .models import CachedResponse, Exchange, Route, Usage
 from .pricing import cost_usd
-from .vault import TAG as VAULT_TAG, Refusal, find_placeholder, substitute, _local_midnight
+from .vault import (TAG as VAULT_TAG, Refusal, base_allows, caller_refusal, endpoint_refusal, find_placeholder,
+                    substitute, _local_midnight)
 from .providers import (
     EVENTSTREAM_CTYPE,
     bedrock_header_usage,
@@ -322,6 +323,37 @@ def _scrub(text: str, secrets: list[str]) -> str:
     return text
 
 
+def _scrub_bytes(data: bytes, secrets: list[bytes]) -> bytes:
+    for sec in secrets:
+        if sec and sec in data:
+            data = data.replace(sec, REDACTED.encode())
+    return data
+
+
+class _StreamScrub:
+    """Removes secrets from a byte stream even when one is split across chunks. Only a tail that could be the
+    start of a secret is held back (usually nothing), so streaming stays chunk-by-chunk."""
+
+    def __init__(self, secrets: list[bytes]) -> None:
+        self.secrets = [s for s in secrets if s]
+        self.pending = b""
+
+    def feed(self, chunk: bytes) -> bytes:
+        buf = _scrub_bytes(self.pending + chunk, self.secrets)
+        hold = 0
+        for sec in self.secrets:
+            for n in range(min(len(sec) - 1, len(buf)), 0, -1):
+                if buf.endswith(sec[:n]):
+                    hold = max(hold, n)
+                    break
+        self.pending = buf[len(buf) - hold:] if hold else b""
+        return buf[: len(buf) - hold] if hold else buf
+
+    def flush(self) -> bytes:
+        out, self.pending = self.pending, b""
+        return out
+
+
 def _storable_headers(headers: list[tuple[str, str]], secrets: list[str] | None = None) -> dict[str, str]:
     out: dict[str, str] = {}
     for k, v in headers:
@@ -569,8 +601,8 @@ class LLMTap:
 
     # ---------------------------------------------------------------- pipeline
     def handle(self, method: str, path: str, headers: Mapping[str, str], body: bytes,
-               respond: Responder) -> Exchange:
-        """Process one request end-to-end and return the (recorded) Exchange."""
+               respond: Responder, client: str | None = None) -> Exchange:
+        """Process one request end-to-end and return the (recorded) Exchange. ``client`` is the peer address."""
         method = (method or "GET").upper()
         path = path or "/"
         hdrs = _lower(headers)
@@ -606,30 +638,50 @@ class LLMTap:
         # request is routed (and forwarded) exactly as if the client had sent the real key itself.
         found = find_placeholder(hdrs, path)
         vault_info: Any = None
-        vault_problem: str | None = None
+        vault_refusal: Refusal | None = None
+        vault_secrets: list[str] = []
         if found is not None:
-            vault_info, secret, vault_problem = self._vault_lookup(found.name)
-            if secret:
-                hdrs, path = substitute(hdrs, path, found, secret)
-                ex.__dict__["_vault"] = vault_info
-        ex.__dict__["_secrets"] = _credentials(hdrs, path)
+            from .dashboard import _host_allowed
+            vault_refusal = caller_refusal(hdrs, client, _host_allowed(self, hdrs))
+            if vault_refusal is None and any(ord(c) < 33 or ord(c) == 127 for c in path):
+                vault_refusal = Refusal(400, "llmtap: the request URL contains spaces or control characters.",
+                                        "llmtap_bad_request")
+            if vault_refusal is None:
+                vault_info, secret, problem = self._vault_lookup(found.name)
+                if problem:
+                    vault_refusal = Refusal(401, problem, "llmtap_key_not_found")
+                elif secret:
+                    hdrs, path = substitute(hdrs, path, found, secret)
+                    ex.__dict__["_vault"] = vault_info
+                    vault_secrets = sorted({secret, quote(secret, safe="")}, key=len, reverse=True)
+                    ex.__dict__["_vault_secrets"] = vault_secrets
+        ex.__dict__["_secrets"] = sorted(set(_credentials(hdrs, path)) | set(vault_secrets), key=len, reverse=True)
         t0 = time.perf_counter()
-        out = _Tracked(respond, dict(_CORS_BASE))
+        # no `Access-Control-Allow-Origin: *` on anything involving a stored key: a web page must not read it
+        out = _Tracked(respond, {} if found is not None else dict(_CORS_BASE))
         style = "openai"
         try:
             route = resolve_route(path, hdrs, self.cfg)
             style = route.style
             ex.provider, ex.style = route.provider, route.style
             problem = bedrock_route_problem(route, path, hdrs)
-            if vault_problem:
+            if vault_refusal is not None:
                 ex.source = "blocked"
-                self._error(out, ex, route.style, 401, vault_problem, "llmtap_key_not_found")
+                self._error(out, ex, route.style, vault_refusal.status, vault_refusal.message, vault_refusal.err_type)
             elif vault_info is not None and vault_info.provider != route.provider:
                 ex.source = "blocked"
                 self._error(out, ex, route.style, 403,
                             f"llmtap: the stored key {vault_info.name!r} is for {vault_info.provider}, but this "
                             f"request goes to {route.provider}. Stored keys are only ever sent to their own "
                             "provider.", "llmtap_key_wrong_provider")
+            elif vault_info is not None and not base_allows(vault_info, route.upstream_base):
+                ex.source = "blocked"
+                self._error(out, ex, route.style, 403,
+                            f"llmtap: the stored key {vault_info.name!r} may only be sent to "
+                            f"{vault_info.base or 'its provider'}, but the {route.provider} upstream is configured "
+                            f"as {route.upstream_base}. If that is intended, store the key again for that URL "
+                            f"(`llmtap keys add {vault_info.name} --base {route.upstream_base}`).",
+                            "llmtap_key_wrong_upstream")
             elif problem:
                 ex.source = "error"
                 self._error(out, ex, route.style, 400, problem, "llmtap_bedrock_route")
@@ -655,8 +707,10 @@ class LLMTap:
         cfg = self.cfg
         req = parse_json(body)
         path_model = model_from_path(route.upstream_path)
-        # Bedrock names the model in the URL; its request bodies are model-native and rarely carry one
-        ex.model = (path_model if is_bedrock_call(route.upstream_path) else None) or request_model(req) or path_model
+        # Bedrock and Gemini name the model in the URL, and that is the model the upstream runs (a "model" field in
+        # a Gemini body is not what gets billed), so the URL wins there
+        url_model_wins = is_bedrock_call(route.upstream_path) or route.style == "gemini"
+        ex.model = (path_model if url_model_wins else None) or request_model(req) or path_model
         stream_req = is_stream_request(req)
         ex.tags = tags_from_headers(hdrs)
         ex.tags.pop(VAULT_TAG, None)          # llmtap's own attribution tag: a client header must not fake it
@@ -758,13 +812,15 @@ class LLMTap:
         # stored-key limits (paused, expiry, allowed models, daily / total spend) for calls that use the key
         vault_reserved: float | None = None
         if vault_info is not None:
+            def spent(k: Any) -> tuple[float, float]:
+                return (self.store.spent_by_tag(VAULT_TAG, k.name, _local_midnight()) if k.daily_usd else 0.0,
+                        self.store.spent_by_tag(VAULT_TAG, k.name, k.created) if k.total_usd else 0.0)
             try:
                 info = self.vault.get(vault_info.name) or vault_info      # pick up limit changes made meanwhile
-                today = (self.store.spent_by_tag(VAULT_TAG, info.name, _local_midnight())
-                         if cacheable and info.daily_usd else 0.0)
-                total = (self.store.spent_by_tag(VAULT_TAG, info.name, info.created)
-                         if cacheable and info.total_usd else 0.0)
-                refusal = self.vault.admit(info, ex.model, today, total, estimate, cacheable)
+                refusal = endpoint_refusal(info, method, route.upstream_path, cacheable)
+                if refusal is None:
+                    named = [ex.model, request_model(req), path_model]  # every model the request names
+                    refusal = self.vault.admit(info, named, estimate, cacheable, spent)
             except Exception as e:      # fail closed: limits that can't be checked must not be skipped
                 refusal = Refusal(503, f"llmtap: could not check the limits of the stored key "
                                        f"{vault_info.name!r}: {type(e).__name__}: {e}", "llmtap_key_check_failed")
@@ -826,6 +882,13 @@ class LLMTap:
         # request out of it, or wait for bytes that never come.
         for k in [k for k in fwd if k.lower() == "content-length"]:
             fwd[k] = str(len(body))
+        # stored key: anything the upstream echoes back is scrubbed before the client (or the history) sees it,
+        # which needs an uncompressed response
+        vsec = [s.encode() for s in (ex.__dict__.get("_vault_secrets") or [])]
+        if vsec:
+            for k in [k for k in fwd if k.lower() == "accept-encoding"]:
+                del fwd[k]
+            fwd["Accept-Encoding"] = "identity"
         try:
             try:
                 conn.request(method, full_path, body=body if (body or method in ("POST", "PUT", "PATCH")) else None,
@@ -845,6 +908,11 @@ class LLMTap:
             encoding = low.get("content-encoding", "")
             relay = [(k, v) for k, v in up_headers if k.lower() not in _RESP_HOP]
             client_h = _merge_headers(relay, {"x-llmtap-id": ex.id, "x-llmtap-source": "upstream"})
+            if vsec:
+                vstr = [s.decode() for s in vsec]
+                for k in list(client_h):
+                    client_h[k] = _scrub(client_h[k], vstr)
+            scrubber = _StreamScrub(vsec) if vsec else None
             bodyless = method == "HEAD" or resp.status in (204, 304) or resp.status < 200
             if bodyless and resp.status != 204 and "content-length" in low:
                 client_h["Content-Length"] = low["content-length"]   # HEAD / 304 describe the entity: keep its length
@@ -869,11 +937,22 @@ class LLMTap:
                     if ex.ttft_ms is None:
                         ex.ttft_ms = round((time.perf_counter() - t0) * 1000.0, 2)
                     raw += chunk
+                    piece = scrubber.feed(chunk) if scrubber else chunk
                     try:
-                        out.write(chunk)
+                        if piece:
+                            out.write(piece)
                     except ClientGone:
                         client_gone = True
                         break
+                if not (client_gone or upstream_err) and scrubber:
+                    try:
+                        tail = scrubber.flush()
+                        if tail:
+                            out.write(tail)
+                    except ClientGone:
+                        client_gone = True
+                if vsec:
+                    raw = bytearray(_scrub_bytes(bytes(raw), vsec))
                 if client_gone or upstream_err:
                     out.abort()
                 else:
@@ -892,6 +971,8 @@ class LLMTap:
                     status = 504 if isinstance(e, (socket.timeout, TimeoutError)) else 502
                     self._error(out, ex, route.style, status, msg, "llmtap_upstream_error")
                     return
+                if vsec:
+                    data = _scrub_bytes(data, vsec)
                 raw += data
                 ex.ttft_ms = round((time.perf_counter() - t0) * 1000.0, 2)
                 if not bodyless:
@@ -1101,6 +1182,9 @@ class LLMTap:
 
     def _error(self, out: _Tracked, ex: Exchange, style: str, status: int, message: str, err_type: str) -> None:
         """Send a provider-shaped JSON error and fill the exchange accordingly."""
+        secrets = ex.__dict__.get("_secrets")
+        if secrets:     # e.g. an http.client error quoting the URL, which may carry a swapped-in ?key=
+            message = _scrub(message, secrets)
         data = error_body(style, status, message, err_type)
         ex.status = status
         ex.error = ex.error or message
@@ -1388,7 +1472,7 @@ class _Handler(BaseHTTPRequestHandler):
                 r.end()
                 return
             headers = {k: v for k, v in self.headers.items()}
-            self.server.tap.handle(self.command, self.path, headers, body, r)
+            self.server.tap.handle(self.command, self.path, headers, body, r, client=str(self.client_address[0]))
             if not r.started:
                 data = b'{"error":{"message":"llmtap: no response produced","type":"llmtap_error"}}'
                 r.start(500, {"Content-Type": "application/json", "Content-Length": str(len(data))})

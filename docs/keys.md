@@ -20,11 +20,19 @@ Or open the dashboard (`llmtap serve`, then <http://127.0.0.1:4141/_llmtap/>), c
    pick it up with no changes. With `llmtap serve`, `eval "$(llmtap env)"` prints the same variables.
 3. **llmtap swaps it on the way out.** When a request carries a placeholder (in `Authorization: Bearer …`,
    `x-api-key`, `x-goog-api-key`, `api-key` or a `?key=` parameter), llmtap replaces it with the real key, checks the
-   key's limits, and forwards the request **only if it is going to that key's own provider**.
+   key's limits, and forwards the request **only to the upstream the key was stored for**: the provider's official
+   API (`https://api.openai.com`, …) unless you stored it with `--base <url>`. A project's `llmtap.toml` that points
+   `openai` somewhere else can't redirect a stored key; the call is refused with `llmtap_key_wrong_upstream`.
+
+Stored keys are for programs on this computer: requests from other machines, from web pages (a cross-site `Origin`
+or `Sec-Fetch-Site`) and to unexpected `Host` names (DNS rebinding) are refused, and responses to stored-key requests
+carry no `Access-Control-Allow-Origin`. Otherwise any website could spend `llmtap-key-openai`, since the name is easy
+to guess.
 
 The real key is never returned by the dashboard or any API, never written to the history database, and scrubbed
-from anything an upstream echoes back. Requests that use a stored key are tagged `vault_key=<name>`, so
-`llmtap stats --by tag:vault_key` shows spend per key.
+from error messages and from anything an upstream echoes back (headers and body, streamed or not; stored-key
+requests ask the upstream for uncompressed responses so this works). Requests that use a stored key are tagged
+`vault_key=<name>`, so `llmtap stats --by tag:vault_key` shows spend per key.
 
 If several keys exist for one provider, `wrap` uses the one named exactly like the provider (`openai`), else the
 alphabetically first. To pick a specific key, set the variable yourself: `OPENAI_API_KEY=llmtap-key-work-openai`.
@@ -43,10 +51,17 @@ llmtap keys limit openai --pause                       # refuse everything; --re
 | Limit | Refused with |
 |---|---|
 | Paused, expired | 403 `llmtap_key_paused` / `llmtap_key_expired` |
-| Model not in the allowed list (generation calls) | 403 `llmtap_key_model_not_allowed` |
-| Daily / total spend reached (generation calls) | 429 `llmtap_key_limit` |
+| A model the request names (URL or body) isn't in the allowed list | 403 `llmtap_key_model_not_allowed` |
+| Daily / total spend reached | 429 `llmtap_key_limit` |
+| A key with a spend limit, used with a model llmtap has no price for | 403 `llmtap_key_unpriced_model` |
+| A key with model or spend limits, used for an endpoint llmtap can't check (batches, images, audio, fine-tuning, long-running jobs) | 403 `llmtap_key_endpoint_not_allowed` |
 | Placeholder for a key that isn't stored | 401 `llmtap_key_not_found` |
-| Key sent towards another provider | 403 `llmtap_key_wrong_provider` |
+| Key sent towards another provider, or another URL than it was stored for | 403 `llmtap_key_wrong_provider` / `llmtap_key_wrong_upstream` |
+| Request from a web page on another site, another machine, or an unexpected `Host` | 403 `llmtap_key_cross_origin` / `llmtap_key_remote_client` / `llmtap_key_bad_host` |
+
+Limits only mean something if llmtap can count them, so they fail closed: a key with a spend limit refuses models
+without a price (add one under `[pricing_overrides]`), and a key with any model or spend limit only reaches generation
+calls, reads (`GET`) and token counting. Use a key without limits for anything else.
 
 Errors are shaped like the provider's own, so your SDK raises its usual exception with llmtap's message. Spend caps
 work like the global budgets: spend is read from llmtap's history database (calls since local midnight, or since the
@@ -59,12 +74,14 @@ cassette hits are free and never reach the provider, so they don't need the key 
 | Command | What it does |
 |---|---|
 | `llmtap keys` / `llmtap keys list` | Stored keys (masked), their placeholders and limits |
-| `llmtap keys add NAME [--provider P]` | Store or replace a key. Prompts with hidden input, or reads one line from stdin |
+| `llmtap keys add NAME [--provider P] [--base URL]` | Store or replace a key (keeping its limits). Prompts with hidden input, or reads one line from stdin |
 | `llmtap keys limit NAME [--daily USD] [--total USD] [--models LIST] [--expires WHEN] [--pause\|--resume]` | Set limits |
 | `llmtap keys remove NAME` | Delete the key from the credential store and llmtap |
 
 `--provider` defaults to the name when the name is a provider (`openai`, `anthropic`, `gemini`, …). For a custom
-upstream, use its name: `llmtap keys add work --provider my-gateway`.
+upstream, use its name: `llmtap keys add work --provider my-gateway`; the key is then bound to that upstream's URL in
+your current configuration (or `--base`). To send a built-in provider's key through a gateway, store it with
+`--base https://your-gateway`.
 
 ## Where secrets are stored
 

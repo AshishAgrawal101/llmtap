@@ -22,22 +22,6 @@ ANTHROPIC_KEY = "sk-ant-" + "test" + "0123456789abcdefANTH"
 GEMINI_KEY = "AIza" + "Test" + "0123456789abcdefGEMINI00"
 
 
-@pytest.fixture()
-def vault(tmp_path: Path) -> Vault:
-    return Vault(home=tmp_path / "home", backend=MemoryBackend())
-
-
-@pytest.fixture()
-def vtap(tap: Any, vault: Vault, mock_upstream: Any) -> Any:
-    """A proxy (anthropic, openai and gemini upstreams on the mock) using a throwaway vault."""
-    def make(**overrides: Any) -> Any:
-        ups = {"gemini": {"base": mock_upstream.base_url, "style": "gemini"}}
-        t = tap(upstreams=ups, **overrides)
-        t._vault = vault
-        return t
-    return make
-
-
 def _call(t: Any, path: str, body: dict | None, headers: dict[str, str], method: str = "POST") -> tuple[int, dict]:
     c = http.client.HTTPConnection("127.0.0.1", t.port, timeout=10)
     data = json.dumps(body).encode() if body is not None else None
