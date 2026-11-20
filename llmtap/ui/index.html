@@ -185,6 +185,30 @@ tr.leak td.t-time{box-shadow:inset 2px 0 0 var(--bad)}
 .snip button{flex:none;border:0;border-left:1px solid var(--border);background:none;color:var(--muted);padding:0 12px}
 .snip button:hover{color:var(--text);background:var(--panel2)}
 
+/* keys */
+#keysBtn{margin-left:4px}
+.kadd{display:grid;grid-template-columns:150px 150px minmax(0,1fr) auto;gap:10px;align-items:end;padding:14px;border:1px solid var(--border);border-radius:var(--r);background:var(--panel)}
+.kadd label,.klim label{display:flex;flex-direction:column;gap:5px;font-size:10.5px;font-weight:600;letter-spacing:.07em;text-transform:uppercase;color:var(--dim)}
+.kadd input,.klim input{height:30px;border-radius:8px;border:1px solid var(--border);background:var(--bg2);color:var(--text);padding:0 10px;font:inherit;font-size:12.5px;outline:none;text-transform:none;letter-spacing:0;font-weight:400}
+.kadd input:focus,.klim input:focus{border-color:rgba(139,141,255,.6);box-shadow:0 0 0 3px rgba(139,141,255,.15)}
+.kadd select{text-transform:none;letter-spacing:0;font-weight:400}
+.khint{color:var(--muted);font-size:12px;margin:10px 2px 14px;line-height:1.55}
+.khint code,.kcard code{font-family:var(--mono);font-size:11.5px;color:var(--text2);background:var(--panel3);border-radius:5px;padding:1px 5px}
+.kcard{border:1px solid var(--border);border-radius:var(--r);background:var(--panel);padding:13px 14px;margin-bottom:10px}
+.kcard.off{opacity:.72}
+.khead{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.kname{font-family:var(--mono);font-size:13.5px;font-weight:600;color:var(--text)}
+.kprov{font-size:11px;color:var(--text2);border:1px solid var(--border2);border-radius:999px;padding:1px 8px}
+.kstate{font-size:11px;font-weight:600;border-radius:999px;padding:1px 8px;background:rgba(52,211,153,.12);color:var(--good)}
+.kstate.p{background:rgba(251,191,36,.12);color:var(--warn)} .kstate.x{background:rgba(248,113,113,.12);color:var(--bad)}
+.kspend{margin-left:auto;font-size:12px;color:var(--muted)} .kspend b{color:var(--text);font-weight:600}
+.kph{display:flex;align-items:center;gap:8px;margin:9px 0 11px;font-size:12px;color:var(--muted);flex-wrap:wrap}
+.kph button{border:0;background:none;color:var(--accent);padding:0;font-size:12px}
+.klim{display:grid;grid-template-columns:110px 110px minmax(0,1fr) 150px auto;gap:10px;align-items:end}
+.ktog{display:flex;align-items:center;gap:6px;height:30px;font-size:12.5px;color:var(--text2);text-transform:none;letter-spacing:0;font-weight:400}
+.kbtns{display:flex;gap:8px;justify-content:flex-end;margin-top:11px}
+@media (max-width:760px){.kadd,.klim{grid-template-columns:minmax(0,1fr) minmax(0,1fr)} .kadd .wide,.klim .wide{grid-column:1/-1}}
+
 /* drawer */
 .backdrop{position:fixed;inset:0;background:rgba(3,4,7,.55);backdrop-filter:blur(2px);opacity:0;pointer-events:none;transition:opacity .2s;z-index:40}
 .backdrop.open{opacity:1;pointer-events:auto}
@@ -280,6 +304,7 @@ footer .keys{display:flex;gap:14px;flex-wrap:wrap}
   <button class="urlchip" id="urlchip" title="Copy proxy base URL"></button>
   <div class="spacer"></div>
   <div class="pills" id="pills"></div>
+  <button class="btn" id="keysBtn" title="Stored API keys: apps and AI agents use them without seeing them"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="5.5" cy="10.5" r="3"/><path d="M7.7 8.3L13.5 2.5M11 5l2 2M12.5 3.5l1.5 1.5"/></svg>Keys</button>
 </header>
 
 <main>
@@ -351,6 +376,24 @@ footer .keys{display:flex;gap:14px;flex-wrap:wrap}
     <div class="tabs" id="tabs"><button data-t="conv" class="on">Conversation</button><button data-t="req">Request JSON</button><button data-t="resp">Response</button><button data-t="meta">Meta</button></div>
   </div>
   <div class="db" id="dBody"></div>
+</aside>
+<aside class="drawer" id="keysDrawer" aria-hidden="true" role="dialog" aria-label="Stored API keys">
+  <div class="dh" style="padding-bottom:14px">
+    <div class="dh-top"><div class="dh-title" style="font-family:var(--sans)">Stored API keys</div><div class="spacer"></div>
+      <button class="iconbtn" id="keysClose" title="Close (Esc)"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 4l8 8M12 4l-8 8"/></svg></button></div>
+    <div class="dh-meta">Paste a key once. Apps and AI agents then use its placeholder; llmtap swaps in the real key on the way to that provider, within the limits you set.</div>
+  </div>
+  <div class="db">
+    <form class="kadd" id="kAdd" autocomplete="off">
+      <label>Name<input id="kName" placeholder="openai" maxlength="40" required></label>
+      <label>Provider<select id="kProv"></select></label>
+      <label class="wide">API key<input id="kSecret" type="password" placeholder="Paste the key: it is never shown again" required></label>
+      <button class="btn primary" type="submit">Save key</button>
+    </form>
+    <div class="khint" id="kBackend"></div>
+    <div id="kList"></div>
+    <div class="khint">Use <code>llmtap wrap -- &lt;command&gt;</code> and the placeholders are set for you, or set the variable yourself, e.g. <code>OPENAI_API_KEY=llmtap-key-openai</code>. Anything that can run commands as you on this computer can still read your OS credential store or change these limits: this keeps keys out of prompts, logs and code, it is not a sandbox.</div>
+  </div>
 </aside>
 <div class="toast" id="toast"></div>
 
@@ -889,7 +932,76 @@ $('#range').addEventListener('click', function(e){ var b = e.target.closest('but
 $('#metric').addEventListener('click', function(e){ var b = e.target.closest('button'); if (!b) return; S.metric = b.getAttribute('data-m'); [].forEach.call(this.children, function(c){ c.classList.toggle('on', c === b); }); drawChart(); });
 $('#tbody').addEventListener('click', function(e){ var tr = e.target.closest('tr'); if (!tr) return; var i = [].indexOf.call(this.children, tr); select(i, true); });
 $('#tabs').addEventListener('click', function(e){ var b = e.target.closest('button'); if (b) setTab(b.getAttribute('data-t')); });
-$('#backdrop').addEventListener('click', closeDrawer);
+/* ---------- stored keys ---------- */
+var K = {open:false, data:null};
+function keysApi(path, obj){
+  return fetch(BASE + path, {method:'POST', cache:'no-store', body:JSON.stringify(obj||{}),
+    headers:{'content-type':'application/json', 'accept':'application/json', 'x-llmtap-request':'dashboard'}})
+    .then(function(r){ return r.json().catch(function(){ return {}; }).then(function(j){ if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status)); return j; }); });
+}
+function openKeys(){ closeDrawer(); K.open = true; $('#keysDrawer').classList.add('open'); $('#backdrop').classList.add('open'); $('#keysDrawer').setAttribute('aria-hidden','false'); loadKeys(); }
+function closeKeys(){ K.open = false; $('#keysDrawer').classList.remove('open'); if (!S.open) $('#backdrop').classList.remove('open'); $('#keysDrawer').setAttribute('aria-hidden','true'); }
+function loadKeys(){ return api('/api/keys').then(function(d){ K.data = d; renderKeys(); }).catch(function(e){ $('#kList').innerHTML = '<div class="khint">Could not load keys: ' + esc(e.message) + '</div>'; }); }
+function dateVal(ts){ if (!ts) return ''; var d = new Date(ts*1000); return d.getFullYear() + '-' + pad(d.getMonth()+1) + '-' + pad(d.getDate()); }
+function keyCard(k){
+  var now = Date.now()/1000, expired = k.expires && now >= k.expires;
+  var state = k.paused ? '<span class="kstate p">Paused</span>' : expired ? '<span class="kstate x">Expired</span>' : '<span class="kstate">Active</span>';
+  var spend = '<span class="kspend">today <b>' + fmtUsd(k.spent_today_usd) + '</b>' + (k.daily_usd ? ' / ' + fmtUsd(k.daily_usd) : '') +
+              ' · total <b>' + fmtUsd(k.spent_total_usd) + '</b>' + (k.total_usd ? ' / ' + fmtUsd(k.total_usd) : '') + '</span>';
+  var envs = (k.env || []).map(function(v){ return '<code>' + esc(v) + '</code>'; }).join(' ');
+  return '<div class="kcard' + (k.paused || expired ? ' off' : '') + '" data-k="' + esc(k.name) + '">' +
+    '<div class="khead"><span class="kname">' + esc(k.name) + '</span><span class="kprov">' + esc(k.provider) + '</span>' + state +
+    '<span class="kprov" title="Masked: the full key is never shown">' + esc(k.preview) + '</span>' + spend + '</div>' +
+    '<div class="kph">Use <code>' + esc(k.placeholder) + '</code><button type="button" data-copy-ph="' + esc(k.placeholder) + '">Copy</button>' + (envs ? ' as ' + envs : '') + '</div>' +
+    '<div class="klim">' +
+      '<label>Daily $<input type="number" min="0" step="0.01" data-f="daily_usd" value="' + (k.daily_usd || '') + '" placeholder="no cap"></label>' +
+      '<label>Total $<input type="number" min="0" step="0.01" data-f="total_usd" value="' + (k.total_usd || '') + '" placeholder="no cap"></label>' +
+      '<label class="wide">Allowed models<input data-f="models" value="' + esc((k.models || []).join(', ')) + '" placeholder="any (e.g. gpt-4o-mini, claude-haiku-*)"></label>' +
+      '<label>Expires<input type="date" data-f="expires" value="' + dateVal(k.expires) + '"></label>' +
+      '<label class="ktog"><input type="checkbox" data-f="paused"' + (k.paused ? ' checked' : '') + '>Paused</label>' +
+    '</div>' +
+    '<div class="kbtns"><button type="button" class="btn danger" data-act="delete">Delete</button><button type="button" class="btn primary" data-act="save">Save limits</button></div></div>';
+}
+function renderKeys(){
+  var d = K.data || {keys:[], providers:[]};
+  var sel = $('#kProv'), cur = sel.value;
+  sel.innerHTML = (d.providers || []).map(function(p){ return '<option>' + esc(p) + '</option>'; }).join('');
+  if (cur) sel.value = cur; else if ((d.providers || []).indexOf('openai') >= 0) sel.value = 'openai';
+  $('#kBackend').textContent = 'Secrets are stored in: ' + (d.backend || 'unknown') + '. llmtap only keeps a masked preview and the limits.';
+  $('#kList').innerHTML = d.keys.length ? d.keys.map(keyCard).join('') : '<div class="khint">No stored keys yet.</div>';
+}
+function limitsOf(card){
+  var o = {};
+  [].forEach.call(card.querySelectorAll('[data-f]'), function(el){
+    var f = el.getAttribute('data-f');
+    if (f === 'paused') o.paused = el.checked;
+    else if (f === 'models') o.models = el.value;
+    else if (f === 'expires') o.expires = el.value ? new Date(el.value + 'T23:59:59').getTime()/1000 : 0;
+    else o[f] = el.value === '' ? 0 : +el.value;
+  });
+  return o;
+}
+$('#keysBtn').addEventListener('click', openKeys);
+$('#keysClose').addEventListener('click', closeKeys);
+$('#kName').addEventListener('input', function(){ var n = this.value.trim().toLowerCase(), opts = [].map.call($('#kProv').options, function(o){ return o.value; }); if (opts.indexOf(n) >= 0) $('#kProv').value = n; });
+$('#kAdd').addEventListener('submit', function(e){ e.preventDefault();
+  var secretEl = $('#kSecret');
+  keysApi('/api/keys', {name:$('#kName').value, provider:$('#kProv').value, secret:secretEl.value})
+    .then(function(r){ secretEl.value = ''; $('#kName').value = ''; toast('Saved ' + r.key.name + ' (' + r.key.preview + ')'); loadKeys(); })
+    .catch(function(err){ toast(err.message); }); });
+$('#kList').addEventListener('click', function(e){
+  var c = e.target.closest('[data-copy-ph]'); if (c){ copy(c.getAttribute('data-copy-ph'), 'Copied placeholder'); return; }
+  var b = e.target.closest('[data-act]'); if (!b) return;
+  var card = b.closest('[data-k]'), name = card.getAttribute('data-k');
+  if (b.getAttribute('data-act') === 'delete'){
+    if (!confirm('Delete the stored key "' + name + '"? Apps using its placeholder will stop working.')) return;
+    keysApi('/api/keys/' + encodeURIComponent(name) + '/delete', {}).then(function(){ toast('Deleted ' + name); loadKeys(); }).catch(function(err){ toast(err.message); });
+  } else {
+    keysApi('/api/keys/' + encodeURIComponent(name), limitsOf(card)).then(function(){ toast('Saved limits for ' + name); loadKeys(); }).catch(function(err){ toast(err.message); });
+  }
+});
+
+$('#backdrop').addEventListener('click', function(){ closeDrawer(); closeKeys(); });
 $('#closeBtn').addEventListener('click', closeDrawer);
 $('#curlBtn').addEventListener('click', function(){ var ex = S.open && S.detail[S.open]; if (ex) copy(curlFor(ex), 'Copied curl command'); });
 $('#dBody').addEventListener('click', function(e){ var b = e.target.closest('[data-copy-raw]'); if (!b) return; var ex = S.detail[S.open]; if (!ex) return; copy(S.tab === 'req' ? pretty(ex.request_body) : (ex.streamed ? ex.response_body : pretty(ex.response_body))); });
@@ -900,8 +1012,8 @@ $('#urlchip').textContent = ORIGIN.replace(/^https?:\/\//, '');
 $('#urlchip').addEventListener('click', function(){ copy(ORIGIN, 'Copied ' + ORIGIN); });
 document.addEventListener('keydown', function(e){
   var t = e.target, typing = t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable);
-  if (e.key === 'Escape'){ if (S.open){ closeDrawer(); e.preventDefault(); } else if (typing) t.blur(); return; }
-  if (typing || e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.key === 'Escape'){ if (K.open){ closeKeys(); e.preventDefault(); } else if (S.open){ closeDrawer(); e.preventDefault(); } else if (typing) t.blur(); return; }
+  if (typing || e.metaKey || e.ctrlKey || e.altKey || K.open) return;
   if (e.key === '/'){ e.preventDefault(); var q = $('#q'); q.focus(); q.select(); }
   else if (e.key === 'j' || e.key === 'ArrowDown' && S.open){ e.preventDefault(); select(S.sel < 0 ? 0 : S.sel + 1, false); }
   else if (e.key === 'k' || e.key === 'ArrowUp' && S.open){ e.preventDefault(); select(S.sel < 0 ? 0 : S.sel - 1, false); }

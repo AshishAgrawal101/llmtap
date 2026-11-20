@@ -451,6 +451,16 @@ class Store:
             ).fetchone()
         return float(row[0])
 
+    def spent_by_tag(self, tag: str, value: str, since: float) -> float:
+        """Like :meth:`spent_since`, for calls whose tag ``tag`` equals ``value`` (e.g. one stored API key)."""
+        with self._lock:
+            row = self._c().execute(
+                "SELECT COALESCE(SUM(cost_usd),0) FROM exchanges WHERE source = 'upstream' AND ts >= ? "
+                "AND json_valid(tags) AND json_extract(tags, '$.' || ?) = ?",
+                (float(since), str(tag), str(value)),
+            ).fetchone()
+        return float(row[0])
+
     def timeseries(self, since: float, bucket_s: int = 3600) -> list[dict]:
         """Ascending buckets: [{"t": bucket_start, "requests", "cost_usd", "tokens"}]."""
         b = max(1, int(bucket_s))

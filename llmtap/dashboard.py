@@ -387,6 +387,65 @@ def _same_origin(headers: Any) -> bool:
     return urlsplit(origin).netloc.lower() == host.lower()
 
 
+# --------------------------------------------------------------------------------------------
+# key vault API (never returns a secret)
+# --------------------------------------------------------------------------------------------
+
+KEYS_HEADER = "x-llmtap-request"     # must be "dashboard": a custom header forces a CORS preflight, which we refuse
+MAX_KEYS_BODY = 16 * 1024
+
+
+def _keys_payload(tap: "LLMTap") -> dict[str, Any]:
+    from .vault import PROVIDER_ENV, TAG
+    v = tap.vault
+    midnight = _local_midnight()
+    keys = []
+    for k in v.list():
+        d = k.to_dict()
+        d["spent_today_usd"] = tap.store.spent_by_tag(TAG, k.name, midnight)
+        d["spent_total_usd"] = tap.store.spent_by_tag(TAG, k.name, k.created)
+        d["env"] = list(PROVIDER_ENV.get(k.provider, ()))
+        keys.append(d)
+    try:
+        backend = v.backend.name
+    except Exception as e:
+        backend = f"unavailable ({e})"
+    providers = sorted(set(getattr(tap.cfg, "upstreams", {}) or {}) | set(PROVIDER_ENV))
+    return {"keys": keys, "backend": backend, "providers": providers}
+
+
+def _keys_write(tap: "LLMTap", sub: str, headers: Any, body: bytes) -> tuple[int, dict[str, Any]]:
+    from .vault import VaultError
+    if not _same_origin(headers) or (_header(headers, KEYS_HEADER) or "").strip().lower() != "dashboard":
+        return 403, {"error": "llmtap: key changes are only accepted from the llmtap dashboard"}
+    if len(body) > MAX_KEYS_BODY:
+        return 413, {"error": "request too large"}
+    try:
+        data = json.loads(body.decode("utf-8") or "{}")
+    except (UnicodeDecodeError, ValueError):
+        return 400, {"error": "expected a JSON object"}
+    if not isinstance(data, dict):
+        return 400, {"error": "expected a JSON object"}
+    limit_keys = ("daily_usd", "total_usd", "models", "expires", "paused")
+    limits = {k: data[k] for k in limit_keys if k in data}
+    v = tap.vault
+    try:
+        if sub == "/api/keys":
+            info = v.add(str(data.get("name") or ""), str(data.get("provider") or ""), str(data.get("secret") or ""),
+                         **limits)
+            return 200, {"ok": True, "key": info.to_dict()}
+        name = sub[len("/api/keys/"):]
+        if name.endswith("/delete"):
+            name = name[: -len("/delete")]
+            if not v.remove(name):
+                return 404, {"error": f"no stored key named {name!r}"}
+            return 200, {"ok": True}
+        info = v.update(name, **limits)
+        return 200, {"ok": True, "key": info.to_dict()}
+    except VaultError as e:
+        return 400, {"error": str(e)}
+
+
 def handle_internal(tap: "LLMTap", method: str, path: str, headers: Any, body: bytes, respond: Responder) -> bool:
     """Serve ``/_llmtap/*``. Returns True if the request was handled (always, for that prefix)."""
     parts = urlsplit(path)
@@ -436,6 +495,9 @@ def handle_internal(tap: "LLMTap", method: str, path: str, headers: Any, body: b
             if sub == "/api/timeseries":
                 _json(respond, _timeseries(tap, qs))
                 return True
+            if sub == "/api/keys":
+                _json(respond, _keys_payload(tap))
+                return True
             if sub == "/api/events":
                 if method == "HEAD":   # bodyless: writes are no-ops, so a stream would never notice the client left
                     _send(respond, 200, b"", "text/event-stream; charset=utf-8")
@@ -449,6 +511,10 @@ def handle_internal(tap: "LLMTap", method: str, path: str, headers: Any, body: b
                     return True
                 tap.store.clear()
                 _json(respond, {"ok": True})
+                return True
+            if sub == "/api/keys" or sub.startswith("/api/keys/"):
+                status, obj = _keys_write(tap, sub, headers, body)
+                _json(respond, obj, status)
                 return True
         _error(respond, 404, f"no route for {method} {route}")
         return True

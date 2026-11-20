@@ -401,6 +401,21 @@ git diff | llmtap scan -
 
 Full table of detectors: **[docs/guard.md](docs/guard.md)**
 
+## 🔑 Key vault: your AI never sees your API keys
+
+Paste a key once and let your code, or an AI coding agent working on it, use it without seeing it:
+
+```bash
+llmtap keys add openai          # hidden prompt; stored in Windows Credential Manager / macOS Keychain / Secret Service
+llmtap wrap -- python app.py    # the app gets OPENAI_API_KEY=llmtap-key-openai; llmtap sends the real key
+```
+
+Or click **Keys** in the dashboard and paste it there. llmtap swaps the placeholder for the real key on the way out,
+only towards that key's own provider, and only within the limits you set per key: a daily or total dollar cap,
+allowed models, an expiry date, or a pause switch. The real key is never shown again, never stored in the history and
+scrubbed from anything echoed back. It keeps keys out of prompts, logs and committed files; it is not a sandbox
+against programs running as you. Details: **[docs/keys.md](docs/keys.md)**
+
 ## 🧯 Budgets & loop breaker
 
 ```bash
@@ -462,6 +477,7 @@ Every field, env var and flag: **[docs/configuration.md](docs/configuration.md)*
 | `llmtap doctor [--online]` | Check your setup (port, db, env vars, SQLite) and get fix hints |
 | `llmtap prices [filter]` | Show the built-in price table |
 | `llmtap scan [file\|-]` | Scan text for secrets; exit 1 on findings |
+| `llmtap keys [add\|limit\|remove] …` | Store API keys apps can use without seeing them, with per-key limits ([docs](docs/keys.md)) |
 | `llmtap clear [--yes]` | Delete recorded history |
 | `llmtap version` | Print the version |
 

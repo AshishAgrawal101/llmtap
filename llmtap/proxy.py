@@ -33,6 +33,7 @@ from .config import Config
 from .guard import apply_guard
 from .models import CachedResponse, Exchange, Route, Usage
 from .pricing import cost_usd
+from .vault import TAG as VAULT_TAG, Refusal, find_placeholder, substitute, _local_midnight
 from .providers import (
     EVENTSTREAM_CTYPE,
     bedrock_header_usage,
@@ -438,6 +439,8 @@ class LLMTap:
         if cfg.otel_endpoint:
             from .otel import OtelExporter
             self.otel = OtelExporter(cfg.otel_endpoint)
+        self._vault: Any = None             # key vault, opened on first use (a placeholder or the Keys API)
+        self._vault_lock = threading.Lock()
         self.port: int = cfg.port
         self.started_at: float = time.time()
         self._server: _Server | None = None
@@ -454,6 +457,32 @@ class LLMTap:
         if ":" in host and not host.startswith("["):
             host = f"[{host}]"
         return f"http://{host}:{self.port}"
+
+    @property
+    def vault(self) -> Any:
+        """The key vault (``~/.llmtap/keys.json`` + the OS credential store), opened lazily."""
+        if self._vault is None:
+            with self._vault_lock:
+                if self._vault is None:
+                    from .vault import Vault
+                    self._vault = Vault()
+        return self._vault
+
+    def _vault_lookup(self, name: str) -> tuple[Any, str | None, str | None]:
+        """(KeyInfo, secret, problem) for a placeholder's key name. Messages never contain a secret."""
+        try:
+            v = self.vault
+            info = v.get(name)
+            if info is None:
+                return None, None, (f"llmtap: no stored API key named {name!r}. Add it in the llmtap dashboard "
+                                    f"(Keys) or with `llmtap keys add {name}`.")
+            secret = v.secret(name)
+            if not secret:
+                return info, None, (f"llmtap: the stored key {name!r} has no secret in the {v.backend.name} store. "
+                                    "Add it again in the dashboard (Keys) or with `llmtap keys add`.")
+            return info, secret, None
+        except Exception as e:
+            return None, None, f"llmtap: the key vault is unavailable: {e}"
 
     @property
     def is_exposed(self) -> bool:
@@ -573,6 +602,16 @@ class LLMTap:
 
         # -- proxied LLM call ---------------------------------------------------------------
         ex = Exchange(method=method, path=_mask_path(path))
+        # Key vault: a `llmtap-key-<name>` placeholder is replaced by the stored key before routing, so the
+        # request is routed (and forwarded) exactly as if the client had sent the real key itself.
+        found = find_placeholder(hdrs, path)
+        vault_info: Any = None
+        vault_problem: str | None = None
+        if found is not None:
+            vault_info, secret, vault_problem = self._vault_lookup(found.name)
+            if secret:
+                hdrs, path = substitute(hdrs, path, found, secret)
+                ex.__dict__["_vault"] = vault_info
         ex.__dict__["_secrets"] = _credentials(hdrs, path)
         t0 = time.perf_counter()
         out = _Tracked(respond, dict(_CORS_BASE))
@@ -582,7 +621,16 @@ class LLMTap:
             style = route.style
             ex.provider, ex.style = route.provider, route.style
             problem = bedrock_route_problem(route, path, hdrs)
-            if problem:
+            if vault_problem:
+                ex.source = "blocked"
+                self._error(out, ex, route.style, 401, vault_problem, "llmtap_key_not_found")
+            elif vault_info is not None and vault_info.provider != route.provider:
+                ex.source = "blocked"
+                self._error(out, ex, route.style, 403,
+                            f"llmtap: the stored key {vault_info.name!r} is for {vault_info.provider}, but this "
+                            f"request goes to {route.provider}. Stored keys are only ever sent to their own "
+                            "provider.", "llmtap_key_wrong_provider")
+            elif problem:
                 ex.source = "error"
                 self._error(out, ex, route.style, 400, problem, "llmtap_bedrock_route")
             else:
@@ -611,6 +659,10 @@ class LLMTap:
         ex.model = (path_model if is_bedrock_call(route.upstream_path) else None) or request_model(req) or path_model
         stream_req = is_stream_request(req)
         ex.tags = tags_from_headers(hdrs)
+        ex.tags.pop(VAULT_TAG, None)          # llmtap's own attribution tag: a client header must not fake it
+        vault_info = ex.__dict__.get("_vault")
+        if vault_info is not None:
+            ex.tags[VAULT_TAG] = vault_info.name
 
         llm = _is_llm_call(method, route.upstream_path)
         ctype = hdrs.get("content-type", "")
@@ -693,14 +745,39 @@ class LLMTap:
 
         # spend caps: only for generation calls that will actually reach the upstream
         reservation = None
+        estimate = self._estimate_cost(ex, route, req, send_body) if cacheable else 0.0
         if cacheable:
-            verdict = self.budget.check_spend(self._estimate_cost(ex, route, req, send_body))
+            verdict = self.budget.check_spend(estimate)
             if not verdict.allowed:
                 ex.source = "budget"
                 self._error(out, ex, route.style, 429, verdict.reason or "llmtap budget exceeded",
                             "llmtap_budget_exceeded")
                 return
             reservation = verdict.reservation
+
+        # stored-key limits (paused, expiry, allowed models, daily / total spend) for calls that use the key
+        vault_reserved: float | None = None
+        if vault_info is not None:
+            try:
+                info = self.vault.get(vault_info.name) or vault_info      # pick up limit changes made meanwhile
+                today = (self.store.spent_by_tag(VAULT_TAG, info.name, _local_midnight())
+                         if cacheable and info.daily_usd else 0.0)
+                total = (self.store.spent_by_tag(VAULT_TAG, info.name, info.created)
+                         if cacheable and info.total_usd else 0.0)
+                refusal = self.vault.admit(info, ex.model, today, total, estimate, cacheable)
+            except Exception as e:      # fail closed: limits that can't be checked must not be skipped
+                refusal = Refusal(503, f"llmtap: could not check the limits of the stored key "
+                                       f"{vault_info.name!r}: {type(e).__name__}: {e}", "llmtap_key_check_failed")
+            if refusal is not None:
+                self.budget.release(reservation)
+                ex.source = "budget" if refusal.status == 429 else "blocked"
+                self._error(out, ex, route.style, refusal.status, refusal.message, refusal.err_type)
+                return
+            vault_reserved = estimate if cacheable else None
+            if vault_reserved is not None:
+                # held until the exchange is stored (see _finish): per-key spend is read from the database, and the
+                # client can get its response (and send the next call) before the row is written
+                ex.__dict__["_vault_hold"] = (vault_info.name, vault_reserved)
 
         try:
             self._forward(ex, route, method, hdrs, send_body, req, stream_req, key, out, t0)
@@ -1072,10 +1149,17 @@ class LLMTap:
             _seal(ex)
         except Exception:
             ex.__dict__.pop("_secrets", None)
+        hold = ex.__dict__.pop("_vault_hold", None)
         try:
             self.store.record(ex)
         except Exception as e:
             ex.error = ex.error or f"store write failed: {e}"
+        finally:
+            if hold is not None:
+                try:
+                    self.vault.release(*hold)
+                except Exception:
+                    pass
         try:
             self.bus.publish({"type": "exchange", "exchange": summarize(ex)})
         except Exception:

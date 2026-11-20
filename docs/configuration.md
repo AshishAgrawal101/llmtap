@@ -78,7 +78,8 @@ Other environment variables:
 
 | Variable | Meaning |
 |---|---|
-| `LLMTAP_HOME` | Data directory (default `~/.llmtap`). The default database lives here. |
+| `LLMTAP_HOME` | Data directory (default `~/.llmtap`). The default database and the key vault's `keys.json` live here. |
+| `LLMTAP_VAULT_BACKEND` | Where stored API keys are kept: `auto` (default: the OS credential store, else a private file), `os`, `file` or `memory`. See [keys.md](keys.md). |
 | `NO_COLOR` | Disable ANSI colours in terminal output. Colours are also off when the output stream isn't a TTY. |
 | `FORCE_COLOR` | Force ANSI colours on, even when the output isn't a TTY (`0`, `false`, `no`, `off` don't count). |
 

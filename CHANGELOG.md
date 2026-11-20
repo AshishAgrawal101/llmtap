@@ -8,6 +8,12 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- **Key vault**: store an API key once (`llmtap keys add openai`, or the dashboard's new **Keys** panel) and let apps
+  and AI coding agents use it without seeing it. The secret lives in the OS credential store (Windows Credential
+  Manager, macOS Keychain, Linux Secret Service; a private file otherwise); code uses a placeholder such as
+  `llmtap-key-openai`, which `llmtap wrap` puts in `OPENAI_API_KEY` and friends, and llmtap swaps in the real key on
+  the way out, only towards that key's provider. Per-key limits: daily and total dollar caps, allowed models, expiry
+  and pause. The key is never returned by any API or written to the history. See [docs/keys.md](docs/keys.md).
 - **OpenTelemetry spend export** (thanks @KEYUR141, #8): set `otel_endpoint` (or `LLMTAP_OTEL_ENDPOINT`) to an
   OTLP/HTTP collector and every priced call is exported as the `llmtap.cost` counter in USD, with the provider and
   model as GenAI semantic-convention attributes. Off by default, sent in the background, never includes prompts,

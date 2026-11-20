@@ -248,6 +248,25 @@ def build_parser() -> argparse.ArgumentParser:
                     help="html (default; or inferred from -o extension), md or json")
     sp.add_argument("--open", action="store_true", help="open the HTML report in your browser")
 
+    sp = add("keys", "store API keys so apps and AI agents can use them through llmtap without seeing them")
+    ks = sp.add_subparsers(dest="keys_action", metavar="<action>")
+    ks.add_parser("list", help="list stored keys (masked) and their limits")
+    k = ks.add_parser("add", help="store a key (asks for it; or pipe it on stdin)")
+    k.add_argument("name", help="a name such as openai, anthropic or work-openai")
+    k.add_argument("--provider", default=None, help="upstream it is for (default: the name, if it is a provider)")
+    k = ks.add_parser("remove", help="delete a stored key")
+    k.add_argument("name")
+    k = ks.add_parser("limit", help="set limits for a stored key")
+    k.add_argument("name")
+    k.add_argument("--daily", type=float, default=None, metavar="USD", help="daily spend cap (0 = none)")
+    k.add_argument("--total", type=float, default=None, metavar="USD", help="total spend cap (0 = none)")
+    k.add_argument("--models", default=None, metavar="LIST",
+                   help="comma-separated allowed models; * wildcards ok; '' = any")
+    k.add_argument("--expires", default=None, metavar="WHEN", help="YYYY-MM-DD[THH:MM] (local time), or never")
+    g = k.add_mutually_exclusive_group()
+    g.add_argument("--pause", action="store_true", help="refuse every call that uses this key")
+    g.add_argument("--resume", action="store_true", help="undo --pause")
+
     sp = add("doctor", "check your setup (port, db, env vars, SDK base URLs) and print fix hints", [db])
     sp.add_argument("--online", action="store_true", help="also check that the upstream API hosts are reachable (5s timeout)")
     sp.add_argument("--host", default=S)
@@ -393,6 +412,7 @@ def cmd_env(args: argparse.Namespace) -> int:
         host = f"[{host}]"  # IPv6 literal
     base = f"http://{host}:{cfg.port}"
     pairs = env_vars(base)
+    pairs.update(_vault_env(os.environ))
     for k, v in pairs.items():
         if args.shell == "fish":
             _out(f"set -gx {k} {v}")
@@ -401,6 +421,16 @@ def cmd_env(args: argparse.Namespace) -> int:
         else:
             _out(f"export {k}={v}")
     return 0
+
+
+def _vault_env(current: Any) -> dict[str, str]:
+    """Placeholder env vars for providers with a stored key ({} if there are none or the vault can't be read)."""
+    try:
+        from llmtap.vault import Vault
+        return Vault().child_env(current)    # reads keys.json only: no OS credential store access
+    except Exception as e:
+        _err(f"could not read stored keys ({e}); continuing without them")
+        return {}
 
 
 def env_vars(base: str) -> dict[str, str]:
@@ -467,6 +497,8 @@ def cmd_wrap(args: argparse.Namespace) -> int:
     base = getattr(tap, "base_url", None) or f"http://{cfg.host}:{getattr(tap, 'port', cfg.port)}"
     env = dict(os.environ)
     env.update(env_vars(base))
+    stored = _vault_env(env)
+    env.update(stored)
     # make sure HTTP(S)_PROXY settings don't hijack traffic to the local proxy. Both spellings get the
     # same merged list: most clients prefer lowercase no_proxy, which must not drop the user's NO_PROXY hosts.
     cur = ",".join(v for v in dict.fromkeys(env.get(k, "") for k in ("NO_PROXY", "no_proxy")) if v)
@@ -476,6 +508,10 @@ def cmd_wrap(args: argparse.Namespace) -> int:
         print(term.paint("◉ llmtap", "bold", "bright_magenta", color=color)
               + term.paint(f" recording → {base}  ·  dashboard {base}/_llmtap/", "dim", color=color),
               file=sys.stderr, flush=True)
+        if stored:
+            names = sorted({v[len("llmtap-key-"):] for v in stored.values()})
+            print(term.paint(f"  stored keys in use: {', '.join(names)} (the command only sees placeholders)",
+                             "dim", color=color), file=sys.stderr, flush=True)
     start = time.time() - 0.001
     try:
         proc = subprocess.Popen(cmd, env=env)
@@ -1124,6 +1160,92 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return doctor.exit_code(checks)
 
 
+def _parse_when(text: str) -> float:
+    """``never`` / ``0`` -> 0; ``YYYY-MM-DD`` (end of that day) or ``YYYY-MM-DDTHH:MM`` in local time."""
+    t = (text or "").strip()
+    if t.lower() in ("", "0", "never", "none"):
+        return 0.0
+    from datetime import datetime
+    for fmt, end_of_day in (("%Y-%m-%d", True), ("%Y-%m-%dT%H:%M", False), ("%Y-%m-%d %H:%M", False)):
+        try:
+            d = datetime.strptime(t, fmt)
+        except ValueError:
+            continue
+        if end_of_day:
+            d = d.replace(hour=23, minute=59, second=59)
+        return d.timestamp()
+    raise ValueError(f"--expires: expected YYYY-MM-DD, YYYY-MM-DDTHH:MM or never, got {text!r}")
+
+
+def _key_line(k: Any) -> str:
+    bits = []
+    if k.paused:
+        bits.append("PAUSED")
+    if k.expires:
+        bits.append("expires " + time.strftime("%Y-%m-%d %H:%M", time.localtime(k.expires)))
+    if k.daily_usd:
+        bits.append(f"${k.daily_usd:g}/day")
+    if k.total_usd:
+        bits.append(f"${k.total_usd:g} total")
+    if k.models:
+        bits.append("models: " + ", ".join(k.models))
+    return f"{k.name:<18} {k.provider:<11} {k.preview:<12} {k.placeholder:<28} " + ("; ".join(bits) or "no limits")
+
+
+def cmd_keys(args: argparse.Namespace) -> int:
+    from llmtap.vault import PROVIDER_ENV, Vault, VaultError
+    action = getattr(args, "keys_action", None) or "list"
+    try:
+        v = Vault()
+        if action == "list":
+            keys = v.list()
+            if not keys:
+                _out("no stored keys. Add one with: llmtap keys add openai   (or in the dashboard: Keys)")
+                return 0
+            _out(f"{'NAME':<18} {'PROVIDER':<11} {'KEY':<12} {'USE THIS INSTEAD OF THE KEY':<28} LIMITS")
+            for k in keys:
+                _out(_key_line(k))
+            _out(f"\nsecrets: {v.backend.name} · metadata: {v.meta_path}")
+            return 0
+        if action == "add":
+            name = args.name.strip().lower()
+            provider = (args.provider or (name if name in PROVIDER_ENV or name == "bedrock" else "")).strip().lower()
+            if not provider:
+                _err(f"which provider is {name!r} for? pass --provider (e.g. --provider openai)")
+                return 2
+            if sys.stdin.isatty():
+                import getpass
+                secret = getpass.getpass(f"Paste the {provider} API key for {name!r} (input hidden): ")
+            else:
+                secret = sys.stdin.readline()
+            info = v.add(name, provider, secret)
+            _out(f"stored {info.name} ({info.provider}, {info.preview}) in {v.backend.name}.")
+            _out(f"Use {info.placeholder} wherever the key goes; `llmtap wrap` sets it for you.")
+            return 0
+        if action == "remove":
+            if v.remove(args.name):
+                _out(f"removed {args.name.lower()}")
+                return 0
+            _err(f"no stored key named {args.name!r}")
+            return 1
+        if action == "limit":
+            limits: dict[str, Any] = {"daily_usd": args.daily, "total_usd": args.total}
+            if args.models is not None:
+                limits["models"] = args.models
+            if args.expires is not None:
+                limits["expires"] = _parse_when(args.expires)
+            if args.pause or args.resume:
+                limits["paused"] = bool(args.pause)
+            info = v.update(args.name, **limits)
+            _out(_key_line(info))
+            return 0
+    except (VaultError, ValueError) as e:
+        _err(str(e))
+        return 1
+    _err(f"unknown keys action {action!r}")
+    return 2
+
+
 COMMANDS: dict[str, Callable[[argparse.Namespace], int]] = {
     "serve": cmd_serve, "wrap": cmd_wrap, "env": cmd_env, "stats": cmd_stats, "ls": cmd_ls,
     "show": cmd_show, "tail": cmd_tail, "export": cmd_export, "prices": cmd_prices, "scan": cmd_scan,
@@ -1132,7 +1254,7 @@ COMMANDS: dict[str, Callable[[argparse.Namespace], int]] = {
 
 # Added later; kept apart so the core table (and tests that pin it) stay stable.
 EXTRA_COMMANDS: dict[str, Callable[[argparse.Namespace], int]] = {
-    "report": cmd_report, "doctor": cmd_doctor,
+    "report": cmd_report, "doctor": cmd_doctor, "keys": cmd_keys,
 }
 
 
