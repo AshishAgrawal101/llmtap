@@ -39,6 +39,11 @@ every cent.
 pip install llmtap-proxy      # stdlib only, nothing else gets installed; the command is `llmtap` (pipx works too)
 llmtap demo                    # fake LLM traffic + the live dashboard in your browser. No API key needed.
 llmtap wrap -- python app.py   # now do it for real with your own app
+# Node / npx (requires Python 3.11+ installed):
+npx llmtap wrap -- npm run dev
+
+# Or install with pipx:
+pipx install llmtap
 ```
 
 <div align="center">

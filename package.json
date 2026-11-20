@@ -1,0 +1,41 @@
+{
+  "name": "llmtap",
+  "version": "0.2.1",
+  "description": "The flight recorder & firewall for LLM apps. See, cache, replay, budget and secure every LLM call.",
+  "bin": {
+    "llmtap": "./bin/llmtap.js"
+  },
+  "files": [
+    "bin/",
+    "llmtap/",
+    "LICENSE",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "scripts": {
+    "test": "node ./bin/llmtap.js version"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/AshishAgrawal101/llmtap.git"
+  },
+  "keywords": [
+    "llm",
+    "openai",
+    "anthropic",
+    "claude",
+    "gemini",
+    "proxy",
+    "observability",
+    "cache",
+    "testing",
+    "vcr",
+    "agents",
+    "cost",
+    "opentelemetry"
+  ],
+  "author": "Ashish Agrawal",
+  "license": "MIT"
+}
