@@ -385,7 +385,9 @@ def test_sse_one_event_then_disconnect(tap: Any, monkeypatch: pytest.MonkeyPatch
     while not tap.bus.subs and time.time() < deadline:
         time.sleep(0.01)
     assert tap.bus.subs, "SSE handler never subscribed"
-    time.sleep(0.12)  # let at least one heartbeat go out
+    deadline = time.time() + 3      # wait for a heartbeat (a fixed sleep was too short on slow CI runners)
+    while b": ping\n\n" not in list(r.chunks) and time.time() < deadline:
+        time.sleep(0.01)
     ex = anthropic_ex()
     tap.bus.publish({"type": "exchange", "exchange": ex.to_dict()})
     assert r.got_data.wait(3)
