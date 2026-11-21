@@ -30,8 +30,12 @@ carry no `Access-Control-Allow-Origin`. Otherwise any website could spend `llmta
 to guess.
 
 The real key is never returned by the dashboard or any API, never written to the history database, and scrubbed
-from error messages and from anything an upstream echoes back (headers and body, streamed or not; stored-key
-requests ask the upstream for uncompressed responses so this works). Requests that use a stored key are tagged
+from error messages and from anything an upstream echoes back (headers and body, streamed or not). Stored-key
+requests ask the upstream for uncompressed responses; a compressed one is decoded, scrubbed and relayed
+uncompressed, or refused (502) if llmtap can't decode it.
+
+Programs in Docker containers or WSL reach llmtap from a non-loopback address, so they can't use stored keys; run
+them on the host, or pass the real key yourself. Requests that use a stored key are tagged
 `vault_key=<name>`, so `llmtap stats --by tag:vault_key` shows spend per key.
 
 If several keys exist for one provider, `wrap` uses the one named exactly like the provider (`openai`), else the
@@ -58,6 +62,11 @@ llmtap keys limit openai --pause                       # refuse everything; --re
 | Placeholder for a key that isn't stored | 401 `llmtap_key_not_found` |
 | Key sent towards another provider, or another URL than it was stored for | 403 `llmtap_key_wrong_provider` / `llmtap_key_wrong_upstream` |
 | Request from a web page on another site, another machine, or an unexpected `Host` | 403 `llmtap_key_cross_origin` / `llmtap_key_remote_client` / `llmtap_key_bad_host` |
+
+Requests an upstream could read differently from llmtap's checks are refused (400) when they use a stored key:
+`.`/`..`/`//`/`\`/`#` in the path, method-override headers (`X-HTTP-Method-Override` and similar), a `GET` or `HEAD`
+with a body, and (for keys with a model list) a body that repeats `"model"` in one object. With a model list, every
+`"model"` anywhere in the body counts, e.g. `tools[].model` on the Responses API.
 
 Limits only mean something if llmtap can count them, so they fail closed: a key with a spend limit refuses models
 without a price (add one under `[pricing_overrides]`), and a key with any model or spend limit only reaches generation

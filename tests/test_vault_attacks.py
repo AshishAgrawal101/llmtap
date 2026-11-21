@@ -279,3 +279,137 @@ def test_file_backend_leaves_no_temp_files(tmp_path: Path) -> None:
     for i in range(3):
         be.set(f"k{i}", OPENAI_KEY)
     assert sorted(p.name for p in tmp_path.iterdir()) == ["s.json"]
+
+
+# ---------------------------------------------------------------- second review
+
+class _GzipEcho(BaseHTTPRequestHandler):
+    """Ignores Accept-Encoding: identity and echoes the key inside a gzip body."""
+    encoding = "gzip"
+
+    def do_POST(self) -> None:
+        import gzip
+        self.rfile.read(int(self.headers.get("content-length") or 0))
+        raw = json.dumps({"error": {"message": "bad key " + self.headers.get("authorization", "")}}).encode()
+        b = gzip.compress(raw) if self.encoding == "gzip" else b"\x00garbage"
+        self.send_response(401)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-encoding", self.encoding)
+        self.send_header("content-length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+
+    def log_message(self, *a: Any) -> None:
+        pass
+
+
+@pytest.mark.parametrize("encoding", ["gzip", "br"])
+def test_compressed_echo_is_decoded_and_scrubbed(vtap: Any, vault: Vault, encoding: str) -> None:
+    handler = type("H", (_GzipEcho,), {"encoding": encoding})
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+        vault.add("groq", "groq", OPENAI_KEY, base=base)
+        t = vtap(upstreams={"groq": {"base": base, "style": "openai"}})
+        c = http.client.HTTPConnection("127.0.0.1", t.port, timeout=10)
+        c.request("POST", "/groq/v1/chat/completions", body=json.dumps({"model": "llama", "messages": []}),
+                  headers={"Authorization": "Bearer llmtap-key-groq", "Content-Type": "application/json"})
+        r = c.getresponse()
+        b = r.read()
+        assert OPENAI_KEY.encode() not in b
+        if encoding == "gzip":         # decoded, scrubbed, relayed uncompressed
+            assert r.status == 401 and r.getheader("content-encoding") is None and b"[REDACTED]" in b
+        else:                          # can't decode: refused rather than relayed unchecked
+            assert r.status == 502
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+@pytest.mark.parametrize("path", [
+    "/v1beta/models/gemini-2.5-flash/../gemini-2.5-pro:generateContent?key=llmtap-key-gem",
+    "/v1beta/models/gemini-2.5-flash/%2E%2E/gemini-2.5-pro:generateContent?key=llmtap-key-gem",
+    "/v1beta/models//gemini-2.5-pro:generateContent?key=llmtap-key-gem",
+    "/v1beta/models/gemini-2.5-flash/./x:generateContent?key=llmtap-key-gem",
+])
+def test_dot_segments_refused(vtap: Any, vault: Vault, mock_upstream: Any, path: str) -> None:
+    vault.add("gem", "gemini", GEMINI_KEY, models=["gemini-2.5-flash"])
+    t = vtap()
+    s, _ = _call(t, path, {"contents": [{"parts": [{"text": "hi"}]}]}, {})
+    assert s == 400 and not mock_upstream.requests
+
+
+def test_fragment_refused(vtap: Any, vault: Vault, mock_upstream: Any) -> None:
+    vault.add("anthropic", "anthropic", ANTHROPIC_KEY, models=["claude-haiku*"])
+    t = vtap()
+    body = json.dumps({"requests": [{"custom_id": "a", "params": {"model": "claude-opus-4-1", "max_tokens": 5,
+                                                                   "messages": []}}]}).encode()
+    resp = _raw(t, b"POST /v1/messages/batches#/v1/messages/count_tokens HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                   b"x-api-key: llmtap-key-anthropic\r\nanthropic-version: 2023-06-01\r\nContent-Type: application/json\r\n"
+                   b"Connection: close\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+    assert b" 400 " in resp.split(b"\r\n", 1)[0] and not mock_upstream.requests
+
+
+@pytest.mark.parametrize("header", ["X-HTTP-Method-Override", "X-HTTP-Method", "X-Method-Override"])
+def test_method_override_refused(vtap: Any, vault: Vault, mock_upstream: Any, header: str) -> None:
+    vault.add("gem", "gemini", GEMINI_KEY, models=["gemini-2.5-flash"], daily_usd=1)
+    t = vtap()
+    s, _ = _call(t, "/v1beta/models/veo-3.0-generate-preview:predictLongRunning?key=llmtap-key-gem",
+                 {"instances": [{"prompt": "x"}]}, {header: "POST"}, method="GET")
+    assert s == 400 and not mock_upstream.requests
+
+
+def test_get_with_body_refused(vtap: Any, vault: Vault, mock_upstream: Any) -> None:
+    vault.add("openai", "openai", OPENAI_KEY, daily_usd=1)
+    t = vtap()
+    s, _ = _call(t, "/v1/images/generations", {"model": "gpt-image-1", "prompt": "x"},
+                 {"Authorization": "Bearer llmtap-key-openai"}, method="GET")
+    assert s == 400 and not mock_upstream.requests
+
+
+def test_models_in_other_body_fields_are_checked(vtap: Any, vault: Vault, mock_upstream: Any) -> None:
+    vault.add("openai", "openai", OPENAI_KEY, models=["gpt-4o-mini"])
+    t = vtap()
+    s, b = _call(t, "/v1/responses", {"model": "gpt-4o-mini", "input": "draw",
+                                      "tools": [{"type": "image_generation", "model": "gpt-image-1"}]},
+                 {"Authorization": "Bearer llmtap-key-openai"})
+    assert s == 403 and "gpt-image-1" in json.dumps(b) and not mock_upstream.requests
+
+
+def test_repeated_model_key_refused(vtap: Any, vault: Vault, mock_upstream: Any) -> None:
+    vault.add("openai", "openai", OPENAI_KEY, models=["gpt-4o-mini"])
+    t = vtap()
+    body = b'{"model": "gpt-4o", "model": "gpt-4o-mini", "messages": [{"role": "user", "content": "x"}]}'
+    resp = _raw(t, b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer llmtap-key-openai\r\n"
+                   b"Content-Type: application/json\r\nConnection: close\r\nContent-Length: "
+                   + str(len(body)).encode() + b"\r\n\r\n" + body)
+    assert b" 400 " in resp.split(b"\r\n", 1)[0] and not mock_upstream.requests
+
+
+def test_estimate_counts_n_completions(tap: Any) -> None:
+    t = tap()
+    from llmtap.models import Exchange, Route
+    route = Route(provider="openai", upstream_base="http://x", upstream_path="/v1/chat/completions", style="openai")
+    ex = Exchange(model="gpt-4o")
+    one = t._estimate_cost(ex, route, {"model": "gpt-4o", "max_tokens": 100}, b"{}")
+    four = t._estimate_cost(ex, route, {"model": "gpt-4o", "max_tokens": 100, "n": 4}, b"{}")
+    assert four > one * 3
+
+
+def test_secret_not_paired_with_stale_metadata(tmp_path: Path) -> None:
+    home = tmp_path / "h"
+    be = FileBackend(home / "s.json")
+    proxy_side, cli_side = Vault(home=home, backend=be), Vault(home=home, backend=be)
+    cli_side.add("work", "openai", OPENAI_KEY)
+    info = proxy_side.get("work")
+    real_get = be.get
+
+    def racing_get(name: str) -> str | None:        # the key is removed + re-added while the secret is read
+        cli_side.remove("work")
+        cli_side.add("work", "anthropic", ANTHROPIC_KEY)
+        return real_get(name)
+    be.get = racing_get                                  # type: ignore[method-assign]
+    assert proxy_side.secret("work") is None
+    be.get = real_get                                    # type: ignore[method-assign]
+    assert proxy_side.get("work").uid != info.uid and proxy_side.secret("work") == ANTHROPIC_KEY
