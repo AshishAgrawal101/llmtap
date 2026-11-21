@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-21
+
 ### Added
 
 - **Key vault**: store an API key once (`llmtap keys add openai`, or the dashboard's new **Keys** panel) and let apps
@@ -191,7 +193,8 @@ First public release.
 - **`llmtap demo`**: built-in mock upstream and traffic generator for trying everything without an API key.
 - Composite GitHub Action (`action.yml`) for replaying cassettes in CI.
 
-[Unreleased]: https://github.com/AshishAgrawal101/llmtap/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/AshishAgrawal101/llmtap/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/AshishAgrawal101/llmtap/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/AshishAgrawal101/llmtap/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/AshishAgrawal101/llmtap/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/AshishAgrawal101/llmtap/compare/v0.1.0...v0.2.0
