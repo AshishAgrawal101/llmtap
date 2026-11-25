@@ -97,7 +97,8 @@ def test_compressed_body_refused(tap: Any, tmp_path: Path, mock_upstream: Any) -
 @pytest.mark.parametrize("raw", [
     b"\xef\xbb\xbf" + json.dumps({"model": "m", "tools": [{"type": "web_fetch_20260209", "name": "web_fetch"}]}).encode(),
     b'{"model":"m","messages":[{"role":"user","content":"\xff"}],"tools":[{"type":"web_search_20260209"}]}',
-    b"[" * 100_000 + b"]" * 100_000,
+    # absurd nesting: unreadable on some platforms (refused), parsed on others (and the buried tool is seen)
+    b'{"a":' * 50_000 + b'{"tools":[{"type":"web_search_20260209"}]}' + b"}" * 50_000,
 ])
 def test_unreadable_bodies(raw: bytes) -> None:
     found = server_tools(raw)
