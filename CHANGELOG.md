@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-24
+
 ### Added
 
 - **`llmtap xray`**: what your coding agent sends. Splits each request into system prompt, tool definitions, history
@@ -231,7 +233,8 @@ First public release.
 - **`llmtap demo`**: built-in mock upstream and traffic generator for trying everything without an API key.
 - Composite GitHub Action (`action.yml`) for replaying cassettes in CI.
 
-[Unreleased]: https://github.com/AshishAgrawal101/llmtap/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/AshishAgrawal101/llmtap/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/AshishAgrawal101/llmtap/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/AshishAgrawal101/llmtap/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/AshishAgrawal101/llmtap/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/AshishAgrawal101/llmtap/compare/v0.2.0...v0.2.1
