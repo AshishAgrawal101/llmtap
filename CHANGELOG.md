@@ -6,6 +6,44 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- **`llmtap xray`**: what your coding agent sends. Splits each request into system prompt, tool definitions, history
+  and new input (scaled to the reported usage, with cost per part), ranks tool definitions and groups MCP tools by
+  server, and explains prompt-cache misses: the first thing that changed since the previous request (a timestamp in
+  the system prompt, an edited or reordered tool, a changed model, an edited message) or an expired cache, with the
+  estimated cost of the miss. Works for Anthropic, OpenAI (chat and Responses), Gemini and Bedrock. `--json` too.
+- **Leak tripwire** (on by default): llmtap fingerprints your real secrets (stored keys, values in `.env` / `.env.*`
+  files in the folder it starts in, canaries) and blocks any request whose body contains one, as is, JSON-escaped,
+  URL-encoded, hex or base64 at any alignment. Unlike the regex guard it never guesses. The secret is never written to
+  the history, and an echo of it in a response is scrubbed. `--leak-check off|warn|block`, `--leak-files`. See
+  [docs/what-may-leave.md](docs/what-may-leave.md).
+- **Canaries**: `llmtap canary add --file .env` plants a fake secret; if it is ever sent, the request is blocked and
+  you're told something read that file.
+- **Keys-only mode** (`--keys-only`): refuses requests that carry a real API key instead of a `llmtap-key-<name>`
+  placeholder, so a prompt injection can't send data out under someone else's account.
+- **Request size limit** (`--max-request-kb`): refuses bigger request bodies with HTTP 413.
+- **`--no-dashboard-writes`** (`dashboard_writes = false`): the dashboard API can't add or change stored keys or
+  clear the history, so an agent that can reach llmtap's port can't loosen its own limits. Use the CLI instead.
+- Compressed request bodies (`Content-Encoding`) are refused with HTTP 415, since no check could read them.
+- Stored keys can't call endpoints that create other credentials (OpenAI realtime client secrets, Gemini ephemeral
+  tokens, API keys): the result would work without llmtap and escape every limit.
+- **Budget warnings** at 50, 80 and 95% (`--budget-warn`) of the daily and session budgets and of each stored key's
+  caps: in the terminal, as a dashboard banner, and with `--notify` as a desktop notification (no dependencies).
+- **`llmtap statusline`**: one line of today's spend, cache hit rate and last request size for Claude Code's status
+  bar (`llmtap statusline --setup` prints the settings snippet).
+- **Sandbox guide**: [docs/sandbox.md](docs/sandbox.md), how to run an agent where llmtap is its only way out (Linux
+  and macOS recipes, not yet tested end to end).
+
+### Changed
+
+- **Stored keys refuse provider-side tools by default**: web search and fetch, code execution, remote MCP servers and
+  `https://` images / documents / files the provider fetches itself make the provider send data on to other sites, so
+  a request that uses a stored key and asks for one gets HTTP 403 (`llmtap_server_tool_blocked`). So does a model that
+  searches by itself, a tool type llmtap doesn't know, and a request body it can't read (multipart uploads). Allow them per key
+  with `llmtap keys limit NAME --allow-server-tools` (or the dashboard API's `allow_server_tools`). Requests with
+  your own real key are not affected.
+
 ## [0.3.0] - 2026-11-21
 
 ### Added

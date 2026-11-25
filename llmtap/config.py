@@ -54,6 +54,16 @@ class Config:
     budget_session_usd: float = 0.0         # 0 = unlimited (per proxy process)
     loop_threshold: int = 0                 # 0 = off; block when identical request seen N times...
     loop_window_s: int = 60                 # ...within this many seconds
+    budget_warn: str = "50,80,95"           # warn when a budget / stored-key cap reaches these percentages ("" = off)
+    notify: bool = False                    # also show budget warnings as desktop notifications
+    # what may leave
+    keys_only: bool = False                 # refuse requests that carry a real API key instead of a llmtap placeholder
+    leak_check: str = "block"               # "off" | "warn" | "block": your real secrets (stored keys, .env values,
+                                            # canaries) in a request body, also base64 / hex / URL-encoded
+    leak_files: str = ""                    # comma-separated KEY=VALUE files to fingerprint; "" = .env* in the cwd
+    max_request_kb: int = 0                 # 0 = off; refuse request bodies bigger than this (a bulk-upload limit)
+    dashboard_writes: bool = True           # False: the dashboard API can't add / change keys or clear history (use
+                                            # the CLI), so an agent that can reach llmtap's port can't change them
     # upstreams & pricing
     upstreams: dict[str, dict[str, str]] = field(default_factory=lambda: {k: dict(v) for k, v in DEFAULT_UPSTREAMS.items()})
     pricing_overrides: dict[str, dict[str, float]] = field(default_factory=dict)  # model -> {"input":..,"output":..,"cache_read":..,"cache_write":..} USD per 1M tokens
@@ -81,6 +91,7 @@ _TRUE, _FALSE = ("1", "true", "yes", "on"), ("0", "false", "no", "off", "")
 _CHOICES: dict[str, tuple[str, ...]] = {
     "mode": ("record", "replay", "auto"),
     "guard": ("off", "warn", "redact", "block"),
+    "leak_check": ("off", "warn", "block"),
 }
 _STYLES = ("anthropic", "openai", "gemini")
 

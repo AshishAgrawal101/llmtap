@@ -29,6 +29,8 @@ KINDS: dict[str, str] = {
     "email": "Email address (PII)",
     "phone": "Phone number (PII)",
     "credit_card": "Credit card number (PII, Luhn-validated)",
+    "leak": "One of your real secrets (a stored key or a .env value), found by exact match",
+    "canary": "A canary from a .env file: something read that file",
 }
 
 PII_KINDS: frozenset[str] = frozenset({"email", "phone", "credit_card"})

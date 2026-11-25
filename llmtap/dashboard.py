@@ -416,6 +416,9 @@ def _keys_payload(tap: "LLMTap") -> dict[str, Any]:
 
 def _keys_write(tap: "LLMTap", sub: str, headers: Any, body: bytes) -> tuple[int, dict[str, Any]]:
     from .vault import VaultError
+    if not getattr(tap.cfg, "dashboard_writes", True):
+        return 403, {"error": "llmtap: key changes over HTTP are turned off (dashboard_writes = false). Use "
+                              "`llmtap keys` in a terminal."}
     if not _same_origin(headers) or (_header(headers, KEYS_HEADER) or "").strip().lower() != "dashboard":
         return 403, {"error": "llmtap: key changes are only accepted from the llmtap dashboard"}
     if len(body) > MAX_KEYS_BODY:
@@ -426,7 +429,7 @@ def _keys_write(tap: "LLMTap", sub: str, headers: Any, body: bytes) -> tuple[int
         return 400, {"error": "expected a JSON object"}
     if not isinstance(data, dict):
         return 400, {"error": "expected a JSON object"}
-    limit_keys = ("daily_usd", "total_usd", "models", "expires", "paused")
+    limit_keys = ("daily_usd", "total_usd", "models", "expires", "paused", "allow_server_tools")
     limits = {k: data[k] for k in limit_keys if k in data}
     v = tap.vault
     try:
@@ -511,6 +514,10 @@ def handle_internal(tap: "LLMTap", method: str, path: str, headers: Any, body: b
                 return True
         elif method == "POST":
             if sub == "/api/clear":
+                if not getattr(tap.cfg, "dashboard_writes", True):
+                    _error(respond, 403, "llmtap: clearing history over HTTP is turned off (dashboard_writes = "
+                                         "false). Use `llmtap clear` in a terminal.")
+                    return True
                 if not _same_origin(headers):
                     _error(respond, 403, "cross-origin request rejected")
                     return True

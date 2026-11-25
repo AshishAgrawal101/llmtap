@@ -118,6 +118,9 @@ _OVERRIDE_MAP: dict[str, str] = {
     "budget_daily": "budget_daily_usd", "budget_session": "budget_session_usd",
     "loop_threshold": "loop_threshold", "loop_window": "loop_window_s",
     "timeout": "upstream_timeout_s",
+    "keys_only": "keys_only", "leak_check": "leak_check", "leak_files": "leak_files",
+    "max_request_kb": "max_request_kb", "budget_warn": "budget_warn", "notify": "notify",
+    "dashboard_writes": "dashboard_writes",
 }
 
 
@@ -153,6 +156,22 @@ def _proxy_parent() -> argparse.ArgumentParser:
     g.add_argument("--budget-session", type=float, default=S, metavar="USD", help="refuse calls once this run's spend reaches this")
     g.add_argument("--loop-threshold", type=int, default=S, metavar="N", help="block an identical request seen N times...")
     g.add_argument("--loop-window", type=int, default=S, metavar="SECS", help="...within this window (default 60)")
+    g.add_argument("--budget-warn", default=S, metavar="PCTS",
+                   help="warn when a budget or stored-key cap reaches these percentages (default 50,80,95; '' = off)")
+    g.add_argument("--notify", action="store_const", const=True, default=S,
+                   help="also show budget warnings and blocked leaks as desktop notifications")
+    g = p.add_argument_group("what may leave")
+    g.add_argument("--keys-only", action="store_const", const=True, default=S,
+                   help="refuse requests carrying a real API key instead of a llmtap-key-<name> placeholder")
+    g.add_argument("--leak-check", choices=["off", "warn", "block"], default=S,
+                   help="your real secrets (stored keys, .env values, canaries) in a prompt, also base64/hex "
+                        "(default block)")
+    g.add_argument("--leak-files", default=S, metavar="FILES",
+                   help="comma-separated KEY=VALUE files to fingerprint (default: .env* in this folder)")
+    g.add_argument("--max-request-kb", type=int, default=S, metavar="KB",
+                   help="refuse request bodies bigger than this (0 = no limit)")
+    g.add_argument("--no-dashboard-writes", dest="dashboard_writes", action="store_const", const=False, default=S,
+                   help="the dashboard API can't add or change keys or clear history (use the CLI); for sandboxes")
     return p
 
 
@@ -268,6 +287,31 @@ def build_parser() -> argparse.ArgumentParser:
     g = k.add_mutually_exclusive_group()
     g.add_argument("--pause", action="store_true", help="refuse every call that uses this key")
     g.add_argument("--resume", action="store_true", help="undo --pause")
+    g = k.add_mutually_exclusive_group()
+    g.add_argument("--allow-server-tools", action="store_true",
+                   help="let calls with this key use provider-side web search / fetch, code execution, remote MCP "
+                        "and URL fetches (refused by default: they can send data to other sites)")
+    g.add_argument("--block-server-tools", action="store_true", help="undo --allow-server-tools")
+
+    sp = add("xray", "what your agent sends: context split, tool/MCP bloat, and why the prompt cache missed", [db])
+    sp.add_argument("id", nargs="?", default=None, help="one exchange (id prefix ok); default: a summary")
+    sp.add_argument("--since", type=_since_arg, default="today", metavar="WHEN",
+                    help="for the summary: 30m, 24h, 7d, today, 2026-01-31 or all (default today)")
+    sp.add_argument("--top", type=int, default=5, metavar="N", help="rows per list (default 5)")
+    sp.add_argument("--json", action="store_true", help="machine-readable output")
+
+    sp = add("statusline", "one line of today's spend for a status bar (Claude Code: statusLine)", [db])
+    sp.add_argument("--no-color", action="store_true", help="plain text")
+    sp.add_argument("--setup", action="store_true", help="print the Claude Code settings.json snippet and exit")
+
+    sp = add("canary", "plant fake secrets in a .env file: if one shows up in a prompt, an agent read the file")
+    cs = sp.add_subparsers(dest="canary_action", metavar="<action>")
+    c = cs.add_parser("add", help="append a fake secret to a .env file and watch for it")
+    c.add_argument("--file", default=".env", help="the file to add it to (default .env)")
+    c.add_argument("--name", default="ADMIN_API_TOKEN", help="variable name (default ADMIN_API_TOKEN)")
+    cs.add_parser("list", help="list canaries")
+    c = cs.add_parser("remove", help="stop watching a canary (delete its line from the file yourself)")
+    c.add_argument("name")
 
     sp = add("doctor", "check your setup (port, db, env vars, SDK base URLs) and print fix hints", [db])
     sp.add_argument("--online", action="store_true", help="also check that the upstream API hosts are reachable (5s timeout)")
@@ -1191,7 +1235,114 @@ def _key_line(k: Any) -> str:
         bits.append(f"${k.total_usd:g} total")
     if k.models:
         bits.append("models: " + ", ".join(k.models))
+    if getattr(k, "allow_server_tools", False):
+        bits.append("server tools allowed")
     return f"{k.name:<18} {k.provider:<11} {k.preview:<12} {k.placeholder:<28} " + ("; ".join(bits) or "no limits")
+
+
+def _xray_prev(store: Any, ex: Any) -> Any:
+    """The request before ``ex`` in the same conversation: same provider, model and session tag, within 2 hours."""
+    best = None
+    for other in store.iter_light(ex.ts - 7200):
+        if other.ts >= ex.ts or other.id == ex.id or other.source != "upstream":
+            continue
+        if (other.provider, other.model, other.tags.get("session")) != (ex.provider, ex.model, ex.tags.get("session")):
+            continue
+        if best is None or other.ts > best.ts:
+            best = other
+    return best
+
+
+def cmd_xray(args: argparse.Namespace) -> int:
+    from llmtap import xray
+    cfg = make_config(args)
+    overrides = cfg.pricing_overrides or None
+    store = _open_store(args)
+    try:
+        if args.id:
+            ex = store.get(args.id)
+            if ex is None:
+                matches = _count_id_prefix(store, args.id) if len(args.id) >= 4 else 0
+                _err(f"{args.id!r} is ambiguous: {matches} exchanges match; use a longer id prefix" if matches > 1
+                     else f"no exchange matching {args.id!r}")
+                return 1
+            prev = _xray_prev(store, ex)
+            if args.json:
+                _out(json.dumps({"breakdown": xray.breakdown(ex, overrides),
+                                 "tools": xray.tool_bloat(ex, overrides)[: max(1, args.top)],
+                                 "servers": xray.tool_servers(ex, overrides),
+                                 "cache": xray.explain_cache(prev, ex, overrides) if prev else None},
+                                indent=2, default=str))
+            else:
+                _out(xray.render_xray_text(ex, color=_color_out(), prev=prev, overrides=overrides, top=args.top))
+            return 0
+        exchanges = [e for e in store.iter_light(args.since) if e.source == "upstream" and e.request_body]
+    finally:
+        store.close()
+    exchanges.sort(key=lambda e: e.ts)
+    if not exchanges:
+        _out("no calls to analyse in that period. Run something through llmtap first, or widen --since.")
+        return 0
+    if args.json:
+        _out(json.dumps(xray.summary_json(exchanges, overrides, top=args.top), indent=2, default=str))
+    else:
+        _out(xray.render_summary_text(exchanges, color=_color_out(), overrides=overrides, top=args.top))
+    return 0
+
+
+def cmd_statusline(args: argparse.Namespace) -> int:
+    from llmtap.statusline import SETUP_SNIPPET, statusline
+    if args.setup:
+        _out("Add this to ~/.claude/settings.json (or .claude/settings.json in a project):" + chr(10))
+        _out(SETUP_SNIPPET)
+        return 0
+    if sys.stdin is not None and not sys.stdin.isatty():
+        # Claude Code sends session JSON on stdin; it isn't needed, but drain it without ever waiting on it
+        def drain() -> None:
+            try:
+                sys.stdin.read()
+            except Exception:
+                pass
+        threading.Thread(target=drain, daemon=True).start()
+    try:
+        cfg = make_config(args)
+        from llmtap.config import llmtap_home
+        db = cfg.db_path or str(llmtap_home() / "llmtap.db")
+        _out(statusline(db, float(cfg.budget_daily_usd or 0), color=not args.no_color and not os.environ.get("NO_COLOR")))
+    except Exception as e:               # a status bar must never show a traceback
+        _out(f"llmtap: {type(e).__name__}")
+    return 0
+
+
+def cmd_canary(args: argparse.Namespace) -> int:
+    from pathlib import Path
+    from llmtap.egress import add_canary, load_canaries, remove_canary
+    action = getattr(args, "canary_action", None) or "list"
+    try:
+        if action == "add":
+            rec = add_canary(Path(args.file), args.name)
+            _out(f"added {rec['name']} to {rec['file']}.")
+            _out("llmtap now blocks any request that contains it (in any encoding) and tells you: nothing "
+                 "legitimate ever sends it, so seeing it means something read that file.")
+            return 0
+        if action == "remove":
+            n = remove_canary(args.name)
+            if not n:
+                _err(f"no canary named {args.name!r}")
+                return 1
+            _out(f"stopped watching {args.name}. Delete its line from the .env file yourself.")
+            return 0
+        items = load_canaries()
+        if not items:
+            _out("no canaries. Add one with: llmtap canary add --file .env")
+            return 0
+        for c in items:
+            when = time.strftime("%Y-%m-%d", time.localtime(float(c.get("created") or 0)))
+            _out(f"{c.get('name', '?'):<24} {c.get('file', '?')}  (added {when})")
+        return 0
+    except (OSError, ValueError) as e:
+        _err(str(e))
+        return 1
 
 
 def cmd_keys(args: argparse.Namespace) -> int:
@@ -1246,6 +1397,8 @@ def cmd_keys(args: argparse.Namespace) -> int:
                 limits["expires"] = _parse_when(args.expires)
             if args.pause or args.resume:
                 limits["paused"] = bool(args.pause)
+            if args.allow_server_tools or args.block_server_tools:
+                limits["allow_server_tools"] = bool(args.allow_server_tools)
             info = v.update(args.name, **limits)
             _out(_key_line(info))
             return 0
@@ -1264,7 +1417,8 @@ COMMANDS: dict[str, Callable[[argparse.Namespace], int]] = {
 
 # Added later; kept apart so the core table (and tests that pin it) stay stable.
 EXTRA_COMMANDS: dict[str, Callable[[argparse.Namespace], int]] = {
-    "report": cmd_report, "doctor": cmd_doctor, "keys": cmd_keys,
+    "report": cmd_report, "doctor": cmd_doctor, "keys": cmd_keys, "canary": cmd_canary,
+    "statusline": cmd_statusline, "xray": cmd_xray,
 }
 
 

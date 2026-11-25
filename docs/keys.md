@@ -50,6 +50,7 @@ llmtap keys limit openai --daily 2 --total 20          # dollars; 0 = no cap
 llmtap keys limit openai --models "gpt-4o-mini,gpt-5-mini*"   # allowed models, * wildcards; "" = any
 llmtap keys limit openai --expires 2026-12-31          # end of that day, local time; "never" to clear
 llmtap keys limit openai --pause                       # refuse everything; --resume to undo
+llmtap keys limit openai --allow-server-tools          # allow provider-side web search / fetch, code execution, MCP
 ```
 
 | Limit | Refused with |
@@ -59,6 +60,8 @@ llmtap keys limit openai --pause                       # refuse everything; --re
 | Daily / total spend reached | 429 `llmtap_key_limit` |
 | A key with a spend limit, used with a model llmtap has no price for | 403 `llmtap_key_unpriced_model` |
 | A key with model or spend limits, used for an endpoint llmtap can't check (batches, images, audio, fine-tuning, long-running jobs) | 403 `llmtap_key_endpoint_not_allowed` |
+| Provider-side tools (web search / fetch, code execution, remote MCP, provider-fetched URLs), unless `--allow-server-tools` ([why](what-may-leave.md#provider-side-tools)) | 403 `llmtap_server_tool_blocked` |
+| Endpoints that create other credentials (OpenAI realtime client secrets, Gemini ephemeral tokens, API keys), which would work without llmtap | 403 `llmtap_key_mint_refused` |
 | Placeholder for a key that isn't stored | 401 `llmtap_key_not_found` |
 | Key sent towards another provider, or another URL than it was stored for | 403 `llmtap_key_wrong_provider` / `llmtap_key_wrong_upstream` |
 | Request from a web page on another site, another machine, or an unexpected `Host` | 403 `llmtap_key_cross_origin` / `llmtap_key_remote_client` / `llmtap_key_bad_host` |
@@ -112,7 +115,10 @@ worthless and a runaway agent can only spend what you allowed.
 It is **not a sandbox**. Anything running as your user on the same computer, including an AI agent with shell access,
 can read your OS credential store directly, call llmtap's local API to change limits, or make calls through llmtap
 with the placeholder. Keep the dashboard on `127.0.0.1` (the default). The Keys API only accepts changes from the
-dashboard page itself, so other websites can't add, read or change keys, but local programs can.
+dashboard page itself, so other websites can't add, read or change keys, but local programs can, unless you start
+llmtap with `--no-dashboard-writes`. To close that gap,
+run the agent in a box where llmtap is its only way out: [sandbox.md](sandbox.md). The
+[leak tripwire](what-may-leave.md#leak-tripwire) also blocks any request that contains a stored key.
 
 SigV4-signed AWS Bedrock requests can't use stored keys (AWS signs them before they leave your machine). A Bedrock API
 key can be stored with `--provider bedrock` and sent as `Authorization: Bearer llmtap-key-<name>`; `wrap` does not set

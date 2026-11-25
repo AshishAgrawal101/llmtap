@@ -344,6 +344,7 @@ class KeyInfo:
     models: list[str] = field(default_factory=list)   # allowed model patterns (fnmatch, case-insensitive); [] = any
     expires: float = 0.0               # epoch seconds; 0 = never
     paused: bool = False
+    allow_server_tools: bool = False   # provider-side web search / fetch / code execution / remote MCP / URL fetches
 
     @property
     def placeholder(self) -> str:
@@ -412,9 +413,9 @@ def _validate_limits(limits: Mapping[str, Any]) -> dict[str, Any]:
             if any(len(p) > 200 for p in pats) or len(pats) > 100:
                 raise VaultError("models: too many or too long patterns")
             out[k] = pats
-        elif k == "paused":
+        elif k in ("paused", "allow_server_tools"):
             if not isinstance(v, bool):
-                raise VaultError("paused: expected true or false")
+                raise VaultError(f"{k}: expected true or false")
             out[k] = v
         else:
             raise VaultError(f"unknown limit {k!r}")
@@ -667,6 +668,20 @@ _COUNT_TOKENS_RE = re.compile(r"(?:/v1/messages/count_tokens|:countTokens)$")
 
 def has_limits(info: KeyInfo) -> bool:
     return bool(info.models or info.daily_usd or info.total_usd)
+
+
+# endpoints that turn a key into another credential (realtime client secrets, Gemini ephemeral tokens): what they
+# return works without llmtap, so it would escape every limit and check
+_MINT_RE = re.compile(r"/realtime/(?:client_secrets|sessions|transcription_sessions)|/auth_tokens|"
+                      r"/organization/admin_api_keys|/api_keys", re.IGNORECASE)
+
+
+def mint_refusal(info: KeyInfo, upstream_path: str) -> Refusal | None:
+    if _MINT_RE.search(upstream_path.split("?", 1)[0]):
+        return Refusal(403, f"llmtap: the stored key {info.name!r} can't be used to create other credentials "
+                            "(realtime client secrets, ephemeral tokens, API keys): they would work without llmtap.",
+                       "llmtap_key_mint_refused")
+    return None
 
 
 def endpoint_refusal(info: KeyInfo, method: str, upstream_path: str, generation: bool) -> Refusal | None:

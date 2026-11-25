@@ -437,7 +437,7 @@ function api(path, opt){ return fetch(BASE + path, Object.assign({headers:{'acce
 function qs(o){ var a=[]; for (var k in o) if (o[k] !== '' && o[k] != null) a.push(encodeURIComponent(k)+'='+encodeURIComponent(o[k])); return a.length ? '?' + a.join('&') : ''; }
 function midnight(){ var d = new Date(); d.setHours(0,0,0,0); return d.getTime()/1000; }
 function rangeStart(){ var n = Date.now()/1000; switch(S.range){ case '1h': return n-3600; case '24h': return n-86400; case '7d': return n-7*86400; case 'all': return 0; default: return midnight(); } }
-function toast(msg){ var t = $('#toast'); t.textContent = msg; t.classList.add('show'); clearTimeout(toast._t); toast._t = setTimeout(function(){ t.classList.remove('show'); }, 1600); }
+function toast(msg, ms){ var t = $('#toast'); t.textContent = msg; t.classList.add('show'); clearTimeout(toast._t); toast._t = setTimeout(function(){ t.classList.remove('show'); }, ms || 1600); }
 function copy(text, msg){
   function fallback(){ var ta = document.createElement('textarea'); ta.value = text; ta.style.position='fixed'; ta.style.opacity='0'; document.body.appendChild(ta); ta.select(); try{ document.execCommand('copy'); }catch(e){} ta.remove(); toast(msg||'Copied'); }
   if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(text).then(function(){ toast(msg||'Copied'); }, fallback); else fallback();
@@ -725,6 +725,7 @@ function connect(){
   es.onopen = function(){ setLive('on'); stopPolling(); if (S.esDelay){ loadList(true); refreshStats(); } S.esDelay = 0; };
   es.onmessage = function(e){ var ev; try { ev = JSON.parse(e.data); } catch(_){ return; }
     if (ev && ev.type === 'exchange' && ev.exchange){ addRow(ev.exchange); }
+    else if (ev && ev.type === 'warning' && ev.message){ toast('⚠ ' + String(ev.message), 10000); }
     scheduleStats(); };
   // Reconnect ourselves with backoff (2s .. 30s) instead of the browser's fixed retry interval.
   es.onerror = function(){ if (S.es !== es) return;
@@ -959,6 +960,7 @@ function keyCard(k){
       '<label class="wide">Allowed models<input data-f="models" value="' + esc((k.models || []).join(', ')) + '" placeholder="any (e.g. gpt-4o-mini, claude-haiku-*)"></label>' +
       '<label>Expires<input type="date" data-f="expires" value="' + dateVal(k.expires) + '"></label>' +
       '<label class="ktog"><input type="checkbox" data-f="paused"' + (k.paused ? ' checked' : '') + '>Paused</label>' +
+      '<label class="ktog" title="Web search / fetch, code execution, remote MCP and URLs the provider fetches itself. They send data on to other sites, so they are refused unless you allow them."><input type="checkbox" data-f="allow_server_tools"' + (k.allow_server_tools ? ' checked' : '') + '>Allow provider-side tools</label>' +
     '</div>' +
     '<div class="kbtns"><button type="button" class="btn danger" data-act="delete">Delete</button><button type="button" class="btn primary" data-act="save">Save limits</button></div></div>';
 }
@@ -974,7 +976,7 @@ function limitsOf(card){
   var o = {};
   [].forEach.call(card.querySelectorAll('[data-f]'), function(el){
     var f = el.getAttribute('data-f');
-    if (f === 'paused') o.paused = el.checked;
+    if (f === 'paused' || f === 'allow_server_tools') o[f] = el.checked;
     else if (f === 'models') o.models = el.value;
     else if (f === 'expires') o.expires = el.value ? new Date(el.value + 'T23:59:59').getTime()/1000 : 0;
     else o[f] = el.value === '' ? 0 : +el.value;

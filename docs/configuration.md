@@ -69,6 +69,13 @@ A fully commented example is in [`llmtap.example.toml`](../llmtap.example.toml).
 | `budget_session_usd` | `0.0` | `LLMTAP_BUDGET_SESSION_USD` | `--budget-session` | Same, for spend through this proxy process. `0` = unlimited. |
 | `loop_threshold` | `0` | `LLMTAP_LOOP_THRESHOLD` | `--loop-threshold` | Refuse (429) an identical request once seen this many times within the window. `0` = off. |
 | `loop_window_s` | `60` | `LLMTAP_LOOP_WINDOW_S` | `--loop-window` | Loop-detection window in seconds. |
+| `budget_warn` | `"50,80,95"` | `LLMTAP_BUDGET_WARN` | `--budget-warn` | Warn (terminal, dashboard, and desktop with `notify`) when the daily or session budget, or a stored key's cap, reaches each percentage. Once per threshold per day / run. `""` = off. |
+| `notify` | `false` | `LLMTAP_NOTIFY` | `--notify` | Desktop notifications for budget warnings and blocked leaks (`osascript`, `notify-send` or PowerShell; nothing to install). |
+| `leak_check` | `"block"` | `LLMTAP_LEAK_CHECK` | `--leak-check` | `off`, `warn` or `block`: your real secrets (stored keys, `.env` values, canaries) in a request body, also base64 / hex / URL-encoded. See [what-may-leave.md](what-may-leave.md). |
+| `leak_files` | `""` | `LLMTAP_LEAK_FILES` | `--leak-files` | Comma-separated `KEY=VALUE` files to fingerprint. `""` = `.env` and `.env.*` in the folder llmtap starts in. |
+| `keys_only` | `false` | `LLMTAP_KEYS_ONLY` | `--keys-only` | Refuse requests that carry a real API key instead of a `llmtap-key-<name>` placeholder. |
+| `dashboard_writes` | `true` | `LLMTAP_DASHBOARD_WRITES` | `--no-dashboard-writes` | `false`: the dashboard API can't add or change stored keys or clear history; use the CLI. For agents that can reach llmtap's port (sandboxes). |
+| `max_request_kb` | `0` | `LLMTAP_MAX_REQUEST_KB` | `--max-request-kb` | Refuse request bodies bigger than this (HTTP 413). `0` = no limit. |
 | `upstreams` | see below | – | `--upstream NAME=URL[,STYLE]` (repeatable) | Named upstreams (`base`, `style`). |
 | `pricing_overrides` | `{}` | – | – | Per-model prices in USD per 1M tokens (`input`, `output`, `cache_read`, `cache_write`). File only, as `[pricing_overrides."<model>"]` tables. |
 | `upstream_timeout_s` | `600.0` | `LLMTAP_UPSTREAM_TIMEOUT_S` | `--timeout` | Timeout for upstream requests, in seconds. |

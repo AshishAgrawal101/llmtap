@@ -28,6 +28,14 @@ budget_daily_usd = 0.0        # 0 = unlimited; counts upstream spend since local
 budget_session_usd = 0.0      # 0 = unlimited; per proxy process
 loop_threshold = 0            # 0 = off; e.g. 5 = refuse an identical request seen 5 times...
 loop_window_s = 60            # ...within this many seconds
+budget_warn = "50,80,95"      # warn when a budget or stored-key cap reaches these percentages ("" = off)
+notify = false                # also show budget warnings and blocked leaks as desktop notifications
+
+# --- what may leave (docs/what-may-leave.md) ------------------------------------------------------
+leak_check = "block"          # "off" | "warn" | "block": your real secrets (stored keys, .env values, canaries)
+leak_files = ""               # comma-separated KEY=VALUE files to fingerprint; "" = .env* where llmtap starts
+keys_only = false             # refuse requests that carry a real API key instead of a llmtap-key-<name> placeholder
+max_request_kb = 0            # 0 = no limit; refuse bigger request bodies
 
 # --- upstreams ----------------------------------------------------------------------------------
 # Built in: anthropic, openai, openrouter, groq, together, mistral, deepseek, ollama, gemini.

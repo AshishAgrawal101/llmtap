@@ -30,11 +30,12 @@ from .budget import Budget
 from .cache import ResponseCache, cache_key
 from .cassette import Cassette
 from .config import Config
+from .egress import Tripwire, default_env_files, server_tools
 from .guard import apply_guard
 from .models import CachedResponse, Exchange, Route, Usage
 from .pricing import cost_usd
 from .vault import (TAG as VAULT_TAG, Refusal, base_allows, body_models, caller_refusal, endpoint_refusal,
-                    find_placeholder, request_shape_refusal, substitute, _local_midnight)
+                    PLACEHOLDER_PREFIX, find_placeholder, mint_refusal, request_shape_refusal, substitute, _local_midnight)
 from .providers import (
     EVENTSTREAM_CTYPE,
     bedrock_header_usage,
@@ -316,6 +317,23 @@ def _credentials(hdrs: Mapping[str, str], path: str) -> list[str]:
     return sorted({v for v in vals if len(v) >= 8}, key=len, reverse=True)
 
 
+_PLACEHOLDER_FULL = re.compile(r"(?:(?:bearer|basic|token)\s+)?" + re.escape(PLACEHOLDER_PREFIX)
+                               + r"[a-z0-9][a-z0-9_-]{0,39}", re.IGNORECASE)
+_CRED_QS_RE = re.compile(r"(?i)^x-amz-|token|sig|cred|key|auth|secret|password")
+
+
+def _real_credentials(hdrs: Mapping[str, str], path: str) -> bool:
+    """Keys-only mode: does this request carry any credential that is not exactly a llmtap placeholder?"""
+    for name in _CRED_HEADERS:
+        v = (hdrs.get(name) or "").strip()
+        if v and not _PLACEHOLDER_FULL.fullmatch(v):
+            return True
+    for k, v in parse_qsl(path.partition("?")[2], keep_blank_values=True):
+        if (k.lower() in _SENSITIVE_QS or _CRED_QS_RE.search(k)) and v and not _PLACEHOLDER_FULL.fullmatch(v.strip()):
+            return True
+    return False
+
+
 def _scrub(text: str, secrets: list[str]) -> str:
     for sec in secrets:
         if sec in text:
@@ -382,6 +400,8 @@ def _seal(ex: Exchange) -> None:
             v = getattr(ex, f, None)
             if v:
                 setattr(ex, f, _scrub(v, secrets))
+        if ex.tags:
+            ex.tags = {k: _scrub(str(v), secrets) for k, v in ex.tags.items()}
 
 
 _LLM_TAIL = re.compile(r"(?:/(?:chat/completions|completions|embeddings)|:(?:stream)?[gG]enerateContent|(?:^|/)v\d+[a-z0-9]*/(?:messages|complete|responses))$")
@@ -473,6 +493,17 @@ class LLMTap:
             self.otel = OtelExporter(cfg.otel_endpoint)
         self._vault: Any = None             # key vault, opened on first use (a placeholder or the Keys API)
         self._vault_lock = threading.Lock()
+        from .alerts import Alerts, parse_thresholds
+        self.alerts = Alerts(parse_thresholds(cfg.budget_warn), desktop=bool(cfg.notify), emit=self._warn)
+        self.tripwire: Tripwire | None = None
+        if (cfg.leak_check or "off") != "off":
+            from pathlib import Path
+            files = ([Path(f.strip()).expanduser() for f in cfg.leak_files.split(",") if f.strip()]
+                     if cfg.leak_files.strip() else default_env_files())
+            for f in files:
+                if not f.is_file():
+                    print(f"llmtap: leak_files: {f} not found; it is not being watched", file=sys.stderr)
+            self.tripwire = Tripwire(files, vault=lambda: self.vault)
         self.port: int = cfg.port
         self.started_at: float = time.time()
         self._server: _Server | None = None
@@ -499,6 +530,19 @@ class LLMTap:
                     from .vault import Vault
                     self._vault = Vault()
         return self._vault
+
+    def _warn(self, title: str, message: str, data: dict[str, Any]) -> None:
+        """A warning for the terminal and the dashboard (budget thresholds, blocked leaks)."""
+        try:
+            self.bus.publish({"type": "warning", "title": title, "message": message, **data})
+        except Exception:
+            pass
+        try:
+            from .term import paint
+            safe = "".join(c if c.isprintable() else "?" for c in message)
+            print(paint(f"⚠ {safe}", "bold", "yellow", color=sys.stderr.isatty()), file=sys.stderr, flush=True)
+        except Exception:
+            pass
 
     def _vault_lookup(self, name: str) -> tuple[Any, str | None, str | None]:
         """(KeyInfo, secret, problem) for a placeholder's key name. Messages never contain a secret."""
@@ -640,7 +684,12 @@ class LLMTap:
         vault_info: Any = None
         vault_refusal: Refusal | None = None
         vault_secrets: list[str] = []
-        if found is not None:
+        if self.cfg.keys_only:
+            if _real_credentials(hdrs, path):
+                vault_refusal = Refusal(403, "llmtap: keys-only mode refuses requests that carry a real API key. Store "
+                                             "the key with `llmtap keys add` and send its llmtap-key-<name> "
+                                             "placeholder instead.", "llmtap_keys_only")
+        if found is not None and vault_refusal is None:
             from .dashboard import _host_allowed
             vault_refusal = caller_refusal(hdrs, client, _host_allowed(self, hdrs))
             if vault_refusal is None and any(ord(c) < 33 or ord(c) == 127 for c in path):
@@ -723,6 +772,26 @@ class LLMTap:
         llm = _is_llm_call(method, route.upstream_path)
         ctype = hdrs.get("content-type", "")
 
+        # compressed request bodies: none of the checks below could read them, so they never pass unchecked
+        enc = (hdrs.get("content-encoding") or "").strip().lower()
+        if body and enc not in ("", "identity"):
+            ex.source = "blocked"
+            ex.request_body = f"[{len(body):,} bytes, not stored: content-encoding {enc!r}]"
+            self._error(out, ex, route.style, 415,
+                        f"llmtap: compressed request bodies (content-encoding: {enc}) can't be checked, so they are "
+                        "refused. Send the body uncompressed.", "llmtap_encoded_body")
+            return
+
+        # size limit: a cap on how much one call can carry out (and on what it can cost)
+        limit_kb = int(cfg.max_request_kb or 0)
+        if limit_kb > 0 and len(body) > limit_kb * 1024:
+            ex.source = "blocked"
+            ex.request_body = f"[{len(body):,} bytes, not stored: over max_request_kb]"
+            self._error(out, ex, route.style, 413,
+                        f"llmtap: this request is {len(body) / 1024:,.0f} KB, over the {limit_kb:,} KB limit "
+                        "(max_request_kb).", "llmtap_request_too_large")
+            return
+
         # guard. Only JSON documents may ever be rewritten: multipart / binary / unparseable bodies are
         # scanned as text (warn / block) but forwarded byte-for-byte even in redact mode.
         send_body = body
@@ -738,6 +807,8 @@ class LLMTap:
             if blocked or signed_rewrite:
                 # Never persist the secret we just refused to send: store the redacted body instead.
                 stored_body, _, _ = apply_guard(body, "redact", cfg.guard_pii)
+                if self.tripwire is not None:
+                    stored_body = self.tripwire.redact(stored_body)
                 ex.request_body, trunc = _decode_request(stored_body, ctype)
                 if trunc:
                     _note(ex, f"request body truncated to {MAX_STORED_CHARS} characters in llmtap storage")
@@ -753,7 +824,38 @@ class LLMTap:
                 return
             if send_body is not body:
                 req = parse_json(send_body) if req is not None else req
-        ex.request_body, trunc = _decode_request(send_body, ctype)
+        # leak tripwire: your actual secrets (stored keys, .env values, canaries), in any common encoding
+        stored_body = send_body
+        if self.tripwire is not None:
+            # the body, the URL and every header except the credential ones (where a stored key legitimately is)
+            extra = chr(10).join([ex.path] + [f"{k}: {v}" for k, v in hdrs.items() if k not in _CRED_HEADERS])
+            leaks = self.tripwire.scan(send_body)
+            seen = {lk.label for lk in leaks}
+            leaks += [lk for lk in self.tripwire.scan(extra.encode("utf-8", "replace")) if lk.label not in seen]
+            if leaks:
+                stored_body = self.tripwire.redact(send_body)       # never store the secret...
+                if self.tripwire.scan(stored_body):                  # (an escaped form redact() can't cut out)
+                    stored_body = b"[request body not stored: it contained a secret llmtap could not redact]"
+                    req = None
+                ex.__dict__["_secrets"] = sorted(                    # ...nor an echo of it in the response
+                    set(ex.__dict__.get("_secrets") or []) | {f for lk in leaks for f in lk.forms},
+                    key=len, reverse=True)
+                ex.guard_findings = list(ex.guard_findings or []) + [lk.to_dict() for lk in leaks]
+                what = "; ".join(f"{lk.label}" + (f" ({lk.encoding})" if lk.encoding != "plain" else "")
+                                 for lk in leaks)
+                canary = any(lk.canary for lk in leaks)
+                hint = (" Nothing legitimate sends a canary: something read that .env file." if canary else "")
+                self.alerts.announce("llmtap leak tripwire", f"{'blocked' if cfg.leak_check == 'block' else 'saw'} "
+                                     f"a request containing {what}", {"leak": True})
+                if (cfg.leak_check or "off") == "block":
+                    ex.request_body, _ = _decode_request(stored_body, ctype)
+                    ex.source = "blocked"
+                    self._error(out, ex, route.style, 403,
+                                f"llmtap blocked this request: it contains {what}.{hint} If this is intended, "
+                                "run llmtap with --leak-check warn.", "llmtap_leak_blocked")
+                    return
+                _note(ex, f"leak tripwire: this request contained {what}.{hint}")
+        ex.request_body, trunc = _decode_request(stored_body, ctype)
         if trunc:
             _note(ex, f"request body truncated to {MAX_STORED_CHARS} characters in llmtap storage (forwarded in full)")
 
@@ -786,7 +888,11 @@ class LLMTap:
                     # auto mode: the cassette missed, so keep it complete with the cache-served response
                     if self.cassette is not None and self.cassette.should_record():
                         try:
-                            self.cassette.record(key, req if req is not None else ex.request_body, stored)
+                            rec: Any = req if req is not None else ex.request_body
+                            secrets = ex.__dict__.get("_secrets") or []
+                            if secrets and isinstance(rec, dict):
+                                rec = json.loads(_scrub(json.dumps(rec, ensure_ascii=False), secrets))
+                            self.cassette.record(key, rec, stored)
                         except Exception as e:
                             ex.error = ex.error or f"cassette write failed: {e}"
             if stored is not None:
@@ -819,7 +925,21 @@ class LLMTap:
                         self.store.spent_by_tag(VAULT_TAG, k.name, k.created) if k.total_usd else 0.0)
             try:
                 info = self.vault.get(vault_info.name) or vault_info      # pick up limit changes made meanwhile
-                refusal = endpoint_refusal(info, method, route.upstream_path, cacheable)
+                refusal = (mint_refusal(info, route.upstream_path)
+                           or endpoint_refusal(info, method, route.upstream_path, cacheable))
+                if refusal is None and send_body and not getattr(info, "allow_server_tools", False):
+                    tools = server_tools(send_body)
+                    if tools is None:
+                        refusal = Refusal(403, f"llmtap: the stored key {info.name!r} doesn't allow provider-side "
+                                               "tools, and llmtap can't read this request body (not JSON) to check "
+                                               "for them. To send it anyway: `llmtap keys limit "
+                                               f"{info.name} --allow-server-tools`.", "llmtap_server_tool_blocked")
+                    elif tools:
+                        refusal = Refusal(403, f"llmtap: the stored key {info.name!r} doesn't allow provider-side "
+                                               f"tools, and this request asks for {', '.join(tools)}. They make the "
+                                               "provider send data to other sites. To allow them: `llmtap keys "
+                                               f"limit {info.name} --allow-server-tools`.",
+                                          "llmtap_server_tool_blocked")
                 if refusal is None:
                     named = [ex.model, request_model(req), path_model]  # every model the request names...
                     if info.models:
@@ -1278,6 +1398,12 @@ class LLMTap:
             self.bus.publish({"type": "exchange", "exchange": summarize(ex)})
         except Exception:
             pass
+        if ex.cost_usd > 0 and self.alerts.thresholds:
+            try:
+                from .alerts import Alerts
+                self.alerts.check(Alerts.caps_for(self, ex))
+            except Exception:
+                pass
         if self.otel is not None and ex.cost_usd > 0:
             try:
                 self.otel.submit(ex)    # background thread: never waits on the collector

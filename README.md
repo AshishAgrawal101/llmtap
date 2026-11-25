@@ -16,6 +16,8 @@ See every LLM call live, know exactly what it cost, replay it in CI for free, an
 [Features](#-features) ·
 [Cassettes for CI](#-recordreplay-cassettes-vcr-for-llms) ·
 [Guard](#-secret-guard) ·
+[What may leave](#-what-may-leave) ·
+[X-ray](#-x-ray-what-your-coding-agent-sends) ·
 [CLI](#-cli-cheatsheet) ·
 [How it works](#-how-it-works) ·
 [Comparison](#-how-does-it-compare) ·
@@ -358,6 +360,30 @@ The first run (with real keys) records to `cassettes/<test>.jsonl`. Commit it. A
 no API key, no cost, no flakiness. In CI (`CI=1`) it defaults to replay, and a request with no recording fails the test
 with a message telling you to re-record (`pytest --llmtap-record`). Details: [docs/pytest-plugin.md](docs/pytest-plugin.md).
 
+## 🩻 X-ray: what your coding agent sends
+
+```bash
+llmtap wrap -- claude          # use your agent as usual, then:
+llmtap xray                    # today's summary
+llmtap xray 3f2a               # one request, by id prefix
+```
+
+For every request, llmtap splits the input into **system prompt, tool definitions, history and new input**, scaled
+to the token counts the provider reported, with what each part cost. It ranks tool definitions by size and groups
+MCP tools by server ("your 14 MCP tools from 'github' add ~18k tokens to every request"), and it explains
+**why the prompt cache missed**, by finding the first thing that changed since the previous request:
+
+```
+cache: MISS system prompt changed at char 2,629: '…ate: 2026-11-24 10:31…' -> '…ate: 2026-11-24 10:32…'
+       (looks like a timestamp/ID that changes every request) (~10k tokens, ~$0.0345 lost)
+```
+
+Other causes it names: the cache expired (time since the last request vs the TTL), tool definitions edited or
+reordered, the model changed, or an earlier message edited. `--json` for scripts.
+
+In Claude Code, `llmtap statusline` shows today's spend, cache hit rate and the last request's size in the status
+bar: run `llmtap statusline --setup` for the settings snippet.
+
 ## 📊 Find where the money goes
 
 ```bash
@@ -416,6 +442,27 @@ allowed models, an expiry date, or a pause switch. The real key is never shown a
 scrubbed from anything echoed back. It keeps keys out of prompts, logs and committed files; it is not a sandbox
 against programs running as you. Details: **[docs/keys.md](docs/keys.md)**
 
+## 🚧 What may leave
+
+A spend cap limits the bill, not what goes out. These checks look at the content of each request:
+
+```bash
+llmtap wrap -- claude                         # leak tripwire is on by default
+llmtap canary add --file .env                 # plant a fake secret: if it's ever sent, something read .env
+llmtap wrap --keys-only -- claude             # refuse any real API key; only llmtap-key-* placeholders get through
+llmtap wrap --max-request-kb 1024 -- claude   # refuse giant uploads
+```
+
+- **Leak tripwire**: fingerprints your actual secrets (stored keys, values in `.env` files, canaries) and blocks any
+  request containing one, even base64- or hex-encoded. It never guesses, so it doesn't flag lookalikes.
+- **Provider-side tools are refused for stored keys**: web search and fetch, code execution, remote MCP servers and
+  URLs the provider fetches itself all send data on to other sites. Allow them per key with
+  `llmtap keys limit NAME --allow-server-tools`.
+- **Keys-only mode** stops a prompt injection from sending your data out under someone else's API key.
+
+llmtap only sees LLM traffic, so an agent with network access can still `curl` data out. The real fix is a box where
+llmtap is the only way out: **[docs/sandbox.md](docs/sandbox.md)**. Details: **[docs/what-may-leave.md](docs/what-may-leave.md)**
+
 ## 🧯 Budgets & loop breaker
 
 ```bash
@@ -426,6 +473,9 @@ llmtap wrap --loop-threshold 5 --loop-window 60 -- python agent.py
 - **`--budget-daily USD`**: once today's upstream spend (since local midnight, across all runs sharing the same database) reaches the cap, requests get HTTP **429**.
 - **`--budget-session USD`**: the same, for spend through this proxy process only.
 - **`--loop-threshold N --loop-window W`**: once the *identical* request has been sent N times within W seconds, further copies are refused with HTTP **429**. This is the classic stuck-agent pattern, and it gets stopped in seconds instead of at 3am.
+
+Before a cap is hit you get warnings at 50, 80 and 95% (`--budget-warn 50,80,95`), for the daily and session budgets
+and for each stored key's caps: in the terminal, as a dashboard banner, and with `--notify` as a desktop notification.
 
 Refusals are returned as provider-shaped error JSON, so your SDK raises its normal error type with a clear message
 (e.g. `llmtap: daily budget of $5.00 reached ($5.02 spent today)` or
@@ -478,12 +528,15 @@ Every field, env var and flag: **[docs/configuration.md](docs/configuration.md)*
 | `llmtap prices [filter]` | Show the built-in price table |
 | `llmtap scan [file\|-]` | Scan text for secrets; exit 1 on findings |
 | `llmtap keys [add\|limit\|remove] …` | Store API keys apps can use without seeing them, with per-key limits ([docs](docs/keys.md)) |
+| `llmtap canary [add\|list\|remove]` | Plant fake secrets in `.env`; llmtap blocks and reports them if they're ever sent ([docs](docs/what-may-leave.md#canaries)) |
+| `llmtap xray [id] [--since today] [--json]` | Context split, tool/MCP bloat and prompt-cache misses with their causes |
+| `llmtap statusline [--setup]` | One line of today's spend for Claude Code's status bar |
 | `llmtap clear [--yes]` | Delete recorded history |
 | `llmtap version` | Print the version |
 
 Common flags for `serve` / `wrap`: `--port --host --db --config --quiet --timeout --upstream NAME=URL[,STYLE] --cache
 --no-cache --cache-ttl --cassette --mode --allow-miss --guard --pii --budget-daily --budget-session --loop-threshold
---loop-window`.
+--loop-window --budget-warn --notify --keys-only --leak-check --leak-files --max-request-kb`.
 
 ---
 
