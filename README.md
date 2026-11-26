@@ -458,7 +458,8 @@ llmtap wrap --max-request-kb 1024 -- claude   # refuse giant uploads
 - **Provider-side tools are refused for stored keys**: web search and fetch, code execution, remote MCP servers and
   URLs the provider fetches itself all send data on to other sites. Allow them per key with
   `llmtap keys limit NAME --allow-server-tools`.
-- **Keys-only mode** stops a prompt injection from sending your data out under someone else's API key.
+- **Real keys are refused** for any provider you've stored a key for, and with `--keys-only` for every provider.
+  That stops a prompt injection from sending your data out under someone else's API key.
 
 llmtap only sees LLM traffic, so an agent with network access can still `curl` data out. The real fix is a box where
 llmtap is the only way out: **[docs/sandbox.md](docs/sandbox.md)**. Details: **[docs/what-may-leave.md](docs/what-may-leave.md)**
@@ -536,7 +537,7 @@ Every field, env var and flag: **[docs/configuration.md](docs/configuration.md)*
 
 Common flags for `serve` / `wrap`: `--port --host --db --config --quiet --timeout --upstream NAME=URL[,STYLE] --cache
 --no-cache --cache-ttl --cassette --mode --allow-miss --guard --pii --budget-daily --budget-session --loop-threshold
---loop-window --budget-warn --notify --keys-only --leak-check --leak-files --max-request-kb`.
+--loop-window --budget-warn --notify --keys-only --allow-real-keys --leak-check --leak-files --max-request-kb`.
 
 ---
 

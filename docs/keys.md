@@ -62,6 +62,7 @@ llmtap keys limit openai --allow-server-tools          # allow provider-side web
 | A key with model or spend limits, used for an endpoint llmtap can't check (batches, images, audio, fine-tuning, long-running jobs) | 403 `llmtap_key_endpoint_not_allowed` |
 | Provider-side tools (web search / fetch, code execution, remote MCP, provider-fetched URLs), unless `--allow-server-tools` ([why](what-may-leave.md#provider-side-tools)) | 403 `llmtap_server_tool_blocked` |
 | Endpoints that create other credentials (OpenAI realtime client secrets, Gemini ephemeral tokens, API keys), which would work without llmtap | 403 `llmtap_key_mint_refused` |
+| A real key for a provider that has a stored key, unless `--allow-real-keys` ([why](what-may-leave.md#real-keys-and-keys-only-mode)) | 403 `llmtap_real_key_refused` |
 | Placeholder for a key that isn't stored | 401 `llmtap_key_not_found` |
 | Key sent towards another provider, or another URL than it was stored for | 403 `llmtap_key_wrong_provider` / `llmtap_key_wrong_upstream` |
 | Request from a web page on another site, another machine, or an unexpected `Host` | 403 `llmtap_key_cross_origin` / `llmtap_key_remote_client` / `llmtap_key_bad_host` |

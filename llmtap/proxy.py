@@ -35,7 +35,8 @@ from .guard import apply_guard
 from .models import CachedResponse, Exchange, Route, Usage
 from .pricing import cost_usd
 from .vault import (TAG as VAULT_TAG, Refusal, base_allows, body_models, caller_refusal, endpoint_refusal,
-                    PLACEHOLDER_PREFIX, find_placeholder, mint_refusal, request_shape_refusal, substitute, _local_midnight)
+                    PLACEHOLDER_PREFIX, PROVIDER_ENV, find_placeholder, mint_refusal, request_shape_refusal,
+                    substitute, _local_midnight)
 from .providers import (
     EVENTSTREAM_CTYPE,
     bedrock_header_usage,
@@ -544,6 +545,35 @@ class LLMTap:
         except Exception:
             pass
 
+    def _real_key_refusal(self, provider: str) -> Refusal | None:
+        """A request carries a real credential for ``provider``. Refused when a key for that provider is stored (a
+        real one arriving is then someone else's account, or the key you meant to stop handing out) unless
+        ``allow_real_keys``, and always in ``keys_only`` mode. The message names the exact fix."""
+        cfg = self.cfg
+        if cfg.allow_real_keys and not cfg.keys_only:
+            return None
+        try:
+            stored = [k for k in self.vault.list() if k.provider == provider]
+        except Exception:
+            stored = []
+        if stored:
+            k = next((x for x in stored if x.name == provider), stored[0])
+            env = PROVIDER_ENV.get(provider, ())
+            use = f"{env[0]}={k.placeholder}" if env else k.placeholder
+            more = f" (or another stored {provider} key: {', '.join(x.name for x in stored if x is not k)})"                 if len(stored) > 1 else ""
+            msg = (f"llmtap: this request carries a real {provider} API key, but you have one stored as {k.name!r}. "
+                   f"Use its placeholder instead: {use}{more}. `llmtap wrap` sets it for you.")
+            if cfg.keys_only:
+                return Refusal(403, msg + " (keys-only mode refuses every real key.)", "llmtap_keys_only")
+            return Refusal(403, msg + " If this real key is intended, start llmtap with --allow-real-keys.",
+                           "llmtap_real_key_refused")
+        if cfg.keys_only:
+            env = PROVIDER_ENV.get(provider, ())
+            then = f", then use {env[0]}={PLACEHOLDER_PREFIX}{provider}" if env else ""
+            return Refusal(403, f"llmtap: keys-only mode refuses real API keys, and no {provider} key is stored. "
+                                f"Store it with `llmtap keys add {provider}`{then}.", "llmtap_keys_only")
+        return None
+
     def _vault_lookup(self, name: str) -> tuple[Any, str | None, str | None]:
         """(KeyInfo, secret, problem) for a placeholder's key name. Messages never contain a secret."""
         try:
@@ -684,11 +714,7 @@ class LLMTap:
         vault_info: Any = None
         vault_refusal: Refusal | None = None
         vault_secrets: list[str] = []
-        if self.cfg.keys_only:
-            if _real_credentials(hdrs, path):
-                vault_refusal = Refusal(403, "llmtap: keys-only mode refuses requests that carry a real API key. Store "
-                                             "the key with `llmtap keys add` and send its llmtap-key-<name> "
-                                             "placeholder instead.", "llmtap_keys_only")
+        real_key = _real_credentials(hdrs, path)     # checked once the provider is known (below)
         if found is not None and vault_refusal is None:
             from .dashboard import _host_allowed
             vault_refusal = caller_refusal(hdrs, client, _host_allowed(self, hdrs))
@@ -716,6 +742,8 @@ class LLMTap:
             style = route.style
             ex.provider, ex.style = route.provider, route.style
             problem = bedrock_route_problem(route, path, hdrs)
+            if vault_refusal is None and real_key:
+                vault_refusal = self._real_key_refusal(route.provider)
             if vault_refusal is not None:
                 ex.source = "blocked"
                 self._error(out, ex, route.style, vault_refusal.status, vault_refusal.message, vault_refusal.err_type)

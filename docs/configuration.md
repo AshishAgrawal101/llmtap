@@ -74,6 +74,7 @@ A fully commented example is in [`llmtap.example.toml`](../llmtap.example.toml).
 | `leak_check` | `"block"` | `LLMTAP_LEAK_CHECK` | `--leak-check` | `off`, `warn` or `block`: your real secrets (stored keys, `.env` values, canaries) in a request body, also base64 / hex / URL-encoded. See [what-may-leave.md](what-may-leave.md). |
 | `leak_files` | `""` | `LLMTAP_LEAK_FILES` | `--leak-files` | Comma-separated `KEY=VALUE` files to fingerprint. `""` = `.env` and `.env.*` in the folder llmtap starts in. |
 | `keys_only` | `false` | `LLMTAP_KEYS_ONLY` | `--keys-only` | Refuse requests that carry a real API key instead of a `llmtap-key-<name>` placeholder. |
+| `allow_real_keys` | `false` | `LLMTAP_ALLOW_REAL_KEYS` | `--allow-real-keys` | `false`: a request carrying a real API key is refused for any provider that has a stored key (the error names the placeholder to use). `keys_only` refuses real keys for every provider. |
 | `dashboard_writes` | `true` | `LLMTAP_DASHBOARD_WRITES` | `--no-dashboard-writes` | `false`: the dashboard API can't add or change stored keys or clear history; use the CLI. For agents that can reach llmtap's port (sandboxes). |
 | `max_request_kb` | `0` | `LLMTAP_MAX_REQUEST_KB` | `--max-request-kb` | Refuse request bodies bigger than this (HTTP 413). `0` = no limit. |
 | `upstreams` | see below | – | `--upstream NAME=URL[,STYLE]` (repeatable) | Named upstreams (`base`, `style`). |

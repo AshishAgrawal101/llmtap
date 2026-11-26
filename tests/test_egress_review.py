@@ -277,3 +277,35 @@ def test_statusline_odd_path(tmp_path: Path) -> None:
 
 def test_budget_warn_accepts_100() -> None:
     assert alerts.parse_thresholds("50,80,100") == [50.0, 80.0, 100.0]
+
+
+# 0.4.1: real keys are refused by default for providers that have a stored key, with a message naming the fix
+def test_real_key_refused_when_one_is_stored(vtap: Any, vault: Vault, mock_upstream: Any) -> None:
+    vault.add("openai", "openai", OPENAI_KEY)
+    t = vtap()
+    status, body = _call(t, "/v1/chat/completions", _msg("hi"), {"Authorization": "Bearer sk-someone-else0123456789"})
+    err = body["error"]
+    assert status == 403 and err["type"] == "llmtap_real_key_refused"
+    assert "OPENAI_API_KEY=llmtap-key-openai" in err["message"] and "--allow-real-keys" in err["message"]
+    assert not mock_upstream.requests
+    # other providers (nothing stored), placeholders and no-credential calls are unaffected
+    assert _call(t, "/v1/messages", {"model": "claude-sonnet-4-5", "max_tokens": 5, "messages": []},
+                 {"x-api-key": "sk-ant-mine0123456789", "anthropic-version": "2023-06-01"})[0] == 200
+    assert _call(t, "/v1/chat/completions", _msg("hi"), {"Authorization": "Bearer llmtap-key-openai"})[0] == 200
+    assert _call(t, "/v1/chat/completions", _msg("hi"), {})[0] == 200
+    # opt out
+    assert _call(vtap(allow_real_keys=True), "/v1/chat/completions", _msg("hi"),
+                 {"Authorization": "Bearer sk-someone-else0123456789"})[0] == 200
+
+
+def test_keys_only_message_names_the_fix(vtap: Any, vault: Vault) -> None:
+    t = vtap(keys_only=True, allow_real_keys=True)          # keys-only wins over allow_real_keys
+    status, body = _call(t, "/v1/messages", {"model": "claude-sonnet-4-5", "max_tokens": 5, "messages": []},
+                         {"x-api-key": "sk-ant-mine0123456789", "anthropic-version": "2023-06-01"})
+    msg = body["error"]["message"]
+    assert status == 403 and "llmtap keys add anthropic" in msg and "ANTHROPIC_API_KEY=llmtap-key-anthropic" in msg
+    vault.add("work-openai", "openai", OPENAI_KEY)
+    vault.add("openai", "openai", OPENAI_KEY + "B")
+    status, body = _call(t, "/v1/chat/completions", _msg("hi"), {"Authorization": "Bearer sk-x0123456789"})
+    msg = body["error"]["message"]
+    assert "OPENAI_API_KEY=llmtap-key-openai" in msg and "work-openai" in msg

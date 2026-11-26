@@ -58,6 +58,7 @@ class Config:
     notify: bool = False                    # also show budget warnings as desktop notifications
     # what may leave
     keys_only: bool = False                 # refuse requests that carry a real API key instead of a llmtap placeholder
+    allow_real_keys: bool = False           # False: a real key is refused for any provider that has a stored key
     leak_check: str = "block"               # "off" | "warn" | "block": your real secrets (stored keys, .env values,
                                             # canaries) in a request body, also base64 / hex / URL-encoded
     leak_files: str = ""                    # comma-separated KEY=VALUE files to fingerprint; "" = .env* in the cwd

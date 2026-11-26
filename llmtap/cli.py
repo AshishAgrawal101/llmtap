@@ -118,7 +118,7 @@ _OVERRIDE_MAP: dict[str, str] = {
     "budget_daily": "budget_daily_usd", "budget_session": "budget_session_usd",
     "loop_threshold": "loop_threshold", "loop_window": "loop_window_s",
     "timeout": "upstream_timeout_s",
-    "keys_only": "keys_only", "leak_check": "leak_check", "leak_files": "leak_files",
+    "keys_only": "keys_only", "allow_real_keys": "allow_real_keys", "leak_check": "leak_check", "leak_files": "leak_files",
     "max_request_kb": "max_request_kb", "budget_warn": "budget_warn", "notify": "notify",
     "dashboard_writes": "dashboard_writes",
 }
@@ -162,7 +162,9 @@ def _proxy_parent() -> argparse.ArgumentParser:
                    help="also show budget warnings and blocked leaks as desktop notifications")
     g = p.add_argument_group("what may leave")
     g.add_argument("--keys-only", action="store_const", const=True, default=S,
-                   help="refuse requests carrying a real API key instead of a llmtap-key-<name> placeholder")
+                   help="refuse every real API key; only llmtap-key-<name> placeholders get through")
+    g.add_argument("--allow-real-keys", action="store_const", const=True, default=S,
+                   help="accept real API keys even for providers that have a stored key (refused by default)")
     g.add_argument("--leak-check", choices=["off", "warn", "block"], default=S,
                    help="your real secrets (stored keys, .env values, canaries) in a prompt, also base64/hex "
                         "(default block)")

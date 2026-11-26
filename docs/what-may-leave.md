@@ -8,7 +8,7 @@ your `.env` file into a prompt. These checks look at the content of each request
 | [Leak tripwire](#leak-tripwire) | **on (block)** | Your real secrets (stored keys, `.env` values, canaries) in a prompt, including base64, hex and URL-encoded copies |
 | [Canaries](#canaries) | off (`llmtap canary add`) | Tells you an agent read your `.env` file |
 | [Provider-side tools](#provider-side-tools) | **blocked for stored keys** | Web search / fetch, code execution, remote MCP and provider-fetched URLs, which send data on to other sites |
-| [Keys-only mode](#keys-only-mode) | off (`--keys-only`) | Requests carrying a real key, such as an attacker's own, instead of your placeholder |
+| [Real keys refused](#real-keys-and-keys-only-mode) | **on for providers with a stored key** (`--keys-only` for all) | Requests carrying a real key, such as an attacker's own, instead of your placeholder |
 | [Size limit](#size-limit) | off (`--max-request-kb`) | Bulk uploads in one call |
 
 None of this makes llmtap a sandbox: it only sees LLM traffic. An agent with network access can still `curl` data
@@ -98,13 +98,29 @@ Client-side tools (your own functions, Anthropic's bash / text editor / computer
 run on your machine and are not affected. Requests with your own real key, rather than a stored one, are not
 checked: that's your key.
 
-## Keys-only mode
+## Real keys and keys-only mode
+
+Once you've stored a key for a provider, a request that carries a **real** key for that provider is refused (HTTP
+403, `llmtap_real_key_refused`): it's either someone else's account or the key you meant to stop handing out. The
+error says exactly what to use instead:
+
+```
+llmtap: this request carries a real openai API key, but you have one stored as 'openai'. Use its placeholder
+instead: OPENAI_API_KEY=llmtap-key-openai. `llmtap wrap` sets it for you. If this real key is intended, start
+llmtap with --allow-real-keys.
+```
+
+`llmtap wrap` already replaces real keys in the environment with placeholders for providers you've stored a key for,
+so this only fires when something sends a real key on its own. Providers without a stored key are not affected.
+`--allow-real-keys` turns it off.
+
+To refuse real keys for every provider, stored or not:
 
 ```bash
 llmtap wrap --keys-only -- claude
 ```
 
-Refuses (HTTP 403, `llmtap_keys_only`) any request that carries a real credential instead of exactly a
+Keys-only refuses (HTTP 403, `llmtap_keys_only`) any request that carries a real credential instead of exactly a
 `llmtap-key-<name>` placeholder, in a credential header or a credential-like URL parameter (`key`, `token`,
 `X-Amz-Signature`, ...). A prompt injection could otherwise make the agent send your data under *someone else's* API key, to an
 account the attacker can read. Requests with no credentials at all (a local Ollama model) still work. AWS SigV4
@@ -133,6 +149,7 @@ Make those changes with `llmtap keys` and `llmtap clear` in a terminal instead.
 leak_check = "block"           # off | warn | block
 leak_files = ""                # "" = .env* in the folder llmtap starts in
 keys_only = false
+allow_real_keys = false        # true: accept real keys even for providers that have a stored key
 max_request_kb = 0             # 0 = no limit
 dashboard_writes = true        # false: keys and history can only be changed from the CLI
 notify = false                 # desktop notifications for budget warnings and blocked leaks

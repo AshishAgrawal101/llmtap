@@ -6,6 +6,22 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-25
+
+### Changed
+
+- **Real keys are refused for providers with a stored key**: once you've stored a key for a provider, a request that
+  carries a real key for it gets HTTP 403 (`llmtap_real_key_refused`), since it's someone else's account or the key
+  you meant to stop handing out. `llmtap wrap` already swaps real keys for placeholders, so this only fires when
+  something sends a real key on its own. Turn it off with `--allow-real-keys`. Thanks to the r/LLMDevs commenter who
+  argued that an opt-in only protects people who were already going to be fine.
+- The keys-only and real-key refusals now name the exact fix: the placeholder and environment variable to use
+  (`OPENAI_API_KEY=llmtap-key-openai`), or the `llmtap keys add` command when nothing is stored.
+
+### Fixed
+
+- The test suite no longer reads the developer's real `~/.llmtap` or OS credential store.
+
 ## [0.4.0] - 2026-11-24
 
 ### Added
@@ -233,7 +249,8 @@ First public release.
 - **`llmtap demo`**: built-in mock upstream and traffic generator for trying everything without an API key.
 - Composite GitHub Action (`action.yml`) for replaying cassettes in CI.
 
-[Unreleased]: https://github.com/AshishAgrawal101/llmtap/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/AshishAgrawal101/llmtap/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/AshishAgrawal101/llmtap/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/AshishAgrawal101/llmtap/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/AshishAgrawal101/llmtap/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/AshishAgrawal101/llmtap/compare/v0.2.1...v0.2.2

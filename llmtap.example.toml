@@ -35,6 +35,7 @@ notify = false                # also show budget warnings and blocked leaks as d
 leak_check = "block"          # "off" | "warn" | "block": your real secrets (stored keys, .env values, canaries)
 leak_files = ""               # comma-separated KEY=VALUE files to fingerprint; "" = .env* where llmtap starts
 keys_only = false             # refuse requests that carry a real API key instead of a llmtap-key-<name> placeholder
+allow_real_keys = false       # true: accept real keys even for providers that have a stored key
 max_request_kb = 0            # 0 = no limit; refuse bigger request bodies
 
 # --- upstreams ----------------------------------------------------------------------------------

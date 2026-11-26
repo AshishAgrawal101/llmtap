@@ -255,8 +255,10 @@ def test_daily_cap_counts_spend_per_key(vtap: Any, vault: Vault) -> None:
     assert status == 429 and "daily limit" in json.dumps(body)
     rows = _wait_rows(t, 2)
     assert {r.source for r in rows} == {"upstream", "budget"}
-    # another key / real keys are not affected by this key's cap
-    assert _anthropic(t, key=ANTHROPIC_KEY)[0] == 200
+    # a real key is refused by default while one is stored for the provider; when allowed, this key's cap
+    # doesn't apply to it
+    assert _anthropic(t, key=ANTHROPIC_KEY)[0] == 403
+    assert _anthropic(vtap(allow_real_keys=True), key=ANTHROPIC_KEY)[0] == 200
 
 
 def test_cache_hits_do_not_need_the_key(vtap: Any, vault: Vault, mock_upstream: Any) -> None:

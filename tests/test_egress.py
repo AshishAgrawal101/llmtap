@@ -240,8 +240,10 @@ def test_stored_key_refuses_server_tools_unless_allowed(vtap: Any, vault: Vault,
     hdrs = {"x-api-key": "llmtap-key-anthropic", "anthropic-version": "2023-06-01"}
     status, resp = _call(t, "/v1/messages", body, hdrs)
     assert status == 403 and resp["error"]["type"] == "llmtap_server_tool_blocked" and not mock_upstream.requests
-    # a real key (not stored) is the user's own business
-    assert _call(t, "/v1/messages", body, {"x-api-key": "sk-ant-own", "anthropic-version": "2023-06-01"})[0] == 200
+    # a real key is refused while one is stored; when allowed it's the user's own business (not checked)
+    own = {"x-api-key": "sk-ant-own0123456789", "anthropic-version": "2023-06-01"}
+    assert _call(t, "/v1/messages", body, own)[1]["error"]["type"] == "llmtap_real_key_refused"
+    assert _call(vtap(allow_real_keys=True), "/v1/messages", body, own)[0] == 200
     vault.update("anthropic", allow_server_tools=True)
     assert _call(t, "/v1/messages", body, hdrs)[0] == 200
 

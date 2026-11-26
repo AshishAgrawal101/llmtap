@@ -11,6 +11,13 @@ from llmtap.mock import MockUpstream
 from llmtap.vault import KeyInfo, MemoryBackend, Vault
 
 
+@pytest.fixture(autouse=True)
+def _private_llmtap_home(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never read or write the developer's real ~/.llmtap (stored keys, canaries) or OS credential store."""
+    monkeypatch.setenv("LLMTAP_HOME", str(tmp_path_factory.mktemp("llmtap-home")))
+    monkeypatch.setenv("LLMTAP_VAULT_BACKEND", "memory")
+
+
 @pytest.fixture()
 def mock_upstream() -> Iterator[MockUpstream]:
     """A started MockUpstream on 127.0.0.1:<ephemeral>, stopped after the test."""
