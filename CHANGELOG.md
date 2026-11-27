@@ -6,6 +6,12 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-11-27
+
+### Changed
+
+- PyPI page: links to the source, docs and changelog, and better search keywords. README: a line asking for a star.
+
 ## [0.4.1] - 2026-11-25
 
 ### Changed
@@ -249,7 +255,8 @@ First public release.
 - **`llmtap demo`**: built-in mock upstream and traffic generator for trying everything without an API key.
 - Composite GitHub Action (`action.yml`) for replaying cassettes in CI.
 
-[Unreleased]: https://github.com/AshishAgrawal101/llmtap/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/AshishAgrawal101/llmtap/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/AshishAgrawal101/llmtap/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/AshishAgrawal101/llmtap/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/AshishAgrawal101/llmtap/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/AshishAgrawal101/llmtap/compare/v0.2.2...v0.3.0

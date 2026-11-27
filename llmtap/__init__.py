@@ -1,2 +1,2 @@
 """llmtap — the flight recorder & firewall for LLM apps."""
-__version__ = "0.4.1"
+__version__ = "0.4.2"

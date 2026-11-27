@@ -1,6 +1,6 @@
 {
   "name": "llmtap-proxy",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "The flight recorder & firewall for LLM apps. See, cache, replay, budget and secure every LLM call.",
   "bin": {
     "llmtap": "./bin/llmtap.js"

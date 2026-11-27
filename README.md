@@ -43,6 +43,9 @@ llmtap demo                    # fake LLM traffic + the live dashboard in your b
 llmtap wrap -- python app.py   # now do it for real with your own app
 ```
 
+If llmtap saves you money or a leaked key, a ⭐ [on GitHub](https://github.com/AshishAgrawal101/llmtap) helps other
+people find it.
+
 <div align="center">
   <img src="assets/demo.gif" alt="llmtap demo: live traffic, cache hits, a leaked key caught, a runaway loop blocked" width="900">
   <br><br>

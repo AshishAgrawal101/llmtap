@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llmtap-proxy"
-version = "0.4.1"
+version = "0.4.2"
 description = "The flight recorder & firewall for LLM apps. See, cache, replay, budget and secure every LLM call — zero code changes, zero dependencies."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE"]
-keywords = ["llm", "openai", "anthropic", "claude", "proxy", "observability", "cache", "testing", "vcr", "agents", "cost"]
+keywords = ["llm", "openai", "anthropic", "claude", "proxy", "observability", "cache", "testing", "vcr", "agents", "cost",
+            "claude-code", "coding-agents", "security", "secrets", "api-keys", "prompt-cache", "mcp"]
 classifiers = [
   "Programming Language :: Python :: 3",
   "Topic :: Software Development :: Testing",
@@ -23,6 +24,9 @@ dev = ["pytest>=8", "botocore>=1.34"]   # botocore: Bedrock SigV4 / EventStream 
 
 [project.urls]
 Homepage = "https://github.com/AshishAgrawal101/llmtap"
+Source = "https://github.com/AshishAgrawal101/llmtap"
+Documentation = "https://github.com/AshishAgrawal101/llmtap/tree/main/docs"
+Changelog = "https://github.com/AshishAgrawal101/llmtap/blob/main/CHANGELOG.md"
 Issues = "https://github.com/AshishAgrawal101/llmtap/issues"
 
 [project.scripts]
