@@ -382,7 +382,24 @@ cache: MISS system prompt changed at char 2,629: '…ate: 2026-11-24 10:31…' -
 ```
 
 Other causes it names: the cache expired (time since the last request vs the TTL), tool definitions edited or
-reordered, the model changed, or an earlier message edited. `--json` for scripts.
+reordered, the model changed, or an earlier message edited. `--json` for scripts. The same view is in the dashboard
+(the **X-ray** tab of any request, plus a summary card) and in `llmtap report`.
+
+```bash
+llmtap whatif                                   # today's calls repriced on a set of current models
+llmtap whatif claude-sonnet-5-5 gpt-5-mini      # or the ones you name
+```
+
+```
+what if: 412 calls since today, actual $4.10 (claude-opus-5-5 x380, claude-haiku-5-5 x32)
+  claude-sonnet-5-5        $2.46   -40%
+  ...
+prompt cache: ~$1.90 lost to fixable misses (system prompt changed x14 incl. 14 timestamp/ID)
+```
+
+It uses the token counts each call actually reported, so no calls are made.
+
+Setup for Claude Code, Codex, Aider and other agents: **[docs/agents.md](docs/agents.md)**.
 
 In Claude Code, `llmtap statusline` shows today's spend, cache hit rate and the last request's size in the status
 bar: run `llmtap statusline --setup` for the settings snippet.
@@ -476,6 +493,7 @@ llmtap wrap --loop-threshold 5 --loop-window 60 -- python agent.py
 
 - **`--budget-daily USD`**: once today's upstream spend (since local midnight, across all runs sharing the same database) reaches the cap, requests get HTTP **429**.
 - **`--budget-session USD`**: the same, for spend through this proxy process only.
+- **`--max-call-usd USD`**: refuses a single call likely to cost more than this, before it's sent (one giant request with a whole repository in the context).
 - **`--loop-threshold N --loop-window W`**: once the *identical* request has been sent N times within W seconds, further copies are refused with HTTP **429**. This is the classic stuck-agent pattern, and it gets stopped in seconds instead of at 3am.
 
 Before a cap is hit you get warnings at 50, 80 and 95% (`--budget-warn 50,80,95`), for the daily and session budgets
@@ -534,13 +552,14 @@ Every field, env var and flag: **[docs/configuration.md](docs/configuration.md)*
 | `llmtap keys [add\|limit\|remove] …` | Store API keys apps can use without seeing them, with per-key limits ([docs](docs/keys.md)) |
 | `llmtap canary [add\|list\|remove]` | Plant fake secrets in `.env`; llmtap blocks and reports them if they're ever sent ([docs](docs/what-may-leave.md#canaries)) |
 | `llmtap xray [id] [--since today] [--json]` | Context split, tool/MCP bloat and prompt-cache misses with their causes |
+| `llmtap whatif [MODEL…] [--since today]` | What your recorded calls would have cost on other models, and with a working prompt cache |
 | `llmtap statusline [--setup]` | One line of today's spend for Claude Code's status bar |
 | `llmtap clear [--yes]` | Delete recorded history |
 | `llmtap version` | Print the version |
 
 Common flags for `serve` / `wrap`: `--port --host --db --config --quiet --timeout --upstream NAME=URL[,STYLE] --cache
 --no-cache --cache-ttl --cassette --mode --allow-miss --guard --pii --budget-daily --budget-session --loop-threshold
---loop-window --budget-warn --notify --keys-only --allow-real-keys --leak-check --leak-files --max-request-kb`.
+--loop-window --max-call-usd --budget-warn --notify --keys-only --allow-real-keys --leak-check --leak-files --max-request-kb`.
 
 ---
 

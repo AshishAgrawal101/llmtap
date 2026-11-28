@@ -6,10 +6,26 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
-## [0.4.2] - 2026-11-27
+## [0.5.0] - 2026-11-28
+
+### Added
+
+- **X-ray in the dashboard and the report**: every request has an **X-ray** tab (context split, tool and MCP bloat,
+  and the prompt-cache verdict against the previous request), the main view has a "Context X-ray · today" card, and
+  `llmtap report` has an X-ray section (where input tokens go, the largest tool definitions, cache misses by cause
+  with the $ lost). New read-only endpoints: `/_llmtap/api/exchanges/<id>/xray` and `/_llmtap/api/xray`.
+- **`llmtap whatif`**: reprices your recorded calls on other models from the token counts they actually reported
+  (no new calls), and shows what a working prompt cache would have saved, with misses split into fixable causes
+  (a timestamp in the system prompt, reordered or edited tools) and cache expiries. `--json` too.
+- **`--max-call-usd`**: refuses a single call likely to cost more than the limit (HTTP 403,
+  `llmtap_call_too_expensive`), before it's sent. The estimate counts inline images as media, not by their base64
+  length, and assumes up to 4,096 output tokens rather than the whole `max_tokens`.
+- **[docs/agents.md](docs/agents.md)**: setup for Claude Code, Codex CLI, Aider and other agents, with recommended
+  limits.
 
 ### Changed
 
+- `llmtap report` applies `[pricing_overrides]` to its X-ray figures.
 - PyPI page: links to the source, docs and changelog, and better search keywords. README: a line asking for a star.
 
 ## [0.4.1] - 2026-11-25
@@ -255,8 +271,8 @@ First public release.
 - **`llmtap demo`**: built-in mock upstream and traffic generator for trying everything without an API key.
 - Composite GitHub Action (`action.yml`) for replaying cassettes in CI.
 
-[Unreleased]: https://github.com/AshishAgrawal101/llmtap/compare/v0.4.2...HEAD
-[0.4.2]: https://github.com/AshishAgrawal101/llmtap/compare/v0.4.1...v0.4.2
+[Unreleased]: https://github.com/AshishAgrawal101/llmtap/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/AshishAgrawal101/llmtap/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/AshishAgrawal101/llmtap/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/AshishAgrawal101/llmtap/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/AshishAgrawal101/llmtap/compare/v0.2.2...v0.3.0

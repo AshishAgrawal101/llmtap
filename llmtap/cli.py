@@ -119,7 +119,7 @@ _OVERRIDE_MAP: dict[str, str] = {
     "loop_threshold": "loop_threshold", "loop_window": "loop_window_s",
     "timeout": "upstream_timeout_s",
     "keys_only": "keys_only", "allow_real_keys": "allow_real_keys", "leak_check": "leak_check", "leak_files": "leak_files",
-    "max_request_kb": "max_request_kb", "budget_warn": "budget_warn", "notify": "notify",
+    "max_request_kb": "max_request_kb", "max_call_usd": "max_call_usd", "budget_warn": "budget_warn", "notify": "notify",
     "dashboard_writes": "dashboard_writes",
 }
 
@@ -156,6 +156,8 @@ def _proxy_parent() -> argparse.ArgumentParser:
     g.add_argument("--budget-session", type=float, default=S, metavar="USD", help="refuse calls once this run's spend reaches this")
     g.add_argument("--loop-threshold", type=int, default=S, metavar="N", help="block an identical request seen N times...")
     g.add_argument("--loop-window", type=int, default=S, metavar="SECS", help="...within this window (default 60)")
+    g.add_argument("--max-call-usd", type=float, default=S, metavar="USD",
+                   help="refuse a single call likely to cost more than this (input + up to 4k output; 0 = off)")
     g.add_argument("--budget-warn", default=S, metavar="PCTS",
                    help="warn when a budget or stored-key cap reaches these percentages (default 50,80,95; '' = off)")
     g.add_argument("--notify", action="store_const", const=True, default=S,
@@ -300,6 +302,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--since", type=_since_arg, default="today", metavar="WHEN",
                     help="for the summary: 30m, 24h, 7d, today, 2026-01-31 or all (default today)")
     sp.add_argument("--top", type=int, default=5, metavar="N", help="rows per list (default 5)")
+    sp.add_argument("--json", action="store_true", help="machine-readable output")
+
+    sp = add("whatif", "what your recorded calls would have cost on other models, and with a working prompt cache",
+             [db])
+    sp.add_argument("models", nargs="*", metavar="MODEL", help="models to compare (default: a sensible set)")
+    sp.add_argument("--since", type=_since_arg, default="today", metavar="WHEN",
+                    help="30m, 24h, 7d, today, 2026-01-31 or all (default today)")
     sp.add_argument("--json", action="store_true", help="machine-readable output")
 
     sp = add("statusline", "one line of today's spend for a status bar (Claude Code: statusLine)", [db])
@@ -1155,9 +1164,10 @@ def cmd_report(args: argparse.Namespace) -> int:
     if fmt is None:
         ext = os.path.splitext(out)[1].lower() if out and out != "-" else ""
         fmt = _REPORT_EXT.get(ext, "html")
+    cfg = make_config(args)
     store = _open_store(args)
     try:
-        data = report.build_report(store, since=args.since)
+        data = report.build_report(store, since=args.since, overrides=cfg.pricing_overrides or None)
     finally:
         store.close()
     text = {"html": report.render_html, "md": report.render_markdown, "json": report.render_json}[fmt](data)
@@ -1292,6 +1302,29 @@ def cmd_xray(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_whatif(args: argparse.Namespace) -> int:
+    from llmtap import whatif
+    cfg = make_config(args)
+    overrides = cfg.pricing_overrides or None
+    store = _open_store(args)
+    try:
+        exchanges = [e for e in store.iter_light(args.since) if e.source == "upstream"]
+    finally:
+        store.close()
+    exchanges.sort(key=lambda e: e.ts)
+    if not exchanges:
+        _out("no calls in that period. Run something through llmtap first, or widen --since.")
+        return 0
+    result = whatif.compare(exchanges, args.models or None, overrides)
+    cache = whatif.cache_savings(exchanges, overrides)
+    period = "since " + time.strftime("%Y-%m-%d %H:%M", time.localtime(args.since)) if args.since else "all time"
+    if args.json:
+        _out(whatif.to_json(result, cache=cache, period=period))
+    else:
+        _out(whatif.render_text(result, cache=cache, color=_color_out(), period=period))
+    return 0
+
+
 def cmd_statusline(args: argparse.Namespace) -> int:
     from llmtap.statusline import SETUP_SNIPPET, statusline
     if args.setup:
@@ -1420,7 +1453,7 @@ COMMANDS: dict[str, Callable[[argparse.Namespace], int]] = {
 # Added later; kept apart so the core table (and tests that pin it) stay stable.
 EXTRA_COMMANDS: dict[str, Callable[[argparse.Namespace], int]] = {
     "report": cmd_report, "doctor": cmd_doctor, "keys": cmd_keys, "canary": cmd_canary,
-    "statusline": cmd_statusline, "xray": cmd_xray,
+    "statusline": cmd_statusline, "xray": cmd_xray, "whatif": cmd_whatif,
 }
 
 

@@ -29,6 +29,8 @@ TOP_N = 10
 _BLOCK_SOURCES = ("blocked", "budget", "loop")
 _PREVIEW_CHARS = 100
 _MAX_DAYS = 400
+XRAY_MAX_REQUESTS = 2000         # context X-ray: analyse at most the most recent N upstream requests ...
+XRAY_MAX_BYTES = 256 * 1024 * 1024   # ... and at most this many request-body bytes (bodies are held in memory)
 
 # --------------------------------------------------------------------------------------------
 # small helpers
@@ -422,8 +424,63 @@ def _fill_days(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
-def build_report(store: Any, since: float | None = None, now: float | None = None) -> dict[str, Any]:
-    """Aggregate everything the report shows into one JSON-serializable dict (exact numbers, no rounding)."""
+def _empty_xray(eligible: int = 0, considered: int = 0, error: str | None = None) -> dict[str, Any]:
+    return {"eligible_requests": eligible, "considered_requests": considered, "analyzed_requests": 0,
+            "unparsed_requests": 0, "capped": considered < eligible, "max_requests": XRAY_MAX_REQUESTS,
+            "avg_input_tokens": 0, "total_input_tokens": 0, "input_usd": 0.0, "parts": {},
+            "tools": {"requests_with_tools": 0, "avg_tool_tokens": 0, "avg_tool_share": 0.0, "total_tool_usd": 0.0,
+                      "top_tools": [], "servers": [], "headlines": []},
+            "cache": {"pairs": 0, "hits": 0, "partial": 0, "no_cache": 0, "misses": 0, "lost_usd": 0.0,
+                      "lost_tokens": 0, "by_cause": [], "top_misses": []},
+            "error": error}
+
+
+def _xray_section(exchanges: list[Exchange], eligible: int, overrides: dict | None) -> dict[str, Any]:
+    """Context X-ray over the most recent upstream requests: share of input per part, the largest tool
+    definitions / MCP servers and prompt-cache misses by cause. Never raises (an analysis bug must not cost
+    the user the whole report)."""
+    considered = len(exchanges)
+    if not exchanges:
+        return _empty_xray(eligible, 0)
+    try:
+        from llmtap import xray
+        data = xray.summary_json(sorted(exchanges, key=lambda e: e.ts), overrides, top=TOP_N)
+    except Exception as e:  # pragma: no cover - defensive
+        return _empty_xray(eligible, considered, f"x-ray analysis failed: {type(e).__name__}")
+    tb, c = data.get("tool_bloat") or {}, data.get("cache") or {}
+    by_cause = [{"cause": k, "count": int(v.get("count", 0)), "lost_usd": float(v.get("lost_usd", 0.0))}
+                for k, v in (c.get("by_cause") or {}).items()]
+    by_cause.sort(key=lambda r: (-r["lost_usd"], -r["count"], r["cause"]))
+    top_misses = [{"id": m.get("id"), "ts": m.get("ts"), "model": m.get("model"), "verdict": m.get("verdict"),
+                   "cause": m.get("cause"), "detail": m.get("detail") or "", "lost_tokens": int(m.get("lost_tokens") or 0),
+                   "lost_usd": float(m.get("lost_usd") or 0.0)} for m in (c.get("misses") or [])[:TOP_N]]
+    return {
+        "eligible_requests": eligible, "considered_requests": considered,
+        "analyzed_requests": int(data.get("analyzed") or 0), "unparsed_requests": int(data.get("unparsed") or 0),
+        "capped": considered < eligible, "max_requests": XRAY_MAX_REQUESTS,
+        "avg_input_tokens": int(data.get("avg_input_tokens") or 0),
+        "total_input_tokens": int(data.get("total_input_tokens") or 0), "input_usd": float(data.get("input_usd") or 0.0),
+        "parts": data.get("parts") or {},
+        "tools": {"requests_with_tools": int(tb.get("requests_with_tools") or 0),
+                  "avg_tool_tokens": int(tb.get("avg_tool_tokens") or 0),
+                  "avg_tool_share": float(tb.get("avg_tool_share") or 0.0),
+                  "total_tool_usd": float(tb.get("total_tool_usd") or 0.0),
+                  "top_tools": list(tb.get("top_tools") or [])[:TOP_N],
+                  "servers": list(tb.get("servers") or [])[:TOP_N], "headlines": list(tb.get("headlines") or [])},
+        "cache": {"pairs": int(c.get("pairs") or 0), "hits": int(c.get("hits") or 0), "partial": int(c.get("partial") or 0),
+                  "no_cache": int(c.get("no_cache") or 0), "misses": int(c.get("total_misses") or 0),
+                  "lost_usd": float(c.get("total_lost_usd") or 0.0), "lost_tokens": int(c.get("total_lost_tokens") or 0),
+                  "by_cause": by_cause, "top_misses": top_misses},
+        "error": None,
+    }
+
+
+def build_report(store: Any, since: float | None = None, now: float | None = None,
+                 overrides: dict | None = None) -> dict[str, Any]:
+    """Aggregate everything the report shows into one JSON-serializable dict (exact numbers, no rounding).
+
+    ``overrides`` are pricing overrides (config ``pricing_overrides``) used by the context X-ray's dollar
+    estimates."""
     now = time.time() if now is None else float(now)
     from llmtap.guard import KINDS, PII_KINDS
 
@@ -448,6 +505,9 @@ def build_report(store: Any, since: float | None = None, now: float | None = Non
     last_ts: float | None = None
     seq = 0
     key_memo: dict[bytes, str] = {}
+    xray_exs: list[Exchange] = []          # most recent upstream requests with a body (newest first)
+    xray_eligible = 0
+    xray_bytes = 0
 
     for ex in _iter_exchanges(store, since):
         seq += 1
@@ -476,6 +536,12 @@ def build_report(store: Any, since: float | None = None, now: float | None = Non
         _add_group(by_day, time.strftime("%Y-%m-%d", time.localtime(ex.ts)), ex)
         for tname, tval in (ex.tags or {}).items():
             _add_group(by_tag.setdefault(str(tname), {}), str(tval), ex)
+
+        if ex.source == "upstream" and ex.request_body:
+            xray_eligible += 1
+            if len(xray_exs) < XRAY_MAX_REQUESTS and xray_bytes < XRAY_MAX_BYTES:
+                xray_exs.append(ex)
+                xray_bytes += len(ex.request_body)
 
         if ex.source == "upstream" and int(ex.status or 0) < 400:
             if ex.latency_ms:
@@ -529,6 +595,8 @@ def build_report(store: Any, since: float | None = None, now: float | None = Non
 
     # ---- derived
     waste = _waste_from(waste_records, _preview_lookup(store))
+    xray_section = _xray_section(xray_exs, xray_eligible, overrides)
+    del xray_exs
 
     loop_rows = []
     prevented = 0.0
@@ -617,6 +685,7 @@ def build_report(store: Any, since: float | None = None, now: float | None = Non
                   "kinds": kinds_out},
         "loops": {"blocked": blocked_by["loop"], "budget_blocked": blocked_by["budget"],
                   "est_prevented_usd": prevented, "groups": loop_rows[:TOP_N]},
+        "xray": xray_section,
         "insights": insights,
     }
 
@@ -831,6 +900,133 @@ def _stat(k: str, v: str, d: str = "") -> str:
             + (f'<div class="d">{_e(d)}</div>' if d else "") + "</div>")
 
 
+_XRAY_PARTS = ("system", "tools", "history", "new_input", "other")
+_XRAY_LABELS = {"system": "system", "tools": "tools", "history": "history", "new_input": "new input",
+                "other": "other"}
+_XRAY_COLORS = {"system": "#60a5fa", "tools": "#c084fc", "history": "#22d3ee", "new_input": "#34d399",
+                "other": "#7d8496"}
+_CAUSE_LABELS = {"model_changed": "model changed", "ttl_expired": "cache expired (TTL)",
+                 "tools_changed": "tool definitions changed", "tool_order_changed": "tool order changed",
+                 "system_changed": "system prompt changed", "history_edited": "history edited",
+                 "history_truncated": "history truncated", "unknown": "unknown"}
+
+
+def _cause(c: Any) -> str:
+    return _CAUSE_LABELS.get(str(c), str(c or "unknown"))
+
+
+def _xray_scope(x: dict[str, Any]) -> str:
+    n = x["analyzed_requests"]
+    s = f"{_n(n)} upstream request{'s' if n != 1 else ''} analysed"
+    if x["capped"]:
+        s += (f" (the most recent {_n(x['considered_requests'])} of {_n(x['eligible_requests'])}; "
+              f"the x-ray reads at most {_n(x['max_requests'])} requests and "
+              f"{XRAY_MAX_BYTES // (1024 * 1024)} MB of request bodies)")
+    if x["unparsed_requests"]:
+        s += f" · {_n(x['unparsed_requests'])} with an unreadable or truncated body skipped"
+    return s
+
+
+def _fmt_time(ts: Any) -> str:
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(ts))) if ts else "-"
+    except (OverflowError, OSError, ValueError, TypeError):
+        return "-"
+
+
+def _xray_html(x: dict[str, Any] | None) -> str:
+    out = ['<section class="panel"><h2>Context X-ray <span class="n">where the input tokens go, tool bloat and '
+           'prompt-cache misses</span>']
+    if x and x["cache"]["lost_usd"] > 0:
+        out.append(f'<span class="tag bad">~{_e(_usd(x["cache"]["lost_usd"]))} lost to cache misses</span>')
+    out.append("</h2>")
+    if not x or not x["analyzed_requests"]:
+        why = (x or {}).get("error") or ("No upstream request with a readable body in this period (bodies may be "
+                                         "truncated, or the requests were not JSON).")
+        out.append(f'<div class="empty">{_e(why)}</div></section>')
+        return "".join(out)
+    parts = x["parts"]
+    out.append(f'<div class="sub" style="margin:-6px 0 12px">{_e(_xray_scope(x))} · average request '
+               f'{_e(_tok(x["avg_input_tokens"]))} tokens · input cost {_e(_usd(x["input_usd"]))}</div>')
+    segs, legend = [], []
+    for p in _XRAY_PARTS:
+        d = parts.get(p)
+        if not d or float(d.get("share") or 0) <= 0:
+            continue
+        c = _XRAY_COLORS[p]
+        segs.append(f'<div style="width:{100 * float(d["share"]):.2f}%;background:{c}" '
+                    f'title="{_e(_XRAY_LABELS[p])}: {_e(_pct(d["share"]))}"></div>')
+        legend.append(f'<span><i style="background:{c}"></i>{_e(_XRAY_LABELS[p])} {_e(_pct(d["share"]))}</span>')
+    out.append(f'<div class="mix" style="height:14px">{"".join(segs)}</div><div class="legend">{"".join(legend)}</div>')
+    out.append('<div class="tw" style="margin-top:14px"><table><thead><tr><th>Part</th><th class="r">Share</th>'
+               '<th class="r">Avg tokens / request</th><th class="r">Total tokens</th><th class="r">Est. cost</th></tr>'
+               '</thead><tbody>')
+    for p in _XRAY_PARTS:
+        d = parts.get(p)
+        if not d:
+            continue
+        out.append(f'<tr><td><i style="display:inline-block;width:9px;height:9px;border-radius:3px;margin-right:8px;'
+                   f'background:{_XRAY_COLORS[p]}"></i>{_e(_XRAY_LABELS[p])}</td><td class="r">{_e(_pct(d["share"]))}</td>'
+                   f'<td class="r">{_e(_tok(d["avg_tokens"]))}</td><td class="r">{_e(_tok(d["tokens"]))}</td>'
+                   f'<td class="r">{_e(_usd(d["usd"]))}</td></tr>')
+    out.append("</tbody></table></div>")
+
+    tb = x["tools"]
+    out.append('<div class="grid" style="margin:16px 0 0"><div><h2 style="margin-top:4px">Largest tool definitions '
+               f'<span class="n">avg {_e(_tok(tb["avg_tool_tokens"]))} tokens / request · {_e(_pct(tb["avg_tool_share"]))}'
+               f' of input · {_e(_usd(tb["total_tool_usd"]))}</span></h2>')
+    if tb["top_tools"]:
+        out.append('<div class="tw"><table style="min-width:0"><thead><tr><th>Tool</th><th class="r">Requests</th>'
+                   '<th class="r">Avg tokens</th><th class="r">Est. cost</th></tr></thead><tbody>')
+        for t in tb["top_tools"]:
+            srv = f' <span class="badge">{_e(t["server"])}</span>' if t.get("server") else ""
+            out.append(f'<tr><td class="mono p">{_e(t["name"])}{srv}</td><td class="r">{_e(_n(t["requests"]))}</td>'
+                       f'<td class="r">{_e(_tok(t["avg_tokens"]))}</td><td class="r">{_e(_usd(t["usd"]))}</td></tr>')
+        out.append("</tbody></table></div>")
+    else:
+        out.append('<div class="empty">No tool definitions were sent.</div>')
+    out.append('</div><div><h2 style="margin-top:4px">MCP servers <span class="n">tools named '
+               'mcp__&lt;server&gt;__&lt;tool&gt;</span></h2>')
+    if tb["servers"]:
+        out.append('<div class="tw"><table style="min-width:0"><thead><tr><th>Server</th><th class="r">Tools</th>'
+                   '<th class="r">Avg tokens</th><th class="r">Requests</th><th class="r">Est. cost</th></tr></thead><tbody>')
+        for s in tb["servers"]:
+            out.append(f'<tr><td class="mono p">{_e(s["server"])}</td><td class="r">{_e(_n(s["tools"]))}</td>'
+                       f'<td class="r">{_e(_tok(s["avg_tokens"]))}</td><td class="r">{_e(_n(s["requests"]))}</td>'
+                       f'<td class="r">{_e(_usd(s["usd"]))}</td></tr>')
+        out.append("</tbody></table></div>")
+    else:
+        out.append('<div class="empty">No MCP tools.</div>')
+    out.append("</div></div>")
+
+    c = x["cache"]
+    out.append('<h2 style="margin-top:18px">Prompt-cache misses <span class="n">'
+               f'{_e(_n(c["pairs"]))} follow-up request{"s" if c["pairs"] != 1 else ""} compared with the previous one: '
+               f'{_e(_n(c["hits"]))} hit{"s" if c["hits"] != 1 else ""}, {_e(_n(c["misses"]))} '
+               f'miss{"es" if c["misses"] != 1 else ""}'
+               + (f', {_e(_n(c["no_cache"]))} without caching' if c["no_cache"] else "") + "</span></h2>")
+    if not c["pairs"]:
+        out.append('<div class="empty">No consecutive requests with reported usage to compare.</div>')
+    elif not c["misses"]:
+        out.append('<div class="empty"><span class="ok">✓</span> No prompt-cache misses.</div>')
+    else:
+        out.append('<div class="tw"><table><thead><tr><th>Cause</th><th class="r">Misses</th><th class="r">Lost</th>'
+                   '</tr></thead><tbody>')
+        for r in c["by_cause"]:
+            out.append(f'<tr><td>{_e(_cause(r["cause"]))}</td><td class="r">{_e(_n(r["count"]))}</td>'
+                       f'<td class="r"><b>{_e(_usd(r["lost_usd"]))}</b></td></tr>')
+        out.append("</tbody></table></div>")
+        out.append('<div class="tw" style="margin-top:14px"><table><thead><tr><th>When</th><th>Model</th><th>Cause</th>'
+                   '<th>What changed</th><th class="r">Lost</th></tr></thead><tbody>')
+        for m in c["top_misses"]:
+            out.append(f'<tr><td class="mono">{_e(_fmt_time(m["ts"]))}</td><td class="mono">{_e(m["model"] or "-")}</td>'
+                       f'<td>{_e(_cause(m["cause"]))}</td><td class="p">{_e(_clip(m["detail"], 240))}</td>'
+                       f'<td class="r"><b>{_e(_usd(m["lost_usd"]))}</b></td></tr>')
+        out.append("</tbody></table></div>")
+    out.append("</section>")
+    return "".join(out)
+
+
 def render_html(data: dict[str, Any]) -> str:
     """Render the report dict as one self-contained, XSS-safe HTML document (inline CSS/SVG, no JS)."""
     t = data["totals"]
@@ -928,6 +1124,9 @@ def render_html(data: dict[str, Any]) -> str:
     else:
         add('<div class="empty">No priced requests yet.</div>')
     add("</section>")
+
+    # context x-ray
+    add(_xray_html(data.get("xray")))
 
     # guard
     tag = (f'<span class="tag bad">{_e(_n(g["total"]))} finding{"s" if g["total"] != 1 else ""}</span>' if g["total"]
@@ -1032,6 +1231,7 @@ def render_markdown(data: dict[str, Any]) -> str:
         for r in data["expensive"][:5]:
             L.append(f"| {_md(r['model'] or '-')} | {_usd(r['cost_usd'])} | "
                      f"{_tok(r['input_tokens'])}→{_tok(r['output_tokens'])} | {_md(r['preview'], 60)} |")
+    L += _xray_markdown(data.get("xray"))
     L += ["", "### Guard findings"]
     if g["kinds"]:
         L += ["", "| Kind | Count | Masked preview |", "|---|---:|---|"]
@@ -1043,6 +1243,40 @@ def render_markdown(data: dict[str, Any]) -> str:
           + (f" (~{_usd(lp['est_prevented_usd'])} prevented)" if lp["est_prevented_usd"] > 0 else "")]
     L += ["", f"_Generated by llmtap v{data.get('version', __version__)}_", ""]
     return "\n".join(L)
+
+
+def _xray_markdown(x: dict[str, Any] | None) -> list[str]:
+    L = ["", "### Context X-ray"]
+    if not x or not x["analyzed_requests"]:
+        return L + ["", _md((x or {}).get("error") or "No upstream request with a readable body in this period.")]
+    L += ["", f"{_md(_xray_scope(x))}; average request {_tok(x['avg_input_tokens'])} tokens, "
+              f"input cost {_usd(x['input_usd'])}.", "",
+          "| Part | Share | Avg tokens | Est. cost |", "|---|---:|---:|---:|"]
+    for p in _XRAY_PARTS:
+        d = x["parts"].get(p)
+        if d:
+            L.append(f"| {_XRAY_LABELS[p]} | {_pct(d['share'])} | {_tok(d['avg_tokens'])} | {_usd(d['usd'])} |")
+    tb = x["tools"]
+    if tb["top_tools"]:
+        L += ["", f"Tool definitions: avg {_tok(tb['avg_tool_tokens'])} tokens per request "
+                  f"({_pct(tb['avg_tool_share'])} of input), {_usd(tb['total_tool_usd'])} in total.", "",
+              "| Tool | MCP server | Avg tokens | Est. cost |", "|---|---|---:|---:|"]
+        for t in tb["top_tools"][:5]:
+            L.append(f"| {_md(t['name'], 80)} | {_md(t.get('server') or '-')} | {_tok(t['avg_tokens'])} | {_usd(t['usd'])} |")
+    if tb["servers"]:
+        L += ["", "| MCP server | Tools | Avg tokens | Est. cost |", "|---|---:|---:|---:|"]
+        for s in tb["servers"][:5]:
+            L.append(f"| {_md(s['server'])} | {_n(s['tools'])} | {_tok(s['avg_tokens'])} | {_usd(s['usd'])} |")
+    c = x["cache"]
+    L += ["", f"Prompt cache: {_n(c['pairs'])} follow-up request{'s' if c['pairs'] != 1 else ''}, "
+              f"{_n(c['hits'])} hit{'s' if c['hits'] != 1 else ''}, "
+              f"{_n(c['misses'])} miss{'es' if c['misses'] != 1 else ''}"
+              + (f", ~{_usd(c['lost_usd'])} lost" if c["lost_usd"] > 0 else "") + "."]
+    if c["by_cause"]:
+        L += ["", "| Miss cause | Count | Lost |", "|---|---:|---:|"]
+        for r in c["by_cause"]:
+            L.append(f"| {_md(_cause(r['cause']))} | {_n(r['count'])} | {_usd(r['lost_usd'])} |")
+    return L
 
 
 def render_json(data: dict[str, Any]) -> str:

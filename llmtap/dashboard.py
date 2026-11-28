@@ -291,6 +291,74 @@ def _timeseries(tap: "LLMTap", qs: dict[str, list[str]]) -> dict[str, Any]:
     return {"since": since, "bucket": bucket, "points": tap.store.timeseries(since, bucket)}
 
 
+# --------------------------------------------------------------------------------------------
+# context X-ray (read-only; the analysis lives in llmtap.xray)
+# --------------------------------------------------------------------------------------------
+
+XRAY_TOP_TOOLS = 10
+XRAY_PREV_WINDOW_S = 7200.0      # the previous request of a conversation must be at most 2 hours older
+XRAY_MAX_REQUESTS = 2000         # period summary: analyse at most the most recent N upstream requests
+
+
+def _overrides(tap: "LLMTap") -> dict | None:
+    return getattr(tap.cfg, "pricing_overrides", None) or None
+
+
+def _xray_prev(store: Any, ex: Exchange) -> Exchange | None:
+    """The request before ``ex`` in the same conversation: same provider, model and session tag, within 2 hours.
+    Mirrors ``llmtap.cli._xray_prev`` (``llmtap xray <id>``)."""
+    if not hasattr(store, "iter_light"):
+        return None
+    key = (ex.provider, ex.model, (ex.tags or {}).get("session"))
+    best = None
+    for other in store.iter_light(float(ex.ts) - XRAY_PREV_WINDOW_S):
+        if other.ts >= ex.ts or other.id == ex.id or other.source != "upstream":
+            continue
+        if (other.provider, other.model, (other.tags or {}).get("session")) != key:
+            continue
+        if best is None or other.ts > best.ts:
+            best = other
+    return best
+
+
+def _xray_exchange(tap: "LLMTap", ex: Exchange) -> dict[str, Any]:
+    """Same shape as ``llmtap xray <id> --json``: ``{breakdown, tools, servers, cache}``."""
+    from . import xray
+    overrides = _overrides(tap)
+    prev = _xray_prev(tap.store, ex)
+    return {
+        "id": ex.id,
+        "breakdown": xray.breakdown(ex, overrides),
+        "tools": xray.tool_bloat(ex, overrides)[:XRAY_TOP_TOOLS],
+        "servers": xray.tool_servers(ex, overrides),
+        "cache": xray.explain_cache(prev, ex, overrides) if prev is not None else None,
+        "prev_id": prev.id if prev is not None else None,
+    }
+
+
+def _xray_summary(tap: "LLMTap", qs: dict[str, list[str]]) -> dict[str, Any]:
+    """``summary_json`` over the upstream requests (with a body) since ``since`` (default: local midnight)."""
+    from . import xray
+    since = _since(qs, default=_local_midnight())
+    store = tap.store
+    exchanges: list[Exchange] = []
+    capped = False
+    if hasattr(store, "iter_light"):
+        for ex in store.iter_light(since):          # newest first
+            if ex.source != "upstream" or not ex.request_body:
+                continue
+            if len(exchanges) >= XRAY_MAX_REQUESTS:
+                capped = True
+                break
+            exchanges.append(ex)
+    exchanges.sort(key=lambda e: e.ts)
+    out = xray.summary_json(exchanges, _overrides(tap), top=XRAY_TOP_TOOLS)
+    out["since"] = since
+    out["capped"] = capped
+    out["max_requests"] = XRAY_MAX_REQUESTS
+    return out
+
+
 def _event_payload(event: Any) -> dict[str, Any]:
     """Normalize a bus event: make sure any embedded exchange is a lightweight summary dict."""
     if isinstance(event, Exchange):
@@ -489,6 +557,17 @@ def handle_internal(tap: "LLMTap", method: str, path: str, headers: Any, body: b
                 return True
             if sub == "/api/exchanges":
                 _json(respond, _exchanges(tap, qs))
+                return True
+            if sub == "/api/xray":
+                _json(respond, _xray_summary(tap, qs))
+                return True
+            if sub.startswith("/api/exchanges/") and sub.rstrip("/").endswith("/xray"):
+                ex_id = sub[len("/api/exchanges/"):].rstrip("/")[: -len("/xray")].strip("/")
+                ex = tap.store.get(ex_id) if ex_id else None
+                if ex is None:
+                    _error(respond, 404, f"exchange not found: {ex_id}")
+                    return True
+                _json(respond, _xray_exchange(tap, ex))
                 return True
             if sub.startswith("/api/exchanges/"):
                 ex_id = sub[len("/api/exchanges/"):].strip("/")

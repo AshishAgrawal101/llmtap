@@ -62,6 +62,7 @@ class Config:
     leak_check: str = "block"               # "off" | "warn" | "block": your real secrets (stored keys, .env values,
                                             # canaries) in a request body, also base64 / hex / URL-encoded
     leak_files: str = ""                    # comma-separated KEY=VALUE files to fingerprint; "" = .env* in the cwd
+    max_call_usd: float = 0.0               # 0 = off; refuse a single call likely to cost more than this
     max_request_kb: int = 0                 # 0 = off; refuse request bodies bigger than this (a bulk-upload limit)
     dashboard_writes: bool = True           # False: the dashboard API can't add / change keys or clear history (use
                                             # the CLI), so an agent that can reach llmtap's port can't change them

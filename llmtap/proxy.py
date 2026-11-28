@@ -318,6 +318,9 @@ def _credentials(hdrs: Mapping[str, str], path: str) -> list[str]:
     return sorted({v for v in vals if len(v) >= 8}, key=len, reverse=True)
 
 
+_B64_RUN = re.compile(rb"[A-Za-z0-9+/]{1024,}={0,2}")      # inline images / PDFs in a request body
+
+
 _PLACEHOLDER_FULL = re.compile(r"(?:(?:bearer|basic|token)\s+)?" + re.escape(PLACEHOLDER_PREFIX)
                                + r"[a-z0-9][a-z0-9_-]{0,39}", re.IGNORECASE)
 _CRED_QS_RE = re.compile(r"(?i)^x-amz-|token|sig|cred|key|auth|secret|password")
@@ -933,6 +936,19 @@ class LLMTap:
                 self._error(out, ex, route.style, 409, msg, "llmtap_cassette_miss")
                 return
 
+        # per-call limit: one giant request (a whole repo pasted into the context) is refused before it's sent
+        limit_usd = float(cfg.max_call_usd or 0)
+        if cacheable and limit_usd > 0:
+            call_usd, call_tokens = self._likely_call_cost(ex, route, req, send_body)
+            if call_usd > limit_usd:
+                ex.source = "blocked"
+                self._error(out, ex, route.style, 403,
+                            f"llmtap: this call would cost about ${call_usd:.2f} (~{call_tokens:,} input tokens on "
+                            f"{ex.model or 'this model'}), over the per-call limit of ${limit_usd:.2f} "
+                            "(max_call_usd). Send less context, use a cheaper model, or raise --max-call-usd.",
+                            "llmtap_call_too_expensive")
+                return
+
         # spend caps: only for generation calls that will actually reach the upstream
         reservation = None
         estimate = self._estimate_cost(ex, route, req, send_body) if cacheable else 0.0
@@ -996,6 +1012,30 @@ class LLMTap:
             self._forward(ex, route, method, hdrs, send_body, req, stream_req, key, out, t0)
         finally:
             self.budget.release(reservation)
+
+    def _likely_call_cost(self, ex: Exchange, route: Route, req: dict | None, body: bytes) -> tuple[float, int]:
+        """(USD, input tokens) a call will probably cost: the input from the body size (base64 media counted as
+        ~1,500 tokens each, not by length) plus up to 4,096 output tokens. Unlike the budget reservation, it
+        doesn't assume the whole ``max_tokens`` gets used (agents ask for 32k on every call). 0 when unpriced."""
+        try:
+            model = ex.model or (request_model(req) if req is not None else None)
+            if not model:
+                return 0.0, 0
+            media = [m for m in _B64_RUN.findall(body[:64 * 1024 * 1024])      # real base64 mixes all three
+                     if any(65 <= c <= 90 for c in m[:256]) and any(97 <= c <= 122 for c in m[:256])
+                     and any(48 <= c <= 57 for c in m[:256])]
+            text_bytes = len(body) - sum(len(m) for m in media)
+            tokens = int(text_bytes / 4 + 1500 * len(media))
+            out_tokens = 4096
+            if isinstance(req, dict):
+                for v in (req.get("max_tokens"), req.get("max_completion_tokens"), req.get("max_output_tokens")):
+                    if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+                        out_tokens = min(v, 4096)
+                        break
+            usage = Usage(input_tokens=max(1, tokens), output_tokens=out_tokens)
+            return float(cost_usd(model, usage, self.cfg.pricing_overrides, style=route.style) or 0.0), tokens
+        except Exception:
+            return 0.0, 0
 
     def _estimate_cost(self, ex: Exchange, route: Route, req: dict | None, body: bytes) -> float:
         """Worst-case cost guess used to reserve budget for an in-flight call (0.0 when unknown)."""
